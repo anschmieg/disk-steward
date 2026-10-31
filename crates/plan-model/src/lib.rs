@@ -811,6 +811,30 @@ impl PlanEditor {
         Ok(self.snapshot())
     }
 
+    /// Appends trusted inventory metadata while preserving all existing inventory
+    /// and user state. This is a domain operation for native-owned callers; it is
+    /// deliberately not representable as a renderer-submitted `PlanEdit`.
+    pub fn add_items(
+        &mut self,
+        expected_revision: RevisionId,
+        items_to_add: Vec<InventoryItem>,
+    ) -> Result<EditorSnapshot, EditError> {
+        self.check_revision(expected_revision)?;
+        if items_to_add.is_empty() {
+            return Ok(self.snapshot());
+        }
+        let mut items = self.state.items.clone();
+        items.extend(items_to_add);
+        self.refresh(
+            expected_revision,
+            InventoryRefresh {
+                items,
+                groups: self.state.groups.clone(),
+                duplicate_sets: self.state.duplicate_sets.clone(),
+            },
+        )
+    }
+
     pub fn freeze_review(&self, expected_revision: RevisionId) -> Result<FrozenReview, EditError> {
         self.check_revision(expected_revision)?;
         let snapshot = self.snapshot();
@@ -2224,6 +2248,107 @@ mod tests {
                 .in_plan
         );
         assert_eq!(snapshot.duplicates[0].survivor_id, Some(candidate));
+    }
+
+    #[test]
+    fn trusted_add_items_preserves_user_state_and_participates_in_history() {
+        let input = sample();
+        let keep_id = input.items[1].id;
+        let duplicate_set_id = input.duplicate_sets[0].id;
+        let survivor_id = input.items[2].id;
+        let mut editor = PlanEditor::new(input).unwrap();
+        editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetChoice {
+                    item_id: keep_id,
+                    choice: Choice::Keep,
+                },
+            )
+            .unwrap();
+        let selected = editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetDuplicateSurvivor {
+                    duplicate_set_id,
+                    survivor_id,
+                },
+            )
+            .unwrap()
+            .snapshot;
+        let added = item(
+            "Native metadata only",
+            None,
+            ItemKind::File,
+            Choice::Keep,
+            12,
+        );
+        let added_id = added.id;
+
+        let after_add = editor.add_items(selected.revision_id, vec![added]).unwrap();
+        assert_eq!(after_add.items.len(), selected.items.len() + 1);
+        assert_eq!(after_add.duplicates[0].survivor_id, Some(survivor_id));
+        assert_eq!(
+            after_add
+                .items
+                .iter()
+                .find(|row| row.item_id == keep_id)
+                .unwrap()
+                .user_choice,
+            Some(Choice::Keep)
+        );
+        assert!(after_add.can_undo);
+
+        let undone = editor.undo(after_add.revision_id).unwrap();
+        assert_eq!(undone.items.len(), selected.items.len());
+        assert_eq!(undone.duplicates[0].survivor_id, Some(survivor_id));
+        let redone = editor.redo(undone.revision_id).unwrap();
+        assert!(redone.items.iter().any(|row| row.item_id == added_id));
+        assert_eq!(redone.duplicates[0].survivor_id, Some(survivor_id));
+    }
+
+    #[test]
+    fn trusted_add_items_rejects_stale_duplicate_invalid_and_over_capacity_atomically() {
+        let mut editor = PlanEditor::new(sample()).unwrap();
+        let before = editor.snapshot();
+        let existing_id = before.items[0].item_id;
+        let duplicate = item("Duplicate ID", None, ItemKind::File, Choice::Keep, 1);
+        let mut duplicate = duplicate;
+        duplicate.id = existing_id;
+        assert_eq!(
+            editor.add_items(before.revision_id, vec![duplicate]),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(editor.snapshot(), before);
+
+        let mut invalid = item("Invalid bounds", None, ItemKind::File, Choice::Keep, 1);
+        invalid.recovery_lower_bytes = Some(2);
+        invalid.recovery_upper_bytes = Some(1);
+        assert_eq!(
+            editor.add_items(before.revision_id, vec![invalid]),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(editor.snapshot(), before);
+
+        assert_eq!(
+            editor.add_items(
+                RevisionId::new(),
+                vec![item("Stale", None, ItemKind::File, Choice::Keep, 1)]
+            ),
+            Err(EditError::StaleRevision)
+        );
+        assert_eq!(editor.snapshot(), before);
+
+        let mut full = PlanEditor::new(synthetic_fixture(MAX_ITEMS, 25).unwrap()).unwrap();
+        let full_before = full.snapshot();
+        assert_eq!(
+            full.add_items(
+                full_before.revision_id,
+                vec![item("Over cap", None, ItemKind::File, Choice::Keep, 1)]
+            ),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(full.snapshot(), full_before);
     }
 
     #[test]

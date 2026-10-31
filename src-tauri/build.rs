@@ -20,6 +20,7 @@ fn main() {
             "freeze_general_review",
             "get_general_review",
             "list_general_reviews",
+            "add_selected_general_item",
         ]),
     ))
     .expect("failed to generate application permission manifest");

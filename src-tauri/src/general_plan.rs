@@ -7,10 +7,11 @@ use std::{
 };
 
 use disk_steward_core::{ReviewId, RevisionId};
-use disk_steward_plan_model::{EditOutcome, EditorSnapshot, FrozenReview, PlanEdit};
+use disk_steward_plan_model::{EditOutcome, EditorSnapshot, FrozenReview, InventoryItem, PlanEdit};
 use disk_steward_plan_store::{FixtureScale, GeneralPlanStore, ReviewSummary, StoreError};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +233,93 @@ pub(crate) async fn get_general_review(
         store.get_saved_review(request.review_id)
     })
     .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AddSelectedItemOutcome {
+    snapshot: Option<EditorSnapshot>,
+    canceled: bool,
+}
+
+/// Adds one file's no-follow metadata to the pilot plan. The dialog, metadata
+/// read, and append all run under the same native-operation guard and blocking
+/// worker; cancellation returns the unchanged snapshot.
+#[tauri::command]
+pub(crate) async fn add_selected_general_item(
+    request: RevisionRequest,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GeneralPlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
+) -> Result<AddSelectedItemOutcome, GeneralPlanError> {
+    if request.profile != Profile::Pilot {
+        return Err(GeneralPlanError {
+            code: "unsupported_profile",
+            message: "Adding a native file is available only in the pilot workspace.",
+        });
+    }
+    if !demo.permits_plan_edits() {
+        return Err(GeneralPlanError {
+            code: "plan_in_use",
+            message: "Another Disk Steward instance owns this workspace. Return to that instance to edit it.",
+        });
+    }
+    let guard = edit_guard(&demo)?;
+    let stores = Arc::clone(&state.0);
+    let expected_revision_id = request.expected_revision_id;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let mut stores = stores.lock().map_err(|_| unavailable())?;
+        let directory = stores.directory.as_ref().map_err(|error| *error)?.clone();
+        let stored = stores.profiles.entry(Profile::Pilot).or_insert_with(|| {
+            GeneralPlanStore::open(
+                directory.join(Profile::Pilot.filename()),
+                Profile::Pilot.scale(),
+            )
+            .map_err(public_error)
+        });
+        let store = stored.as_mut().map_err(|error| *error)?;
+
+        // Reject stale UI state before opening the native chooser. append_item
+        // repeats this check transactionally after metadata collection.
+        let before = store.get_plan().map_err(public_error)?;
+        if before.revision_id != expected_revision_id {
+            return Err(public_error(StoreError::StaleRevision));
+        }
+
+        let Some(selection) = app
+            .dialog()
+            .file()
+            .set_title("Add one file's metadata only · blocked from cleanup")
+            .set_can_create_directories(false)
+            .blocking_pick_file()
+        else {
+            return Ok(AddSelectedItemOutcome {
+                snapshot: Some(before),
+                canceled: true,
+            });
+        };
+        let path = selection.into_path().map_err(|_| GeneralPlanError {
+            code: "unsupported_selection",
+            message: "The selected location is unsupported. Nothing was added.",
+        })?;
+        let item: InventoryItem =
+            crate::selected_metadata::inspect_selected_file(&path).map_err(|message| {
+                GeneralPlanError {
+                    code: "metadata_unavailable",
+                    message,
+                }
+            })?;
+        let snapshot = store
+            .append_item(expected_revision_id, item)
+            .map_err(public_error)?;
+        Ok(AddSelectedItemOutcome {
+            snapshot: Some(snapshot),
+            canceled: false,
+        })
+    })
+    .await
+    .map_err(|_| unavailable())?
 }
 
 #[cfg(test)]

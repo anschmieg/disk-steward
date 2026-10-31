@@ -11,3 +11,10 @@ Every meaningful edit, including undo/redo, creates a new revision; old reviews 
 Completion still requires all M1B gates: native item addition/removal/exclusions, survivor and override handling, persistent exclusions with separate explicit confirmation, undo/redo, overlap/estimate rules, readiness/blockers, a 1,000-finding/25-group review fixture, 10,000-item focus/performance verification and the three-participant preservation/comprehension pilot. Domain or automated tests alone cannot close that pilot. M0 remains open in parallel; its unsigned access and AI/Git limitations are not relaxed.
 
 Work is on feat/m1b-plan-model, version0.0.5. The M0 follow-up is isolated at /Users/adrian/Projects/disk-steward-worktrees/m0-feasibility on feat/m0-feasibility-followup, version0.0.4. Matching versions are enforced within each branch, including first-party lockfile entries. No release is published.
+
+
+## Native metadata-add boundary
+
+The next integrated batch permits one native-selected regular file in the pilot workspace. It observes leaf metadata only, persists a bounded display basename/size with fresh opaque identities, defaults to Keep and attaches a hard `native_metadata_only` blocker. No source path, content, permission grant or operation binding is retained. Folder traversal, duplicate identity matching, source revalidation and eligibility remain later discovery work. Repeated selection may create separate blocked observations; it is not claimed to deduplicate source identities. Addition uses the existing model state/history shape and trusted append transaction, preserving saved reviews and undo/redo without a v1 schema change.
+
+Native selection is not broad inventory completion or M1B closure. Persistent global exclusions need their own separately confirmed registry and stable source semantics; three human pilots remain outstanding.

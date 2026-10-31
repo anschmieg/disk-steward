@@ -18,3 +18,11 @@ The 36 evaluation and 42 main-branch Python probe checks passed during this inte
 ## Open gates
 
 Native-selected item additions, separately confirmed persistent global exclusions, and the three-participant preservation/comprehension pilot remain outstanding. M1B is **In progress**. Live recursive discovery belongs to M2. User-file cleanup, recovered-space claims, signed packaging and platform permission claims remain unavailable. No user files were scanned, staged or deleted in this validation.
+
+## Native metadata-add follow-up
+
+The pilot workspace now offers a native single-file picker. Its backend accepts only profile/revision, performs a leaf no-follow metadata observation, and appends a bounded display basename/size with fresh opaque IDs, default Keep and a hard cleanup blocker. It retains no source path, contents, access grant or operation identity. Folders remain unsupported here. Repeated selection can create separate blocked observations; this is not source deduplication.
+
+All117 workspace tests and14 native backend tests pass, including append/history/reopen/stale/cap and symlink/basename/directional-formatting cases. Strict workspace/native Clippy, formatting and frontend build/version checks pass. The39.09MiB macOS build was exercised: picker cancel preserved revision6; selecting the app-created47-byte fixture produced revision7/1,001 entries with790 selected and Include disabled. Undo produced revision8/1,000; restart preserved undo state; redo produced revision9/1,001 with790 selected. The inspector showed recovery unavailable and metadata provenance. The later directional-formatting escape fix passed native tests/Clippy; its special filename was not manually exercised in the UI.
+
+This advances native additions without claiming full discovery/eligibility, directory additions, persistent global exclusions or human-pilot completion. No actual user file was used as a test fixture.

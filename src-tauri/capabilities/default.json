@@ -25,6 +25,7 @@
     "allow-redo-general-plan",
     "allow-freeze-general-review",
     "allow-get-general-review",
-    "allow-list-general-reviews"
+    "allow-list-general-reviews",
+    "allow-add-selected-general-item"
   ]
 }

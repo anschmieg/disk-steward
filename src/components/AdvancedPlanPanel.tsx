@@ -848,14 +848,30 @@ export default function AdvancedPlanPanel({
                 <small>logical size</small>
               </p>
               <div className="ap-inspector-estimate">
-                <span>Synthetic recovery estimate</span>
+                <span>
+                  {inspected.blockers.some(
+                    (blocker) => blocker.code === "native_metadata_only",
+                  )
+                    ? "Recovery estimate"
+                    : "Synthetic recovery estimate"}
+                </span>
                 <b>
-                  {formatBytes(inspected.recoveryLowerBytes)} –{" "}
-                  {formatBytes(inspected.recoveryUpperBytes)}
+                  {inspected.recoveryLowerBytes === null &&
+                  inspected.recoveryUpperBytes === null ? (
+                    "Unavailable"
+                  ) : (
+                    <>
+                      {formatBytes(inspected.recoveryLowerBytes)} –{" "}
+                      {formatBytes(inspected.recoveryUpperBytes)}
+                    </>
+                  )}
                 </b>
                 <small>
-                  Illustrative only. This is not recovered space or a
-                  live-storage estimate.
+                  {inspected.blockers.some(
+                    (blocker) => blocker.code === "native_metadata_only",
+                  )
+                    ? "Metadata alone cannot establish reclaimable space."
+                    : "Illustrative only. This is not recovered space or a live-storage estimate."}
                 </small>
               </div>
               <section className="ap-detail-section">

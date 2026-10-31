@@ -366,7 +366,7 @@ export default function App() {
           </b>
           <small>
             {page === "advanced"
-              ? `${generalSummary?.count ?? "—"} example findings`
+              ? `${generalSummary?.count ?? "—"} review entries`
               : "5 synthetic actions"}
           </small>
         </div>
@@ -760,7 +760,7 @@ export default function App() {
         <footer className="footnote">
           {page === "demo"
             ? "Only app-created demo fixtures · exact review and native confirmation required · no permanent deletion"
-            : "No user files scanned · this metadata plan cannot authorize staging or cleanup"}
+            : "Metadata review only · this plan cannot authorize staging or cleanup"}
         </footer>
       </main>
     </div>

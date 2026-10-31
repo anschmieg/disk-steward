@@ -9,8 +9,8 @@ use std::{
 
 use disk_steward_core::{ReviewId, RevisionId};
 use disk_steward_plan_model::{
-    synthetic_fixture, EditError, EditOutcome, EditorSnapshot, FrozenReview, PlanEdit, PlanEditor,
-    ValidationError, MAX_SERIALIZED_BYTES,
+    synthetic_fixture, EditError, EditOutcome, EditorSnapshot, FrozenReview, InventoryItem,
+    PlanEdit, PlanEditor, ValidationError, MAX_SERIALIZED_BYTES,
 };
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -161,6 +161,27 @@ impl GeneralPlanStore {
         }
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// Appends one inventory record supplied by a trusted native caller. This
+    /// accepts no paths, renderer metadata, or execution authority.
+    pub fn append_item(
+        &mut self,
+        expected_revision: RevisionId,
+        item: InventoryItem,
+    ) -> StoreResult<EditorSnapshot> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut editor, _) = load_editor(&tx)?;
+        validate_all_reviews(&tx, &editor)?;
+        check_revision(editor.snapshot().revision_id, expected_revision)?;
+        let snapshot = editor.add_items(expected_revision, vec![item])?;
+        if snapshot.revision_id != expected_revision {
+            save_editor(&tx, &editor)?;
+        }
+        tx.commit()?;
+        Ok(snapshot)
     }
 
     pub fn undo(&mut self, expected_revision: RevisionId) -> StoreResult<EditorSnapshot> {
@@ -411,7 +432,7 @@ fn load_editor(c: &Connection) -> StoreResult<(PlanEditor, StoredDocument)> {
     let snap = editor.snapshot();
     if id_string(snap.revision_id)? != revision_id
         || i64::try_from(snap.revision_number).ok() != Some(revision_number)
-        || snap.items.len() != expected_profile.item_count()
+        || snap.items.len() < expected_profile.item_count()
         || snap.groups.len() != 25
     {
         return Err(StoreError::CorruptData);
@@ -557,7 +578,8 @@ fn nofollow_database_path(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_steward_plan_model::{Choice, PlanEdit};
+    use disk_steward_core::{EvidenceId, InventoryItemId};
+    use disk_steward_plan_model::{Blocker, Choice, ItemKind, PlanEdit, Suggestion};
     use std::{
         fs,
         sync::{Arc, Barrier},
@@ -572,6 +594,31 @@ mod tests {
     }
     fn first_item(s: &EditorSnapshot) -> disk_steward_core::InventoryItemId {
         s.items[0].item_id
+    }
+
+    fn metadata_only_item(label: &str) -> InventoryItem {
+        InventoryItem {
+            id: InventoryItemId::new(),
+            parent_id: None,
+            label: label.to_owned(),
+            kind: ItemKind::File,
+            logical_bytes: Some(12),
+            recovery_lower_bytes: None,
+            recovery_upper_bytes: None,
+            storage_identity: None,
+            blockers: vec![Blocker {
+                code: "native_metadata_only".to_owned(),
+                reason: "Only selected-item metadata is available".to_owned(),
+            }],
+            evidence: vec![disk_steward_plan_model::EvidenceRef {
+                id: EvidenceId::new(),
+                summary: "Native metadata only; contents were not read".to_owned(),
+            }],
+            suggestion: Suggestion {
+                choice: Choice::Keep,
+                rationale: "User-selected item; metadata only".to_owned(),
+            },
+        }
     }
 
     #[test]
@@ -633,6 +680,79 @@ mod tests {
             reopened.list_reviews().unwrap()[0].review_id,
             latest_review.review_id
         );
+    }
+
+    #[test]
+    fn append_item_preserves_edits_reviews_and_survives_undo_reopen_redo() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::Pilot1000).unwrap();
+        let initial = store.get_plan().unwrap();
+        let kept_id = initial.items[0].item_id;
+        let edited = store
+            .edit(
+                initial.revision_id,
+                PlanEdit::SetChoice {
+                    item_id: kept_id,
+                    choice: Choice::Keep,
+                },
+            )
+            .unwrap();
+        let review = store.freeze_review(edited.snapshot.revision_id).unwrap();
+        let item = metadata_only_item("selected-installer.pkg");
+        let item_id = item.id;
+        let appended = store
+            .append_item(edited.snapshot.revision_id, item)
+            .unwrap();
+        assert_eq!(appended.items.len(), initial.items.len() + 1);
+        assert!(appended.items.iter().any(|row| row.item_id == item_id));
+        assert_eq!(
+            appended
+                .items
+                .iter()
+                .find(|row| row.item_id == kept_id)
+                .unwrap()
+                .user_choice,
+            Some(Choice::Keep)
+        );
+        assert_eq!(store.get_saved_review(review.review_id).unwrap(), review);
+
+        let undone = store.undo(appended.revision_id).unwrap();
+        assert_eq!(undone.items.len(), initial.items.len());
+        drop(store);
+        let mut reopened = GeneralPlanStore::open(&path, FixtureScale::Pilot1000).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), undone);
+        let redone = reopened.redo(undone.revision_id).unwrap();
+        assert!(redone.items.iter().any(|row| row.item_id == item_id));
+        assert_eq!(reopened.get_saved_review(review.review_id).unwrap(), review);
+    }
+
+    #[test]
+    fn append_item_rejects_stale_duplicate_and_over_capacity_without_mutation() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::Pilot1000).unwrap();
+        let before = store.get_plan().unwrap();
+        let duplicate = metadata_only_item("duplicate");
+        let mut duplicate = duplicate;
+        duplicate.id = before.items[0].item_id;
+        assert!(matches!(
+            store.append_item(before.revision_id, duplicate),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(store.get_plan().unwrap(), before);
+        assert!(matches!(
+            store.append_item(RevisionId::new(), metadata_only_item("stale")),
+            Err(StoreError::StaleRevision)
+        ));
+        assert_eq!(store.get_plan().unwrap(), before);
+
+        let (_d, stress_path) = db();
+        let mut full = GeneralPlanStore::open(&stress_path, FixtureScale::Stress10000).unwrap();
+        let full_before = full.get_plan().unwrap();
+        assert!(matches!(
+            full.append_item(full_before.revision_id, metadata_only_item("over cap")),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(full.get_plan().unwrap(), full_before);
     }
 
     #[test]

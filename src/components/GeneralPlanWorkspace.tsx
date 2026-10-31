@@ -54,6 +54,7 @@ export default function GeneralPlanWorkspace({
       setBusy(true);
       onBusyChange(true);
       setError("");
+      setNotice("");
       try {
         return await operation();
       } catch (failure) {
@@ -131,6 +132,24 @@ export default function GeneralPlanWorkspace({
           : next.changed
             ? "Choice saved."
             : "The current choice was preserved.",
+      );
+    }
+  };
+  const addSelectedItem = async () => {
+    if (!snapshot || !confirmed || showReview || profile !== "pilot") return;
+    const result = await request(() =>
+      invoke<{ snapshot: EditorSnapshot | null; canceled: boolean }>(
+        "add_selected_general_item",
+        { request: { profile, expectedRevisionId: snapshot.revisionId } },
+      ),
+    );
+    if (result) {
+      if (result.snapshot) setSnapshot(result.snapshot);
+      setConfirmed(true);
+      setNotice(
+        result.canceled
+          ? "File selection canceled. The plan is unchanged."
+          : "Selected file metadata added with Keep. Cleanup stays blocked; its contents were not read. Find it under Other findings.",
       );
     }
   };
@@ -219,7 +238,17 @@ export default function GeneralPlanWorkspace({
             <option value="stress">10,000 findings · 25 groups</option>
           </select>
         </label>
-        <span>Synthetic inventory · no user files scanned</span>
+        <span>
+          Example inventory · optional selected-file metadata · no content reads
+        </span>
+        <button
+          className="ap-button quiet"
+          disabled={busy || !confirmed || showReview || profile !== "pilot"}
+          onClick={() => void addSelectedItem()}
+          title="Select one file for a metadata-only review entry. Cleanup remains blocked. Available in the 1,000-item workspace."
+        >
+          Add file metadata…
+        </button>
         {reviewHistory.length > 0 && (
           <label>
             Saved reviews{" "}

@@ -1,6 +1,7 @@
 mod example_plan;
 mod fixture_demo;
 mod general_plan;
+mod selected_metadata;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
@@ -84,7 +85,8 @@ pub fn run() {
             general_plan::redo_general_plan,
             general_plan::freeze_general_review,
             general_plan::get_general_review,
-            general_plan::list_general_reviews
+            general_plan::list_general_reviews,
+            general_plan::add_selected_general_item
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disk Steward");
