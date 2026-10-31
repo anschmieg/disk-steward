@@ -1,6 +1,6 @@
 # Disk Steward — cross-platform cleanup application plan
 
-Working name; no naming or trademark research performed. Planning package dated 31 October 2026. This package specifies an application; it does not install software or clean the computer.
+Working name; no naming or trademark research performed. Planning package dated 31 October 2026. Implementation is in progress; the current application uses synthetic data and cannot clean the computer.
 
 ## Product
 
@@ -17,7 +17,7 @@ Start with the [implementation roadmap](ROADMAP.md) for milestones, demonstrable
 3. [Implementation tasks](.kiro/specs/macos-cleanup/tasks.md): dependency-ordered work and release gates.
 4. [MVP detector and integration catalog](MVP-CATALOG.md): named tool/category targets, minimum executable scope, private Git authentication, and verification resource budgets.
 
-These documents were prepared together because the request explicitly asks for the complete implementation plan. Their existence is not approval to implement or perform cleanup.
+These documents were prepared together because the request explicitly asks for the complete implementation plan. Implementation is authorized; cleanup of user data still requires an exact reviewed plan.
 
 [Initial desktop concept](concept-desktop.png) and [narrow-layout check](concept-mobile.png) show synthetic data. The revised visual direction is specified in design.md: a spatial storage map linked to an editable decision view and evidence inspector. Preview checks verify concept interactions only, not the proposed application or filesystem safety engine.
 
@@ -53,7 +53,7 @@ The earlier 12–16-week envelope is unvalidated and no longer an active deliver
 
 ## Development
 
-Version: 0.0.1. Repository: https://github.com/anschmieg/disk-steward (private). Current feature branch: feat/m0-foundation. See [progress](PROGRESS.md) for verified results and remaining gates.
+Version: 0.0.2. Repository: https://github.com/anschmieg/disk-steward (private). Current feature branch: feat/m0-foundation. See [progress](PROGRESS.md) for verified results and remaining gates.
 
 Use `npm ci` then `npm run dev` for the fixture UI, or `npm run tauri dev` for the desktop shell after installing the native prerequisites. `npm run build` checks TypeScript and builds the frontend. `cargo test --workspace` tests the portable contracts; `cargo check --manifest-path src-tauri/Cargo.toml -j 2` checks the native backend separately. `node scripts/check-version.mjs` enforces matching 0.0.x versions. The optional evaluation harness is development tooling: see [evaluation notes](evaluation/README.md).
 

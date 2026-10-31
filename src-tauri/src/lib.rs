@@ -34,8 +34,18 @@ pub fn foundation_capabilities() -> Vec<CapabilityReport> {
 pub fn run() {
     tauri::Builder::default()
         .manage(foundation_capabilities())
+        .invoke_handler(tauri::generate_handler![foundation_status])
         .run(tauri::generate_context!())
         .expect("error while running Disk Steward");
+}
+
+/// Read-only diagnostic bridge. Takes no paths, scopes, commands or credentials.
+#[tauri::command]
+fn foundation_status(reports: tauri::State<'_, Vec<CapabilityReport>>) -> Vec<(String, bool)> {
+    reports
+        .iter()
+        .map(|report| (format!("{:?}", report.capability), report.is_available()))
+        .collect()
 }
 
 #[cfg(test)]

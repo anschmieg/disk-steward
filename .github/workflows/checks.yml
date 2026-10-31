@@ -1,6 +1,7 @@
 name: Checks
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -42,3 +43,11 @@ jobs:
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo check --manifest-path src-tauri/Cargo.toml --locked -j 2
+      - name: Compile native feasibility helpers without performing cleanup
+        run: |
+          swiftc probes/native/RecoveryProbe.swift -o "$RUNNER_TEMP/recovery-probe"
+          swiftc probes/keychain/KeychainProbe.swift -o "$RUNNER_TEMP/keychain-probe"
+          swiftc probes/bookmark/BookmarkProbe.swift -o "$RUNNER_TEMP/bookmark-probe"
+          swiftc probes/confirmation/ConfirmationProbe.swift -o "$RUNNER_TEMP/confirmation-probe"
+          "$RUNNER_TEMP/keychain-probe"
+          "$RUNNER_TEMP/confirmation-probe"

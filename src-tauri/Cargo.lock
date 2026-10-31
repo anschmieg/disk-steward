@@ -593,11 +593,11 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-core"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "disk-steward-desktop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "disk-steward-core",
  "tauri",

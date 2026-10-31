@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   Archive, ArrowUpRight, Check, ChevronDown, ChevronRight,
   HardDrive, LayoutGrid, List, Search, ShieldCheck,
@@ -25,6 +26,17 @@ const fmt = (n: number) => `${Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1)}
 const fixtureTotal = initialItems.reduce((sum, item) => sum + item.size, 0);
 
 export default function App() {
+  const [bridgeStatus, setBridgeStatus] = useState("Browser fixture preview · native bridge unavailable");
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    invoke<[string, boolean][]>("foundation_status")
+      .then((reports) => {
+        if (active) setBridgeStatus(`Native core connected · ${reports.filter(([, available]) => available).length}/${reports.length} production adapters available`);
+      })
+      .catch(() => { if (active) setBridgeStatus("Native capability query failed · cleanup remains unavailable"); });
+    return () => { active = false; };
+  }, []);
   const [items, setItems] = useState(initialItems);
   const [selectedId, setSelectedId] = useState("build-atlas");
   const [view, setView] = useState<"map" | "list">("map");
@@ -63,6 +75,7 @@ export default function App() {
             <div className="crumb">EXAMPLE VOLUME <ChevronRight size={12} /> {page === "space" ? "OVERVIEW" : "PLAN"}</div>
             <h1>{page === "space" ? "See what’s taking space." : "Review your plan."}</h1>
             <p className="subtitle">{page === "space" ? "Explore the example folders. Inspect the notes. Decide what stays." : "Change example decisions and see how the plan responds."}</p>
+            <p className="subtitle" role="status">{bridgeStatus}</p>
           </div>
           <button className="quiet-button" onClick={() => setPage(page === "space" ? "plan" : "space")}>{page === "space" ? "Review your plan" : "Back to space map"}<ArrowUpRight size={15} /></button>
         </div>

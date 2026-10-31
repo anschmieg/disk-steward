@@ -36,3 +36,19 @@ Purpose/scope review: M0 must establish truthful platform support and recovery e
 - Native desktop cargo check with the core linked passed; core tests now total seven, and formatting/strict Clippy pass. Python probe tests total five. Version guard remains 0.0.1. CI includes the new probe tests but is still externally blocked until the GitHub account restriction is resolved.
 
 M0 remains in progress. Next: native permission/runtime probes and recovery-mechanism feasibility; independently reviewed evaluation labels/live model evaluation; private Git broker/resource limits; detector scope/version freeze and forecast. No milestone completion claimed. Quota checks during this batch reported 46% remaining.
+
+## Sustained M0 feasibility — version 0.0.2
+
+The resumed work uses the autonomous skill's durable handoff pattern with Luna delegates; the app heartbeat is the sole continuation mechanism. Routine commits and completed test batches are checkpoints, not stopping conditions.
+
+- Added a permission-scoped read-only native status command. Built and launched the debug macOS bundle; its native interface reported 0/7 production adapters available and list navigation worked. The UI remains synthetic with execution disabled.
+- Native Foundation fixtures passed same-volume stage/restore, collisions, symlink rejection, same-size edit detection, exact returned-URL Trash restoration, and optional selective removal while a separate synthetic sentinel survived. Restricted execution failed with Cocoa 513; access-enabled fixture runs succeeded.
+- An isolated 4 GiB APFS image recovered 276,832,256 bytes after exact fixture deletion, against 276,824,064 allocated bytes. Stage/restore did not free space. The probe detached and removed its own image. No user snapshots or files were touched.
+- Synthetic Keychain create/read/delete/absence passed. Ordinary bookmarks passed identity/persistence checks, but read-only security-scoped bookmark creation failed in the unsigned CLI; scoped access remains unproven.
+- Public and authenticated-private GitHub HTTPS advertisements passed bounded read-only probes; anonymous private access failed. No clone/object completeness proof or production credential broker exists yet. Added pure verification-budget accounting with seven behavioral tests; failed/canceled workers retain accounting until stopped acknowledgement.
+- Four development-only Jev requests succeeded on typesafe/jev-1.14-20261014, total reported cost $0.000087444. Provisional labels are still not human-reviewed. One initial route differed from its provisional label; these calls establish connectivity only.
+- CPython 3.15.0 checked-hash bytecode regenerated exactly in fixtures; negative cases were rejected. pytest 9.2.0 generated a recognized nodeids record in a disposable environment, subsequently removed. These remain candidate version pins, not production detector support.
+
+Detailed observations and limitations: [M0 evidence](probes/M0-EVIDENCE.md). M0 remains in progress. Durable approval-ledger feasibility is under review. Remaining work includes packaged permission/confirmation boundaries, real broker/worker enforcement, human evaluation and detector scope freeze, and an evidence-based forecast. CI remains blocked by the previously reported GitHub account restriction.
+
+Verification checkpoint: 20 workspace Rust tests, strict Clippy and formatting pass; native backend check and 0.0.2 debug app bundle build pass; 26 evaluation and 25 probe Python tests pass. SQLite now prevents both repeated consumption and multiple intents for a consumed approval; unknown/altered schemas are refused. A schema-validation query error and an associated test barrier hang were found and corrected before integration. The ledger remains a feasibility component without filesystem authority. Native helper compilation/dry-run checks were added to CI, but those jobs have not run because of the account restriction.

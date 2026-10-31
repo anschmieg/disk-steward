@@ -1,0 +1,31 @@
+# M0 feasibility evidence — 31 October 2026
+
+These are coordinator-observed development experiments, not production adapter certification. All write/delete experiments used self-created disposable fixtures. Production capabilities remain unsupported in the application.
+
+| Area | Observed result | Still unproven |
+|---|---|---|
+| Native application | A local debug Tauri app bundle built and launched. Native UI showed `Native core connected · 0/7 production adapters available`; list navigation worked. | Developer ID signing/notarization, full permission matrix, distribution and supported-version coverage |
+| Read-only bridge | `foundation_status` is registered with an explicit application permission; it accepts no paths/commands/credentials and reports backend-owned core capability state. | Future scan/plan/execution command authorization and durable workflow integration |
+| Native identities | Foundation volume/resource identity survived same-volume stage/restore; collision and symlink cases were rejected; SHA-256 detected same-size edits. | Elimination of path races, hostile concurrent changes and crash durability |
+| Native Trash | Restricted execution returned Cocoa 513. The access-enabled disposable experiment staged/restored its exact returned URL. Opt-in purge removed only a new target receipt; the separate synthetic Trash sentinel survived and was restored. | Production entitlement/access behavior, arbitrary content/volume support and persistent receipt reconciliation |
+| Controlled APFS recovery | An isolated 4 GiB test image completed stage/restore/restage/purge. Stage and restore free-space readings stayed constant. Allocated fixture bytes: 276,824,064; observed recovery: 276,832,256; tolerance: 27,682,406. Only the probe image was detached/removed. | Results on normal snapshot/shared/busy user volumes; no snapshot removal was attempted |
+| Git HTTPS reachability | Public Tauri advertisement: HTTP 200, 641,593 bytes. Private app-repository advertisement: HTTP 200, 644 bytes with existing credentials in memory; anonymous private access failed. No source clone was changed. | Full object/ref proof, app-owned credential broker, revoked-token UX, worker hard deadlines and live temporary-store enforcement |
+| Keychain | Security-framework helper created/read/deleted one UUID-named synthetic item and verified absence without authentication interaction. No existing item was enumerated or read. | Packaged-app real-token integration, rotation/revocation and permission acceptance |
+| Jev | Four synthetic development-only requests succeeded on `typesafe/jev-1.14-20261014`, total reported cost $0.000087444. No labels, held-out cases, disk contents or credentials were stored in results. | Human-reviewed labels, routing correctness/usefulness, held-out evaluation and provider-side hard spend controls |
+| Durable approvals | SQLite reopen, exact digest/expiry, atomic two-connection consumption and one-intent-per-approval passed six tests. Altered schemas are rejected. | Connection to typed core, production permission checks, process-kill fault injection and journal/filesystem reconciliation |
+| Scope bookmarks | Ordinary fixture bookmark resolution and replacement-identity detection passed; security-scoped creation failed in the unsigned CLI. | Packaged selected-folder access, revocation/denial matrix and restart grants |
+| Generated data | CPython 3.15.0 checked-hash bytecode regenerated exactly; missing source, altered bytes, symlink and unexpected-file cases were rejected. A disposable environment with pytest 9.2.0 produced a recognized `nodeids` cache record. | Production detector implementation, broader versions, regeneration/tool discovery and full cache-record eligibility |
+
+## Corrections made during review
+
+- Budget observations beyond a limit remain charged; failed/canceled workers retain their concurrency slot until stopped acknowledgement. Cleanup cannot release their accounting early.
+- HTTP streaming uses bounded reads and post-read deadline checks. DNS/connect still need a production worker-level hard deadline; the probe does not claim otherwise.
+- The image probe originally used an invalid image-type argument, then an explicit byte size that the installed compatibility command rejected. Installed help and a disposable diagnostic established `-type UDIF -size 4g`; that form passed. macOS 27 warns that the compatibility command is deprecated. The probe is development tooling, not the shipped app's storage implementation.
+- Catalog tests were initially missing from recursive discovery because their package marker was absent. Package imports/discovery were corrected; they are included in the full probe suite.
+- Jev's first result was `keep` where the provisional fixture label expected metadata inspection. Route semantics were clarified before three further cases. Four calls do not establish accuracy or justify action eligibility.
+
+## Interpretation
+
+The native experiments support continuing with receipt-based recovery feasibility, a shared typed core and OS-specific adapters. They do not close all M0 gates. Human evaluation, production broker/resource integration, detector scope/version freeze, durable storage approach, native confirmation/permission probes and the forecast must remain explicit.
+
+The live evaluation's cost threshold is a post-response stop, not a hard provider-side billing cap. Request counts/input size were bounded and only four small synthetic requests were made. Never present these provisional labels or rule-matched baseline scores as an independent safety benchmark.

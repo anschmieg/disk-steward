@@ -16,3 +16,11 @@ Before each milestone record the product-purpose check, scope cornerstones and f
 ### Continuation batch — 31 October 2026
 
 M0 advanced through core capability contracts, backend linkage and disposable recovery mechanics. All production capabilities deliberately unsupported; no renderer I/O introduced. Coordinator fixed path traversal in the development probe before commit. Verified seven core tests, five recovery probe tests, native desktop check and formatting/Clippy/version guard. Version stays 0.0.1 on existing feat/m0-foundation / PR #1. Next batch should tackle remaining native feasibility probes rather than repeat this scaffold. Human label/live AI and Git authentication gates remain open. Quota remained 46%; heartbeat stays active.
+
+### Sustained continuation — 0.0.2
+
+Resumed after Adrian correctly challenged a premature short run. Automation prompt now explicitly requires sustained work across routine batch/commit boundaries. Luna delegates implemented native recovery/bookmark/confirmation/Keychain probes, HTTPS/Jev helpers, verification-budget accounting, detector/APFS probes and SQLite approval-ledger feasibility; coordinator reviewed, fixed/integrated and exercised disposable native fixtures. See PROGRESS.md and probes/M0-EVIDENCE.md for actual results and limitations.
+
+Verified: 20 Rust workspace tests, fmt/strict Clippy, desktop cargo check, frontend build/version guard, native 0.0.2 debug bundle, 26 evaluation tests and 25 probe tests. All production adapters remain unsupported. Security-scoped bookmark and actual native confirmation cancellation paths remain unproven. Jev four development calls establish connectivity only; human labels remain outstanding. Private HTTPS advertisement worked but full proof/broker/worker limits remain open.
+
+Next active bounded work: journal_feasibility agent implementing probes/worker disposable child cancellation/accounting harness. Review it before integration. Then package-level selected-folder/denial/revocation/confirmation tests and production transport/storage enforcement choices. Do not redo completed probes or mark M0 complete. Last quota sampling: 43% remaining; heartbeat active.
