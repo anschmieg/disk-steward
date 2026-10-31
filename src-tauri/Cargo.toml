@@ -13,4 +13,5 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+disk-steward-core = { path = "../crates/disk-steward-core" }
 tauri = { version = "2", features = [] }

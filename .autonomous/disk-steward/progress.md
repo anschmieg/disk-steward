@@ -12,3 +12,7 @@ Resume from /Users/adrian/Projects/disk-steward, current Git state, PROGRESS.md,
 GitHub Actions did not run because of account billing/spending restrictions. Continue independent local work; do not alter billing or misreport CI as passing. If a specific M0 gate requires unavailable access, document it and work on unaffected gates rather than stopping at the first dependency. If no useful work remains, pause and explain the exact user action needed.
 
 Before each milestone record the product-purpose check, scope cornerstones and failure cases. End each work batch with evidence, actual remaining work and branch/commit references. Do not run the autonomous skill's separate CLI runner in parallel with this app heartbeat; use its durable handoff pattern only to avoid duplicate writers and quota monitoring outside the app.
+
+### Continuation batch — 31 October 2026
+
+M0 advanced through core capability contracts, backend linkage and disposable recovery mechanics. All production capabilities deliberately unsupported; no renderer I/O introduced. Coordinator fixed path traversal in the development probe before commit. Verified seven core tests, five recovery probe tests, native desktop check and formatting/Clippy/version guard. Version stays 0.0.1 on existing feat/m0-foundation / PR #1. Next batch should tackle remaining native feasibility probes rather than repeat this scaffold. Human label/live AI and Git authentication gates remain open. Quota remained 46%; heartbeat stays active.

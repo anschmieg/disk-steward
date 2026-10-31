@@ -592,9 +592,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-steward-core"
+version = "0.0.1"
+
+[[package]]
 name = "disk-steward-desktop"
 version = "0.0.1"
 dependencies = [
+ "disk-steward-core",
  "tauri",
  "tauri-build",
 ]

@@ -74,6 +74,71 @@ typed_id!(ActionId);
 typed_id!(ApprovalId);
 typed_id!(EvidenceId);
 
+/// Host platform identifiers used to describe adapter coverage. These values do
+/// not imply that an adapter is installed, available, or validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HostPlatform {
+    MacOS,
+    Windows,
+    Linux,
+    Other,
+}
+
+/// Portable platform functions that an adapter may report status for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlatformCapability {
+    ScopeAccess,
+    FileIdentity,
+    RecoverableStage,
+    Restore,
+    PermanentRemoval,
+    SecureCredentialStore,
+    NativeConfirmation,
+}
+
+/// Why a platform capability cannot currently be used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    /// A concrete adapter reports the capability available. This is not by itself
+    /// proof that a destructive operation passed its required validation gate.
+    Available { adapter_version: String },
+    /// The capability is supported in principle, but a runtime dependency or
+    /// condition is missing (for example, permission has not been granted).
+    Unavailable { reason: String },
+    /// This adapter/platform combination does not implement the capability.
+    Unsupported { reason: String },
+}
+
+/// A platform adapter's reported status for one capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityReport {
+    pub platform: HostPlatform,
+    pub capability: PlatformCapability,
+    pub status: CapabilityStatus,
+}
+
+impl CapabilityReport {
+    #[must_use]
+    pub const fn new(
+        platform: HostPlatform,
+        capability: PlatformCapability,
+        status: CapabilityStatus,
+    ) -> Self {
+        Self {
+            platform,
+            capability,
+            status,
+        }
+    }
+
+    /// Returns true only for an adapter's explicit availability report.
+    /// Callers must still apply operation-specific validation and approval gates.
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        matches!(self.status, CapabilityStatus::Available { .. })
+    }
+}
+
 /// Identifies the approved plan state without carrying paths into the renderer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeSnapshot {
@@ -393,6 +458,43 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(format!("{first:?}"), "ScopeId([redacted])");
         assert_eq!(format!("{:?}", OpaqueId::new()), "OpaqueId([redacted])");
+    }
+
+    #[test]
+    fn platform_status_keeps_unavailable_and_unsupported_distinct() {
+        let permission_missing = CapabilityReport::new(
+            HostPlatform::MacOS,
+            PlatformCapability::ScopeAccess,
+            CapabilityStatus::Unavailable {
+                reason: "user permission not granted".into(),
+            },
+        );
+        let no_adapter = CapabilityReport::new(
+            HostPlatform::Windows,
+            PlatformCapability::RecoverableStage,
+            CapabilityStatus::Unsupported {
+                reason: "no validated staging adapter".into(),
+            },
+        );
+
+        assert!(!permission_missing.is_available());
+        assert!(!no_adapter.is_available());
+        assert_ne!(permission_missing.status, no_adapter.status);
+    }
+
+    #[test]
+    fn reported_availability_does_not_imply_mutation_authority() {
+        let report = CapabilityReport::new(
+            HostPlatform::MacOS,
+            PlatformCapability::RecoverableStage,
+            CapabilityStatus::Available {
+                adapter_version: "fixture-adapter/0.0.1".into(),
+            },
+        );
+
+        assert!(report.is_available());
+        // The report has no operation executor, path, target, or approval API.
+        assert_eq!(report.capability, PlatformCapability::RecoverableStage);
     }
 
     #[test]

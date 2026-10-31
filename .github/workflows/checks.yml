@@ -29,6 +29,7 @@ jobs:
       - run: npm audit --audit-level=high
       - run: python3 evaluation/harness.py --score-baseline --check-validator
       - run: python3 -m unittest discover -s evaluation -p 'test_*.py'
+      - run: python3 -m unittest discover -s probes -p 'test_*.py'
   desktop-macos:
     runs-on: macos-latest
     steps:
