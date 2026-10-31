@@ -15,6 +15,10 @@ This is the proposed release scope, not a claim that the detectors already exist
 | D7 | Large files and folders | Metadata/coverage-based discovery in selected scopes | Explain/reveal/add to plan; execution only through a supported file/category adapter | No generic recursive deletion or inference that large means disposable; unfamiliar/managed stores remain review-only |
 | D8 | Ordinary standalone Git clones | Full local-state assessment plus fresh remote/object verification and a valid authentication adapter | Stage a reviewed verified clone; permanent removal requires a second plan | Worktrees, submodules/nested repos, alternates, LFS, shallow/partial/sparse clones, unknown local state, unsupported auth, expired evidence, and verification-budget exhaustion remain blocked initially |
 
+## Recorded M0 implementation targets
+
+[Decision 0002](docs/decisions/0002-detector-scope.md) selects D2 CPython 3.15.0 checked-hash bytecode and D3 pytest 9.2.0 `nodeids` records as the two generated/cache implementation targets for M3. They are not enabled adapters. Exact formats, roots, negative evidence and unresolved provenance/activity gates are recorded there. D1 Cargo and D4 Homebrew remain review-only in this selected slice pending new ownership/provenance evidence. D6 exact duplicates remains a separate hard M3 gate; D5's proposed explicit per-file target is unchanged. M0 is still open, including full catalog feasibility and the other recorded gates.
+
 ## Minimum useful M3 release slice
 
 D1–D4 are the initial named generated-data/cache targets; D5–D7 complete the offline review experience. D8 is integrated in M4. M3 requires at least two executable generated-data/cache families among D1–D4, plus D6, to pass complete staging/restoration/permanent-removal tests. M0 must choose the executable subset and mark every remaining target review-only or deferred with its reason. This gate prevents the release passing with only a framework or a list of unexecutable findings.

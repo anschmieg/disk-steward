@@ -17,6 +17,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+SUPPORTED_CPYTHON_VERSION = (3, 15, 0)
+SUPPORTED_CPYTHON_CACHE_TAG = "cpython-315"
+SUPPORTED_CPYTHON_MAGIC = bytes.fromhex("520e0d0a")
+
 
 class FixtureRejected(RuntimeError):
     """The fixture is outside the narrow, validated generated-file shape."""
@@ -86,10 +90,51 @@ def regenerate(source: Path) -> tuple[Path, bytes]:
     return cache, cache.read_bytes()
 
 
+def validate_pytest_nodeids(root: Path, cache_root: Path, record: Path) -> dict[str, Any]:
+    """Validate only pytest 9.2.0's exact fixture-generated nodeids JSON shape."""
+    root = Path(os.path.abspath(root))
+    cache_root = Path(os.path.abspath(cache_root))
+    record = Path(os.path.abspath(record))
+    if root.is_symlink():
+        raise FixtureRejected("fixture root is a symbolic link")
+    expected = cache_root / "v" / "cache" / "nodeids"
+    for path in (cache_root, record):
+        if not _within(root, path):
+            raise FixtureRejected("pytest cache path escaped the selected fixture root")
+        current = path
+        while current != root:
+            if current.is_symlink():
+                raise FixtureRejected("symbolic links are not eligible")
+            current = current.parent
+    if record != expected:
+        raise FixtureRejected("pytest record is not the standard v/cache/nodeids record")
+    if not record.is_file() or record.is_symlink():
+        raise FixtureRejected("pytest nodeids record is not a regular file")
+    try:
+        value = json.loads(record.read_text(encoding="utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise FixtureRejected("pytest nodeids record is not valid UTF-8 JSON") from exc
+    if (not isinstance(value, list) or not value
+            or any(not isinstance(nodeid, str) or not nodeid for nodeid in value)
+            or len(value) != len(set(value)) or value != sorted(value)):
+        raise FixtureRejected("pytest nodeids record has an unrecognized structure")
+    for nodeid in value:
+        test_path = nodeid.split("::", 1)[0]
+        if ("::" not in nodeid or test_path.startswith(("/", "\\"))
+                or "\\" in test_path or ".." in Path(test_path).parts):
+            raise FixtureRejected("pytest nodeids record contains a non-fixture path form")
+    return {"kind": "pytest_9_2_nodeids_json", "count": len(value),
+            "nodeids": value}
+
+
 def _pytest_cache_probe(root: Path) -> dict[str, Any]:
     """Use installed pytest only, in an internally-created project fixture."""
     if importlib.util.find_spec("pytest") is None:
         return {"status": "unavailable", "reason": "pytest is not installed; no install attempted"}
+    pytest_version = _pytest_version()
+    if pytest_version != "9.2.0":
+        return {"status": "unsupported-version", "pytest_version": pytest_version,
+                "reason": "only the pinned pytest 9.2.0 fixture format is in scope"}
 
     project = root / "pytest-fixture"
     project.mkdir()
@@ -117,7 +162,7 @@ def _pytest_cache_probe(root: Path) -> dict[str, Any]:
     records: dict[str, str] = {}
     cache_records = cache_dir / "v" / "cache"
     if cache_records.is_dir() and not cache_records.is_symlink():
-        for name in ("nodeids", "lastfailed", "stepwise"):
+        for name in ("lastfailed", "stepwise"):
             record = cache_records / name
             if record.is_file() and not record.is_symlink():
                 try:
@@ -125,8 +170,26 @@ def _pytest_cache_probe(root: Path) -> dict[str, Any]:
                     records[name] = "valid-json-fixture-record"
                 except (UnicodeError, json.JSONDecodeError):
                     records[name] = "invalid-or-unknown; keep"
-    return {"status": "fixture-passed", "pytest_version": _pytest_version(),
+        nodeids = cache_records / "nodeids"
+        if nodeids.exists() or nodeids.is_symlink():
+            try:
+                validated = validate_pytest_nodeids(root, cache_dir, nodeids)
+                records["nodeids"] = "validated-sorted-string-array"
+                nodeids_value = validated["nodeids"]
+            except FixtureRejected:
+                records["nodeids"] = "invalid-or-unknown; keep"
+                nodeids_value = []
+        else:
+            nodeids_value = []
+    else:
+        nodeids_value = []
+    unexpected_cache_records = (sorted(p.name for p in cache_records.iterdir()
+                                       if p.name not in {"nodeids", "lastfailed", "stepwise"})
+                               if cache_records.is_dir() and not cache_records.is_symlink() else [])
+    return {"status": "fixture-passed", "pytest_version": pytest_version,
             "recognized_records": records, "unexpected_top_level_entries": unknown,
+            "unexpected_cache_records": unexpected_cache_records,
+            "nodeids": nodeids_value,
             "cache_root": ".pytest_cache (fixture only)"}
 
 
@@ -140,6 +203,19 @@ def _pytest_version() -> str | None:
 
 def run_fixture_probe() -> dict[str, Any]:
     """Create, compile, classify and negatively mutate only disposable fixtures."""
+    if (sys.version_info[:3] != SUPPORTED_CPYTHON_VERSION
+            or sys.implementation.cache_tag != SUPPORTED_CPYTHON_CACHE_TAG
+            or importlib.util.MAGIC_NUMBER != SUPPORTED_CPYTHON_MAGIC):
+        return {
+            "cpython": {
+                "status": "unsupported-version",
+                "python_version": sys.version.split()[0],
+                "cache_tag": sys.implementation.cache_tag,
+                "magic": importlib.util.MAGIC_NUMBER.hex(),
+            },
+            "pytest": {"status": "not-run", "reason": "CPython pin did not match"},
+            "scope": "synthetic fixtures only; no user paths, no global installation",
+        }
     with tempfile.TemporaryDirectory(prefix="disk-steward-catalog-") as temp:
         root = Path(temp)
         source = root / "fixture_module.py"
@@ -163,6 +239,23 @@ def run_fixture_probe() -> dict[str, Any]:
             validate_bytecode(root, source, regenerated_cache, first_bytes)
         except FixtureRejected:
             changed_rejected = True
+        regenerated_cache.write_bytes(pristine)
+
+        changed_source_rejected = False
+        source.write_text("raise RuntimeError('probe source must never execute')\nVALUE = 8\n",
+                          encoding="utf-8")
+        try:
+            validate_bytecode(root, source, regenerated_cache, first_bytes)
+        except FixtureRejected:
+            changed_source_rejected = True
+        source.write_bytes(b"raise RuntimeError('probe source must never execute')\nVALUE = 7\n")
+
+        unknown_header_rejected = False
+        regenerated_cache.write_bytes(pristine[:4] + struct.pack("<I", 1) + pristine[8:])
+        try:
+            validate_bytecode(root, source, regenerated_cache, first_bytes)
+        except FixtureRejected:
+            unknown_header_rejected = True
         regenerated_cache.write_bytes(pristine)
 
         missing_source_rejected = False
@@ -202,6 +295,8 @@ def run_fixture_probe() -> dict[str, Any]:
                 "checked_hash_source_match": True,
                 "regeneration_exact_match": exact_regeneration,
                 "changed_cache_refused": changed_rejected,
+                "changed_source_refused": changed_source_rejected,
+                "unknown_header_refused": unknown_header_rejected,
                 "missing_source_refused": missing_source_rejected,
                 "symlink_refused": symlink_rejected,
                 "unexpected_file_refused": unexpected_rejected,

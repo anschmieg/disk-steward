@@ -35,3 +35,10 @@ These are coordinator-observed development experiments, not production adapter c
 The native experiments support continuing with receipt-based recovery feasibility, a shared typed core and OS-specific adapters. They do not close all M0 gates. Human evaluation, production broker/resource integration, detector scope/version freeze, durable storage approach, native confirmation/permission probes and the forecast must remain explicit.
 
 The live evaluation's cost threshold is a post-response stop, not a hard provider-side billing cap. Request counts/input size were bounded and only four small synthetic requests were made. Never present these provisional labels or rule-matched baseline scores as an independent safety benchmark.
+
+
+## Catalog follow-up — 1 November 2026
+
+Luna narrowed the D2/D3 implementation target and expanded negative fixtures. Coordinator replayed the updated probe with CPython3.15.0 and pinned pytest9.2.0 in an isolated temporary environment after the restricted install failed; the environment was removed afterward. Both manager-generated fixtures passed. The retained result is probes/catalog/evidence/2026-11-01-fixture-replay.json. Six catalog tests and45 then-current Python probe tests passed; unmatched interpreter versions are explicitly skipped and unknown pytest versions do not execute the fixture. This is feasibility, not production ownership/activity or full cleanup support. Decision0002 preserves the separate D5/D6 gates; no user files were touched.
+
+A read-only signing inventory with normal host access returned zero valid code-signing identities (exit0). Signed/notarized packaging cannot be validated on this host yet. It does not block independent local implementation, and no identity or credential was installed or changed.
