@@ -1,6 +1,6 @@
 # M1A validation checkpoint — 0.0.4
 
-M1A is in validation. The complete disposable-file interaction has been observed in the native macOS debug app. This does not enable user-file cleanup or close the unresolved M0 gates.
+M1A is complete for its five-file disposable macOS debug slice. The complete disposable-file interaction has been observed in the native macOS debug app. This does not enable user-file cleanup or close the unresolved M0 gates.
 
 ## Observed desktop flow
 
@@ -27,8 +27,22 @@ The control schema retains its original strict child-state vocabulary. For items
 
 ## Evidence and limits
 
-The workspace passed its then-current 83 Rust tests; the two subsequent service regression tests passed separately, bringing the set to 85. Seven native backend tests passed. Workspace and native Clippy passed with warnings denied, formatting and frontend build/version checks passed. Git transport socket tests require local socket access; the restricted run failed with permission errors, and the authorized local-socket run passed. Those failures were not counted as successes.
+After independent review fixes, all 88 workspace Rust tests and eight native backend tests passed. Workspace and native Clippy passed with warnings denied, formatting and frontend build/version checks passed. Git transport socket tests require local socket access; the restricted run failed with permission errors, and the authorized local-socket run passed. Those failures were not counted as successes.
 
-The native debug bundle built at approximately 34.14 MiB. Later cosmetic fixes distinguish the active navigation item and render zero as `0 bytes`; their frontend build passed, but that exact cosmetic revision still needs a final native smoke check. CI remains unrun because of the known GitHub account restriction. No signed/notarized, Windows, Linux or production permission claim follows from local macOS tests.
+The native debug bundle built at approximately 34.14 MiB. The final committed native smoke check confirmed the active navigation highlight, restored status, fresh staging eligibility and `0 bytes` recovered-space display. CI remains unrun because of the known GitHub account restriction. No signed/notarized, Windows, Linux or production permission claim follows from local macOS tests.
 
-M0 still needs its independent human labels/development evaluation, complete authenticated Git worker/object proof, packaged permission matrix, catalog freeze and forecast. M1B review throughput and M1C permanent removal/actual-space recovery remain separate gates. The next checkpoint must record a revised effort forecast before M1A is marked complete or editor breadth is added.
+M0 still needs its independent human labels/development evaluation, complete authenticated Git worker/object proof, packaged permission matrix, catalog freeze and forecast. M1B review throughput and M1C permanent removal/actual-space recovery remain separate gates. The revised effort forecast is recorded in docs/IMPLEMENTATION-FORECAST.md. The independent safety review found expiry binding, interrupted-byte accounting and cross-process plan-edit gaps. All three are closed with regression tests; the final native smoke check confirmed owner edits (Revisions 5/6), an expiry-bound stage review and native cancellation with the restored file retained.
+
+
+## Acceptance and scope of completion
+
+| M1A gate | Evidence |
+|---|---|
+| Five-action editable plan, evidence and revision invalidation | Persistent plan store tests; native revisions and unchanged Keep decisions |
+| Frozen review and exact native confirmation | Metadata snapshots remain non-executable; separate file review binds session, identities, contents, decisions, expiry and operation |
+| Approval and intent before file operation | Core validation, one-time ledger, durable batch/item attempts; cancellation/replay/expiry/tampering tests |
+| Supported recoverable stage, persistent results and collision-safe restore | Observed native stage → quit/reopen → restore; isolated fixture collision/content/link/concurrency tests |
+| Interruption fails closed | Exclusive owner before recovery, uncertainty without retries, known completed totals retained, later files unattempted after uncertainty |
+| Forecast before breadth | docs/IMPLEMENTATION-FORECAST.md, with remaining uncertainty and external waiting time separated |
+
+The synthetic fixture snapshots are the inventory for this slice. General live inventory, variable plan membership, persistent exclusions, undo/redo and schema evolution for the general editor remain their named later checkpoints. No cleanup adapter for existing user files is enabled. M0's independent gates remain open and are not prerequisites silently waived for release.

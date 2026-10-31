@@ -1,6 +1,6 @@
-# Disk Steward — cross-platform cleanup application plan
+# Disk Steward
 
-Working name; no naming or trademark research performed. Planning package dated 31 October 2026. Implementation is in progress; the current application uses synthetic data and cannot clean the computer.
+Working name; no naming or trademark research performed. Implementation is in progress at 0.0.4. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore cycle for five disposable files it creates itself. User-file scanning and cleanup are not enabled.
 
 ## Product
 
@@ -49,7 +49,7 @@ Build a five-action synthetic plan → edit → frozen approval → recoverable 
 
 Run a small bounded AI feasibility evaluation in M0 before freezing evidence contracts; full production Jev/agent integration remains M5 and uses held-out evaluation. Missing evaluation access is an explicit dependency, not evidence of success.
 
-The earlier 12–16-week envelope is unvalidated and no longer an active delivery forecast. Reforecast after M0 and again after M1A from measured effort and frozen scope. Windows/Linux production releases remain separate tracks. M0 remains in progress. M1A review/storage work has started from its tested contracts; M1B–M6 remain planned.
+The earlier 12–16-week envelope is unvalidated and no longer an active delivery forecast. Reforecast after M0 and again after M1A from measured effort and frozen scope. Windows/Linux production releases remain separate tracks. M0 remains in progress. M1A's five-file disposable lifecycle is complete from its tested contracts; M1B–M6 remain planned.
 
 ## Development
 
@@ -57,4 +57,6 @@ Version: 0.0.4. Repository: https://github.com/anschmieg/disk-steward (private).
 
 Use `npm ci` then `npm run dev` for the fixture UI, or `npm run tauri dev` for the desktop shell after installing the native prerequisites. `npm run build` checks TypeScript and builds the frontend. `cargo test --workspace` tests the portable contracts, including the local-only gix transport seam; target that probe with `cargo test -p disk-steward-gix-byte-probe`. Run workspace formatting and lint checks with `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`. `cargo check --manifest-path src-tauri/Cargo.toml -j 2` checks the native backend separately. `node scripts/check-version.mjs` enforces matching 0.0.x versions. The optional evaluation harness is development tooling: see [evaluation notes](evaluation/README.md).
 
-The current UI edits a backend-owned five-action synthetic plan, saves immutable review snapshots, and preserves decisions across restarts. It cannot scan, stage, approve, or clean user files. The native backend exposes only explicit plan/diagnostic commands, with no generic filesystem, shell or SQL access. Review records are not execution approvals. A disposable file-lifecycle component is under review and is not connected to the interface.
+The current UI edits a backend-owned five-action synthetic plan, saves immutable review snapshots, and preserves decisions across restarts. A separate Fixture demo creates five new files and supports exact review → native confirmation → recoverable stage → results → fresh review/confirmation → restore. Metadata reviews cannot authorize those operations. Staging/restoring frees no space, and permanent removal is unavailable. The native backend exposes narrow typed commands, with no generic filesystem, shell or SQL access. It cannot scan or clean user files.
+
+See [M1A validation](docs/M1A-VALIDATION.md) for observed native behavior, tests and remaining gates, and the [implementation forecast](docs/IMPLEMENTATION-FORECAST.md) for the revised work estimate. M1A is complete within its documented disposable scope; M0 remains open and no supported release is implied by a successful demo.

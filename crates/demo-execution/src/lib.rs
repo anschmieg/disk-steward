@@ -168,6 +168,9 @@ struct FileManifest {
     scope_id: ScopeId,
     plan_id: disk_steward_core::PlanId,
     revision_id: RevisionId,
+    prepared_review_id: ReviewId,
+    created_at_ms: i64,
+    expires_at_ms: i64,
     frozen_review_id: ReviewId,
     frozen_review_sha256: String,
     operation: String,
@@ -535,6 +538,9 @@ impl DemoExecutionService {
             scope_id: ScopeId::new(),
             plan_id: plan.plan_id,
             revision_id: expected,
+            prepared_review_id: review_id,
+            created_at_ms: now,
+            expires_at_ms: expires,
             frozen_review_id: frozen.review_id,
             frozen_review_sha256: frozen_hash,
             operation: operation.into(),
@@ -573,7 +579,12 @@ impl DemoExecutionService {
         }
         let manifest: FileManifest =
             serde_json::from_str(&json).map_err(|_| DemoError::CorruptData)?;
-        if hash_json(&manifest)? != digest {
+        if hash_json(&manifest)? != digest
+            || manifest.prepared_review_id != id
+            || manifest.expires_at_ms != expires
+            || manifest.created_at_ms < 0
+            || manifest.expires_at_ms.checked_sub(manifest.created_at_ms) != Some(REVIEW_TTL_MS)
+        {
             return Err(DemoError::CorruptData);
         }
         let plan = self
@@ -631,6 +642,10 @@ impl DemoExecutionService {
             || prepared.schema_version != 1
             || prepared.manifest_sha256 != digest
             || hash_json(manifest)? != digest
+            || manifest.prepared_review_id != prepared.review_id
+            || manifest.expires_at_ms != prepared.expires_at_ms
+            || manifest.expires_at_ms.checked_sub(manifest.created_at_ms) != Some(REVIEW_TTL_MS)
+            || manifest.created_at_ms > now
         {
             return Err(DemoError::InvalidReview);
         }
@@ -1063,6 +1078,12 @@ impl DemoExecutionService {
         }
         let mut items = Vec::new();
         let mut attempts_to_update = Vec::new();
+        let plan = self
+            .plan
+            .get_plan()
+            .map_err(|_| DemoError::PlanUnavailable)?;
+        let mut staged_bytes = 0_u64;
+        let mut restored_bytes = 0_u64;
         for attempt in &binding.attempts {
             let attempt_id = wire(attempt)?;
             let row: Option<(String, Option<String>, String)> = self
@@ -1077,6 +1098,11 @@ impl DemoExecutionService {
             let (action_wire, receipt_wire, prior_state) = row.ok_or(DemoError::CorruptData)?;
             let action_id: ActionId =
                 serde_json::from_str(&action_wire).map_err(|_| DemoError::CorruptData)?;
+            let action = plan
+                .actions
+                .iter()
+                .find(|action| action.id == action_id)
+                .ok_or(DemoError::CorruptData)?;
             let receipt_id = receipt_wire
                 .as_deref()
                 .map(serde_json::from_str)
@@ -1090,6 +1116,16 @@ impl DemoExecutionService {
             } else {
                 prior_state.as_str()
             };
+            if prior_state == "staged" && operation == "stage" {
+                staged_bytes = staged_bytes
+                    .checked_add(action.bytes)
+                    .ok_or(DemoError::CorruptData)?;
+            }
+            if prior_state == "restored" && operation == "restore" {
+                restored_bytes = restored_bytes
+                    .checked_add(action.bytes)
+                    .ok_or(DemoError::CorruptData)?;
+            }
             items.push(ExecutionItem {
                 action_id,
                 receipt_id,
@@ -1101,8 +1137,8 @@ impl DemoExecutionService {
             operation,
             state: "uncertain".into(),
             items,
-            staged_bytes: 0,
-            restored_bytes: 0,
+            staged_bytes,
+            restored_bytes,
             recovered_bytes: 0,
         };
         let now = (self.now)();
@@ -1208,6 +1244,7 @@ fn validate_file_manifest(
         || manifest.session_id != prepared.session_id
         || manifest.plan_id != prepared.plan_id
         || manifest.revision_id != prepared.revision_id
+        || manifest.prepared_review_id != prepared.review_id
         || manifest.frozen_review_id != frozen.review_id
         || manifest.frozen_review_sha256 != frozen.manifest_sha256
         || manifest.operation != prepared.operation
@@ -1764,6 +1801,74 @@ mod tests {
     }
 
     #[test]
+    fn editing_only_the_expiry_column_is_detected_before_confirmation() {
+        let (dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let review = service.prepare_stage(plan.revision_id).expect("review");
+        let changed = service
+            .control
+            .execute(
+                "UPDATE prepared_reviews SET expires_at_ms=?1 WHERE review_id=?2",
+                params![
+                    review.expires_at_ms + REVIEW_TTL_MS,
+                    wire(&review.review_id).unwrap()
+                ],
+            )
+            .expect("tamper only the unhashed column");
+        assert_eq!(changed, 1);
+        let mut callback_called = false;
+        assert_eq!(
+            service
+                .confirm_and_execute(review.review_id, |_| {
+                    callback_called = true;
+                    true
+                })
+                .unwrap_err(),
+            DemoError::CorruptData
+        );
+        assert!(!callback_called);
+        assert_eq!(
+            service.status().expect("fixture unchanged").fixtures[0].status,
+            FixtureStatus::Available
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn overlong_lifetime_is_rejected_even_with_a_recomputed_manifest_hash() {
+        let (_dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let review = service.prepare_stage(plan.revision_id).expect("review");
+        let review_wire = wire(&review.review_id).unwrap();
+        let json: String = service
+            .control
+            .query_row(
+                "SELECT manifest_json FROM prepared_reviews WHERE review_id=?1",
+                [&review_wire],
+                |row| row.get(0),
+            )
+            .expect("stored manifest");
+        let mut manifest: FileManifest = serde_json::from_str(&json).expect("manifest");
+        manifest.expires_at_ms += 1;
+        let tampered_json = bounded_json(&manifest).expect("tampered manifest");
+        let tampered_hash = hash_json(&manifest).expect("self-consistent hash");
+        service.control.execute(
+            "UPDATE prepared_reviews SET manifest_json=?1,manifest_sha256=?2,expires_at_ms=?3 WHERE review_id=?4",
+            params![tampered_json, tampered_hash, manifest.expires_at_ms, review_wire],
+        ).expect("persist internally consistent overlong review");
+        assert_eq!(
+            service
+                .confirm_and_execute(review.review_id, |_| true)
+                .unwrap_err(),
+            DemoError::CorruptData
+        );
+        assert_eq!(
+            service.status().expect("fixture unchanged").fixtures[0].status,
+            FixtureStatus::Available
+        );
+    }
+
+    #[test]
     fn interrupted_started_batch_is_reported_uncertain_without_resume() {
         let (dir, mut service, plan) = fixture_service();
         let plan = include_one(&mut service, &plan);
@@ -1855,6 +1960,86 @@ mod tests {
                 .session_id,
             status.session_id
         );
+    }
+
+    #[test]
+    fn interrupted_batch_recovery_counts_durable_completed_items() {
+        let (dir, mut service, initial) = fixture_service();
+        let first = service
+            .plan
+            .edit(
+                initial.revision_id,
+                initial.actions[0].id,
+                disk_steward_review_plan::Decision::Include,
+            )
+            .expect("include first fixture");
+        let plan = service
+            .plan
+            .edit(
+                first.revision_id,
+                initial.actions[1].id,
+                disk_steward_review_plan::Decision::Include,
+            )
+            .expect("include second fixture");
+        let review = service
+            .prepare_stage(plan.revision_id)
+            .expect("two-item review");
+        let execution = ExecutionId::new();
+        let approval = ApprovalId::new();
+        let attempts = vec![AttemptId::new(), AttemptId::new()];
+        let receipt = service
+            .lifecycle
+            .as_mut()
+            .expect("fixture lifecycle")
+            .stage(review.items[0].action_id, attempts[0])
+            .expect("first fixture moved before simulated crash");
+        let binding = BatchBinding {
+            execution_id: execution,
+            approval_id: approval,
+            attempts: attempts.clone(),
+            review_id: review.review_id,
+            digest: review.manifest_sha256.clone(),
+        };
+        let now = wall_now_ms();
+        let tx = service
+            .control
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("control transaction");
+        tx.execute(
+            "UPDATE control SET active_execution_id=?1 WHERE singleton=1",
+            [wire(&execution).unwrap()],
+        )
+        .expect("claim active batch");
+        tx.execute(
+            "UPDATE prepared_reviews SET claimed=1 WHERE review_id=?1",
+            [wire(&review.review_id).unwrap()],
+        )
+        .expect("claim review");
+        tx.execute("INSERT INTO executions(execution_id,review_id,approval_id,operation,state,batch_json,started_at_ms,finished_at_ms) VALUES(?1,?2,?3,'stage','started',?4,?5,NULL)", params![wire(&execution).unwrap(),wire(&review.review_id).unwrap(),wire(&approval).unwrap(),bounded_json(&binding).unwrap(),now]).expect("execution intent");
+        tx.execute(
+            "INSERT INTO child_attempts(attempt_id,execution_id,action_id,state,receipt_id) VALUES(?1,?2,?3,'staged',?4)",
+            params![wire(&attempts[0]).unwrap(),wire(&execution).unwrap(),wire(&review.items[0].action_id).unwrap(),wire(&receipt).unwrap()],
+        ).expect("persist known first item");
+        tx.execute(
+            "INSERT INTO child_attempts(attempt_id,execution_id,action_id,state,receipt_id) VALUES(?1,?2,?3,'pending',NULL)",
+            params![wire(&attempts[1]).unwrap(),wire(&execution).unwrap(),wire(&review.items[1].action_id).unwrap()],
+        ).expect("persist pending second item");
+        tx.commit().expect("persist simulated crash point");
+        drop(service);
+
+        let mut reopened = DemoExecutionService::open(dir.path()).expect("recover");
+        let recovered = reopened
+            .status()
+            .expect("status")
+            .last_execution
+            .expect("recovered execution");
+        assert_eq!(recovered.state, "uncertain");
+        assert_eq!(recovered.staged_bytes, review.items[0].bytes);
+        assert_eq!(recovered.restored_bytes, 0);
+        assert_eq!(recovered.items[0].status, "staged");
+        assert_eq!(recovered.items[0].receipt_id, Some(receipt));
+        assert_eq!(recovered.items[1].status, "uncertain");
+        assert_eq!(recovered.items[1].receipt_id, None);
     }
 
     #[test]

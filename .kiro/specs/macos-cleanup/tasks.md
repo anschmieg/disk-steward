@@ -27,11 +27,11 @@ Exit: feasibility evidence, supported operation/access model, measured resource 
 
 ### M1A — Smallest complete vertical slice
 
-- [ ] 1.1 Define core inventory/evidence/action/revision/approval/journal types and SQLite migrations; build a five-action synthetic plan with keep/include, evidence, frozen review, native confirmation, and one supported staged-file operation.
+- [x] 1.1 Define core inventory/evidence/action/revision/approval/journal types and SQLite migrations; build a five-action synthetic plan with keep/include, evidence, frozen review, native confirmation, and one supported staged-file operation.
   - Enforce typed commands, scope/identity checks, immutable manifest approval, edit invalidation, intent/outcome journaling and collision-safe restore. No AI or live discovery required.
   - Requirements: R2.1–R2.3, R3.1, R3.4, R3.6, R4.1–R4.5, R8.1–R8.2, R11.2–R11.3.
 
-Checkpoint: demonstrate edit → approve → stage → results → restore; reject stale/unauthorized actions. Use measured effort to reforecast M1B–M6 before adding breadth.
+Checkpoint passed for the five-file disposable macOS debug slice: edit → approve → stage → results → restore, stale/unauthorized rejection, interruption and independent review fixes. Evidence: docs/M1A-VALIDATION.md. Remaining-work forecast: docs/IMPLEMENTATION-FORECAST.md. Production user-file adapters and the outstanding M0 gates remain unavailable.
 
 ### M1B — Full editor and review throughput
 

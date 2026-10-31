@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
-pub(crate) struct FixtureDemoState(Arc<Mutex<Result<DemoExecutionService, FixtureDemoError>>>);
+pub(crate) struct FixtureDemoState {
+    service: Arc<Mutex<Result<DemoExecutionService, FixtureDemoError>>>,
+    foreign_owner: bool,
+}
 
 impl FixtureDemoState {
     pub(crate) fn open(app: &tauri::AppHandle) -> Self {
@@ -25,7 +28,19 @@ impl FixtureDemoState {
             }
             DemoExecutionService::open(&directory).map_err(public_error)
         })();
-        Self(Arc::new(Mutex::new(service)))
+        Self::from_result(service)
+    }
+
+    fn from_result(service: Result<DemoExecutionService, FixtureDemoError>) -> Self {
+        let foreign_owner = matches!(&service, Err(error) if error.code == "busy");
+        Self {
+            service: Arc::new(Mutex::new(service)),
+            foreign_owner,
+        }
+    }
+
+    pub(crate) fn permits_plan_edits(&self) -> bool {
+        !self.foreign_owner
     }
 }
 
@@ -94,7 +109,7 @@ where
     T: Send + 'static,
     F: FnOnce(&mut DemoExecutionService) -> Result<T, DemoError> + Send + 'static,
 {
-    let service = Arc::clone(&state.0);
+    let service = Arc::clone(&state.service);
     tauri::async_runtime::spawn_blocking(move || {
         let mut guard = service.lock().map_err(|_| unavailable())?;
         let service = guard.as_mut().map_err(|error| *error)?;
@@ -151,7 +166,7 @@ pub(crate) async fn request_fixture_execution(
         message: "Finish the open native review before starting another.",
     })?;
     let window = app.get_webview_window("main").ok_or_else(unavailable)?;
-    let service = Arc::clone(&state.0);
+    let service = Arc::clone(&state.service);
     tauri::async_runtime::spawn_blocking(move || {
         // Keep the process-wide guard alive across the native callback and the
         // service's mandatory post-dialog validation and execution.
@@ -228,6 +243,26 @@ mod tests {
     use super::native_summary_at;
     use disk_steward_core::{PlanId, ReviewId, RevisionId, SessionId};
     use disk_steward_demo_execution::{PreparedDemoReview, PreparedItem};
+
+    #[cfg(unix)]
+    #[test]
+    fn second_live_instance_cannot_edit_the_shared_plan() {
+        let directory = tempfile::tempdir().expect("isolated app data");
+        let owner = super::DemoExecutionService::open(directory.path()).expect("first owner");
+        let second = super::FixtureDemoState::from_result(
+            super::DemoExecutionService::open(directory.path()).map_err(super::public_error),
+        );
+        assert!(!second.permits_plan_edits());
+        let first = super::FixtureDemoState::from_result(Ok(owner));
+        assert!(first.permits_plan_edits());
+        drop(first);
+        // An existing read-only instance does not silently acquire ownership.
+        assert!(!second.permits_plan_edits());
+        let reopened = super::FixtureDemoState::from_result(
+            super::DemoExecutionService::open(directory.path()).map_err(super::public_error),
+        );
+        assert!(reopened.permits_plan_edits());
+    }
 
     fn review(operation: &str) -> PreparedDemoReview {
         PreparedDemoReview {

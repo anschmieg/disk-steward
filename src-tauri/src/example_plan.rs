@@ -104,7 +104,14 @@ pub(crate) async fn get_example_plan(
 pub(crate) async fn edit_example_plan(
     request: EditRequest,
     state: tauri::State<'_, ExamplePlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
 ) -> Result<PlanView, PlanCommandError> {
+    if !demo.permits_plan_edits() {
+        return Err(PlanCommandError {
+            code: "plan_in_use",
+            message: "Another Disk Steward instance owns this workspace. Return to that instance to edit the plan.",
+        });
+    }
     // Serialize native edits with the entire confirmation/execution worker,
     // not just the dialog. Renderer disabled states are not a safety boundary.
     let guard = crate::NativeCheckGuard::acquire().map_err(|_| PlanCommandError {
