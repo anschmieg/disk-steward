@@ -42,3 +42,7 @@ review. Any reported cost threshold is checked after a response arrives; it is
 not a hard in-flight billing cap. Live results are marked unreviewed and the
 runner stores only the synthetic case ID, selected route, reported cost,
 response ID, and model.
+
+## Independent development-label review
+
+A blind, terminal-only manual review helper is available; see [review protocol](REVIEW-PROTOCOL.md). It stores annotations separately, never changes provisional labels, excludes held-out scenarios, and binds each annotation to the exact facts/evidence and route definitions shown. Reviewer identity is self-reported, not verified. No human annotations have been collected by this implementation. Completing the helper does not by itself establish model usefulness or pass M0.

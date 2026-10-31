@@ -102,19 +102,7 @@ async fn check_selected_folder_access(app: tauri::AppHandle) -> Result<String, S
         let path = selection
             .into_path()
             .map_err(|_| "The selected location is not a supported local folder.".to_owned())?;
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
-            "Folder metadata could not be read. Access remains unavailable.".to_owned()
-        })?;
-        if !metadata.file_type().is_dir() {
-            return Err(
-                "Select a local directory; links and files are unsupported in this check."
-                    .to_owned(),
-            );
-        }
-        // Opening an iterator probes access without consuming entry names or
-        // traversing the directory. This is not a durable authorization token.
-        std::fs::read_dir(&path)
-            .map_err(|_| "Folder access was denied or became unavailable.".to_owned())?;
+        check_folder_readability(&path).map_err(str::to_owned)?;
         Ok("Folder could be opened for reading. No scan ran and no folder was saved.".to_owned())
     })
     .await
@@ -140,4 +128,52 @@ async fn preview_native_review(app: tauri::AppHandle) -> Result<String, String> 
         if acknowledged { "Example acknowledged. No approval was issued and nothing changed.".to_owned() }
         else { "Review preview canceled. Nothing changed.".to_owned() }
     }).await.map_err(|_| "Native review preview did not complete.".to_owned())
+}
+
+/// Access feasibility only; this result is never an execution precondition or
+/// a retained scope grant. No entry names are requested from the iterator.
+fn check_folder_readability(path: &std::path::Path) -> Result<(), &'static str> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| "Folder metadata could not be read. Access remains unavailable.")?;
+    if !metadata.file_type().is_dir() {
+        return Err("Select a local directory; links and files are unsupported in this check.");
+    }
+    std::fs::read_dir(path).map_err(|_| "Folder access was denied or became unavailable.")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod folder_access_tests {
+    use super::check_folder_readability;
+
+    #[test]
+    fn selected_location_must_remain_a_readable_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        assert!(check_folder_readability(fixture.path()).is_ok());
+        let file = fixture.path().join("not-a-directory");
+        std::fs::write(&file, b"synthetic fixture").unwrap();
+        assert!(check_folder_readability(&file).is_err());
+        std::fs::remove_file(&file).unwrap();
+        assert!(check_folder_readability(&file).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_replacement_and_revoked_read_permission_are_rejected() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("selected");
+        std::fs::create_dir(&directory).unwrap();
+        let link = fixture.path().join("link");
+        symlink(&directory, &link).unwrap();
+        assert!(check_folder_readability(&link).is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let denied = check_folder_readability(&directory);
+        // Restore this own fixture before assertions or temporary-dir cleanup.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            denied.is_err(),
+            "run permission-denial checks as an unprivileged user"
+        );
+    }
 }

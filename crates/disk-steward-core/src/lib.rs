@@ -1,31 +1,42 @@
-//! Portable, side-effect-free domain contracts for Disk Steward.
+//! Portable domain contracts for Disk Steward.
 //!
-//! This crate deliberately contains no filesystem or process operations. It provides
-//! opaque identifiers and revision-bound scope/approval values for backend services.
+//! This crate contains no filesystem traversal or process execution. ID creation
+//! uses operating-system randomness. The remaining contracts bind opaque references
+//! and exact scope/approval revisions for backend services.
 
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use uuid::Uuid;
 
 /// A typed identifier whose representation is not exposed to callers.
 ///
-/// IDs are opaque within the process and suitable for domain references. Durable
-/// persistence and cross-process serialization are intentionally left to a future
-/// storage layer.
+/// IDs are opaque domain references, encoded durably as canonical UUID v4 strings.
+/// Possessing an ID does not grant authority to access or mutate anything.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OpaqueId(u128);
+pub struct OpaqueId(Uuid);
 
 impl OpaqueId {
-    /// Creates a new process-local opaque identifier.
+    /// Creates a random UUID v4 using the operating system's random number source.
     #[must_use]
     pub fn new() -> Self {
-        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        Self((epoch << 64) ^ u128::from(sequence))
+        Self(Uuid::new_v4())
+    }
+
+    fn parse_canonical(value: &str) -> Result<Self, &'static str> {
+        let uuid = Uuid::parse_str(value).map_err(|_| "invalid UUID")?;
+        if uuid.is_nil()
+            || uuid.get_version_num() != 4
+            || uuid.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err("identifier must be a non-nil UUID v4");
+        }
+        if uuid.hyphenated().to_string() != value {
+            return Err("identifier must use canonical lowercase UUID spelling");
+        }
+        Ok(Self(uuid))
     }
 }
 
@@ -42,7 +53,7 @@ impl fmt::Debug for OpaqueId {
 }
 
 macro_rules! typed_id {
-    ($name:ident) => {
+    ($name:ident, $kind:literal) => {
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(OpaqueId);
 
@@ -59,6 +70,36 @@ macro_rules! typed_id {
             }
         }
 
+        impl FromStr for $name {
+            type Err = &'static str;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                let prefix = concat!("disk-steward:", $kind, ":v1:");
+                let uuid = value.strip_prefix(prefix).ok_or("wrong typed ID schema")?;
+                OpaqueId::parse_canonical(uuid).map(Self)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let value = format!("disk-steward:{}:v1:{}", $kind, self.0 .0.hyphenated());
+                serializer.serialize_str(&value)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
+            }
+        }
+
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(concat!(stringify!($name), "([redacted])"))
@@ -67,12 +108,12 @@ macro_rules! typed_id {
     };
 }
 
-typed_id!(ScopeId);
-typed_id!(PlanId);
-typed_id!(RevisionId);
-typed_id!(ActionId);
-typed_id!(ApprovalId);
-typed_id!(EvidenceId);
+typed_id!(ScopeId, "scope");
+typed_id!(PlanId, "plan");
+typed_id!(RevisionId, "revision");
+typed_id!(ActionId, "action");
+typed_id!(ApprovalId, "approval");
+typed_id!(EvidenceId, "evidence");
 
 /// Host platform identifiers used to describe adapter coverage. These values do
 /// not imply that an adapter is installed, available, or validated.
@@ -355,6 +396,31 @@ impl Approval {
         if expires_at <= issued_at || snapshot.actions.is_empty() {
             return None;
         }
+        // Ambiguous identities or adapter versions must never become an
+        // approval binding. Semantic eligibility still belongs to policy.
+        let mut action_ids = HashSet::new();
+        let mut scope_ids = HashSet::new();
+        let mut adapter_names = HashSet::new();
+        if snapshot
+            .actions
+            .iter()
+            .any(|action| !action_ids.insert(action.id))
+            || snapshot
+                .scopes
+                .iter()
+                .any(|scope| !scope_ids.insert(scope.id))
+            || snapshot.adapter_versions.is_empty()
+            || snapshot.adapter_versions.iter().any(|(name, version)| {
+                !adapter_names.insert(name.as_str())
+                    || [name, version].iter().any(|value| {
+                        value.is_empty()
+                            || value.trim() != value.as_str()
+                            || value.chars().any(char::is_control)
+                    })
+            })
+        {
+            return None;
+        }
         if snapshot
             .scopes
             .iter()
@@ -458,6 +524,53 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(format!("{first:?}"), "ScopeId([redacted])");
         assert_eq!(format!("{:?}", OpaqueId::new()), "OpaqueId([redacted])");
+    }
+
+    #[test]
+    fn typed_ids_round_trip_through_persisted_bytes() {
+        let original = PlanId::new();
+        let persisted = serde_json::to_vec(&original).expect("serialize typed ID");
+        // Parsing is stateless, so this models a fresh process loading persisted bytes.
+        let restored: PlanId = serde_json::from_slice(&persisted).expect("load typed ID");
+        assert_eq!(restored, original);
+        assert_eq!(
+            std::str::from_utf8(&persisted).expect("UTF-8 UUID"),
+            format!("\"disk-steward:plan:v1:{}\"", original.0 .0.hyphenated())
+        );
+        assert_eq!(format!("{restored:?}"), "PlanId([redacted])");
+        assert!(serde_json::from_slice::<ScopeId>(&persisted).is_err());
+    }
+
+    #[test]
+    fn typed_id_parser_rejects_malformed_nil_wrong_version_and_noncanonical_values() {
+        for invalid in [
+            "not-a-uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "00000000-0000-1000-8000-000000000000",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "550e8400-e29b-41d4-1716-446655440000",
+        ] {
+            let encoded = format!("disk-steward:scope:v1:{invalid}");
+            assert!(encoded.parse::<ScopeId>().is_err(), "accepted {invalid}");
+            assert!(serde_json::from_str::<ScopeId>(&format!("\"{encoded}\"")).is_err());
+        }
+        assert!(serde_json::from_str::<ScopeId>("42").is_err());
+        assert!("disk-steward:scope:v2:550e8400-e29b-41d4-a716-446655440000"
+            .parse::<ScopeId>()
+            .is_err());
+    }
+
+    #[test]
+    fn new_typed_ids_are_non_nil_uuid_v4() {
+        let id = ScopeId::new();
+        let persisted = serde_json::to_string(&id).expect("serialize typed ID");
+        let text = persisted
+            .trim_matches('"')
+            .strip_prefix("disk-steward:scope:v1:")
+            .expect("typed ID schema");
+        let uuid = Uuid::parse_str(text).expect("generated UUID");
+        assert!(!uuid.is_nil());
+        assert_eq!(uuid.get_version_num(), 4);
     }
 
     #[test]
@@ -589,5 +702,29 @@ mod tests {
         assert!(Approval::issue(&denied, 100, 200).is_none());
 
         assert!(Approval::issue(&snapshot(), 200, 200).is_none());
+    }
+    #[test]
+    fn ambiguous_manifest_identifiers_and_adapter_bindings_cannot_be_approved() {
+        let mut duplicate_action = snapshot();
+        duplicate_action
+            .actions
+            .push(duplicate_action.actions[0].clone());
+        assert!(Approval::issue(&duplicate_action, 10, 20).is_none());
+        let mut duplicate_scope = snapshot();
+        duplicate_scope
+            .scopes
+            .push(duplicate_scope.scopes[0].clone());
+        assert!(Approval::issue(&duplicate_scope, 10, 20).is_none());
+        let mut missing_adapter = snapshot();
+        missing_adapter.adapter_versions.clear();
+        assert!(Approval::issue(&missing_adapter, 10, 20).is_none());
+        let mut conflicting_adapter = snapshot();
+        conflicting_adapter
+            .adapter_versions
+            .push(("recovery".into(), "different".into()));
+        assert!(Approval::issue(&conflicting_adapter, 10, 20).is_none());
+        let mut blank_adapter = snapshot();
+        blank_adapter.adapter_versions[0].1 = " ".into();
+        assert!(Approval::issue(&blank_adapter, 10, 20).is_none());
     }
 }
