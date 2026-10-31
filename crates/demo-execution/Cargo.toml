@@ -1,0 +1,26 @@
+[package]
+name = "disk-steward-demo-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+
+[dependencies]
+disk-steward-core = { path = "../disk-steward-core" }
+disk-steward-review-plan = { path = "../review-plan" }
+disk-steward-approval-ledger = { package = "approval-ledger", path = "../approval-ledger" }
+disk-steward-fixture-lifecycle = { path = "../fixture-lifecycle" }
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.6", features = ["fs"] }
+
+[lints]
+workspace = true

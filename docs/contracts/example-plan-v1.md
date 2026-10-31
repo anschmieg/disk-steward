@@ -26,3 +26,5 @@ Tauri commands owned by coordinator:
 Native handlers resolve database storage internally and expose only these input types. Frontend has no execution request in this slice. Browser adapter may display the same non-executable fixture but must label unsaved preview and never imply desktop persistence.
 
 Command errors are sanitized JSON objects {code:string,message:string}. Known codes: stale_revision, unknown_action, nothing_selected, unsupported_schema, storage_unavailable. Never return paths, raw SQL or credential details in these errors.
+
+Native-only preview: preview_saved_example_review(request:{expectedRevisionId}) returns a descriptive string after presenting the backend snapshot in a parented native dialog. It rechecks the frozen hash/current revision after acknowledgement and never issues an approval or enables file operations. native_check_busy is a possible sanitized error code.

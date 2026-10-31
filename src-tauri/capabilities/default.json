@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core window permissions only; no filesystem or shell plugins are exposed.",
+  "description": "Local diagnostics, example-plan commands, and a bounded native disposable-file demo bridge; no generic filesystem, shell or SQL access.",
   "windows": ["main"],
-  "permissions": ["core:default", "allow-foundation-status", "allow-check-selected-folder-access", "allow-preview-native-review", "allow-get-example-plan", "allow-edit-example-plan", "allow-freeze-example-review"]
+  "permissions": ["core:default", "allow-foundation-status", "allow-check-selected-folder-access", "allow-preview-native-review", "allow-get-example-plan", "allow-edit-example-plan", "allow-freeze-example-review", "allow-preview-saved-example-review", "allow-get-fixture-demo-status", "allow-start-fixture-demo", "allow-prepare-fixture-stage", "allow-prepare-fixture-restore", "allow-request-fixture-execution"]
 }

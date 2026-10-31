@@ -56,3 +56,12 @@ Next: finishreadonlysliceverification/docs, commit/pushstackedPR2 againstfeat/m0
 Readonly slice ready to commit:57 workspace tests, strict workspace/nativeClippy/fmt, npm build/versionguard,36 evaluation+42 probe tests pass. Native0.0.4 persistence flow passed (Revision3/4MiB savedreview fingerprint stable afterrestart; latereditRevision4/1MiB). Source-levelkeyboard/ARIA/error-confirmation fixes were added afterward and compile; rechecknativekeyboard whennextbundlebuilt. Appclosed. No execution IPCexists.
 
 Fixture-lifecyclefollowup reports15standalonetests passing afterpath/claim/hash/schema fixes; nextreview requiresrootcheck thenintegration. Activefollowup addscreate_for_session(parent,SessionId,bindings) toallowcreationintentbeforeFS writes, plus opaqueidentitydigest in snapshots. Do notstagefixturecomponentwithreadonlycommit.
+
+
+### Native disposable lifecycle checkpoint
+
+Current branch feat/m1a-review-plan, pushed readonly commit7369df4 / draft PR2. Further integrated work is ready for review: fixture-lifecycle (17tests), demo-execution (11tests; now root workspace member), native typed-ID-only bridge, actual saved metadata-review preview, and demo interface. Existing synthetic metadata reviews cannot authorize file operations. Native app closed after create/cancel/stage/restart/restore/restaging-review-cancel passed; Test cache is restored, other four files available. No permanent delete/user-file cleanup.
+
+Root validated83workspace tests before two service regressions, which passed separately (85current tests);7native tests; strict root/nativeClippy and formatting; frontendbuild/versionguard; debugbundle34.14MiB. Socket tests failed under restricted permissions then passed authorized local-only execution. Cosmeticnavactive/0bytes fixes frontendcompile but await exactnative smokecheck. Nativebuild target reduced from5.1G to1.7G via profile.dev dependencydebug0; removed only own redundant nestedbuildtargets. Do not clean arbitrary user caches.
+
+M1A Validation, notComplete: final smoke/checkpoint/forecast required; docs/M1A-VALIDATION.md has evidence. M0 remains open. Activecatalog_freeze Luna owns probes/catalog and docs/decisions/0002-detector-scope.md only; evaluating narrow D2/D3 implementationtargets, not enablingproductiondetectors. m1a_demo_execution/m1a_plan_frontend/demo_native_bridge completed. Quota35%remaining; automationACTIVE. Next: commit/pushreviewable lifecyclebatch/PR2update, finish M1Acheckpoint then continue useful M0technicalgates and authorized roadmap. Do notstopjustbecausecommit/tests/PRpassed.

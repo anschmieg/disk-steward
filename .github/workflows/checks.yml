@@ -27,6 +27,7 @@ jobs:
       - run: npm ci
       - run: node scripts/check-version.mjs
       - run: npm run build
+      - run: npm run format:check
       - run: npm audit --audit-level=high
       - run: python3 evaluation/harness.py --score-baseline --check-validator
       - run: python3 -m unittest discover -s evaluation -p 'test_*.py'

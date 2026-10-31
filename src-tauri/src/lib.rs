@@ -1,4 +1,5 @@
 mod example_plan;
+mod fixture_demo;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
@@ -59,6 +60,7 @@ pub fn run() {
         .manage(foundation_capabilities())
         .setup(|app| {
             app.manage(example_plan::ExamplePlanState::open(app.handle()));
+            app.manage(fixture_demo::FixtureDemoState::open(app.handle()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -67,7 +69,13 @@ pub fn run() {
             preview_native_review,
             example_plan::get_example_plan,
             example_plan::edit_example_plan,
-            example_plan::freeze_example_review
+            example_plan::freeze_example_review,
+            example_plan::preview_saved_example_review,
+            fixture_demo::get_fixture_demo_status,
+            fixture_demo::start_fixture_demo,
+            fixture_demo::prepare_fixture_stage,
+            fixture_demo::prepare_fixture_restore,
+            fixture_demo::request_fixture_execution
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disk Steward");
@@ -84,6 +92,14 @@ fn foundation_status(reports: tauri::State<'_, Vec<CapabilityReport>>) -> Vec<(S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_operation_ownership_is_exclusive_until_worker_guard_drops() {
+        let guard = super::NativeCheckGuard::acquire().expect("first operation");
+        assert!(super::NativeCheckGuard::acquire().is_err());
+        drop(guard);
+        assert!(super::NativeCheckGuard::acquire().is_ok());
+    }
+
     #[test]
     fn unimplemented_adapters_never_report_available() {
         let reports = super::foundation_capabilities();

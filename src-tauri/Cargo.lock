@@ -48,6 +48,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "approval-ledger"
+version = "0.0.4"
+dependencies = [
+ "rusqlite",
+]
+
+[[package]]
 name = "atk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,16 +607,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-steward-demo-execution"
+version = "0.0.4"
+dependencies = [
+ "approval-ledger",
+ "disk-steward-core",
+ "disk-steward-fixture-lifecycle",
+ "disk-steward-review-plan",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "disk-steward-desktop"
 version = "0.0.4"
 dependencies = [
  "disk-steward-core",
+ "disk-steward-demo-execution",
  "disk-steward-review-plan",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
+]
+
+[[package]]
+name = "disk-steward-fixture-lifecycle"
+version = "0.0.4"
+dependencies = [
+ "disk-steward-core",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

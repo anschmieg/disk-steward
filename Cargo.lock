@@ -175,6 +175,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-steward-demo-execution"
+version = "0.0.4"
+dependencies = [
+ "approval-ledger",
+ "disk-steward-core",
+ "disk-steward-fixture-lifecycle",
+ "disk-steward-review-plan",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "disk-steward-fixture-lifecycle"
+version = "0.0.4"
+dependencies = [
+ "disk-steward-core",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "disk-steward-gix-byte-probe"
 version = "0.0.4"
 dependencies = [

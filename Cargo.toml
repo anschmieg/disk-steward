@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/disk-steward-core", "crates/verification-budget", "crates/approval-ledger", "crates/review-plan", "probes/git-transport", "probes/atomic-rename"]
+members = ["crates/disk-steward-core", "crates/verification-budget", "crates/approval-ledger", "crates/review-plan", "crates/fixture-lifecycle", "crates/demo-execution", "probes/git-transport", "probes/atomic-rename"]
 exclude = ["src-tauri"]
 resolver = "2"
 
