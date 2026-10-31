@@ -1,6 +1,6 @@
 # Disk Steward implementation roadmap
 
-Status: **M0 In progress**; M1–M6 and post-MVP tracks remain Planned. The first foundation slice is being implemented on feat/m0-foundation; see [PROGRESS.md](PROGRESS.md). Concepts and the current desktop scaffold use synthetic data. This roadmap authorizes no cleanup, repository changes, remote access, or model requests.
+Status: **M0 In progress; M1A Complete (five-file disposable macOS debug slice)**; M1B–M6 and post-MVP tracks remain Planned. The first foundation slice is being implemented on feat/m0-foundation; see [PROGRESS.md](PROGRESS.md). The current plan and file lifecycle use only synthetic metadata and app-created disposable fixtures. This roadmap authorizes no cleanup, repository changes, remote access, or model requests.
 
 ## Delivery approach and forecasting
 

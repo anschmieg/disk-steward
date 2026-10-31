@@ -111,6 +111,11 @@ macro_rules! typed_id {
 typed_id!(ScopeId, "scope");
 typed_id!(PlanId, "plan");
 typed_id!(RevisionId, "revision");
+typed_id!(ReviewId, "review");
+typed_id!(SessionId, "session");
+typed_id!(ReceiptId, "receipt");
+typed_id!(ExecutionId, "execution");
+typed_id!(AttemptId, "attempt");
 typed_id!(ActionId, "action");
 typed_id!(ApprovalId, "approval");
 typed_id!(EvidenceId, "evidence");

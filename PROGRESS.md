@@ -82,3 +82,33 @@ M0 consolidation:45 workspace Rust tests pass, including15 Git transport/loopbac
 Typed IDs now persist as strict versioned/type-specific canonical UUIDv4 references from OS randomness; full Approval capabilities remain nonserializable. Chosen first lifecycle mechanism is app-managed same-volume recoverable holding, documented in docs/decisions/0001-recoverable-holding.md. No production adapter is enabled by this decision.
 
 M0 remains In progress: runnable cross-platform CI, independent human labels/development evaluation, full private HTTPS credential/worker/object proof, packaged access matrix, detector freeze and forecast remain open. M1A review/storage work may proceed from tested M0 contracts while these gates remain explicit; it must not be represented as a completed lifecycle or allow user-file execution.
+
+## M1A — In progress, review-only slice (0.0.4)
+
+Purpose: make the editable cleanup plan authoritative and persistent before adding execution or discovery. M0 remains open; M1A uses its tested contracts while external and unrelated gates remain explicit. The full M1A lifecycle is not complete. Scope/failure review is recorded in .autonomous/disk-steward/m1a-scope.md.
+
+Luna implemented the SQLite example-plan service and the linked editor/evidence/review interface. Coordinator added explicit Tauri permissions/typed requests, bounded blocking database work, sanitized failures, schema/leaf-link checks and native verification. The five-action dataset totals 4.875 MiB and is explicitly synthetic/non-executable. Keep/Include edits use expected-revision tokens; frozen reviews survive later edits and reopening.
+
+Observed in native 0.0.4 debug app: initial Revision 1/all Keep; Include 3 MiB + 1 MiB yielded Revision 3/4 MiB; saved review displayed all five decisions. After quitting/relaunching, Revision 3, both decisions and identical review fingerprint were preserved. A later Keep edit yielded Revision 4/1 MiB and a distinct review. No user files were scanned or changed; writes were only the app's synthetic plan database.
+
+The editor uses exact proportional row backgrounds with one labeled denominator, linked evidence, pending/error states, keyboard focus navigation and pressed decision states. Browser mode is an explicitly unsaved preview. Uncertain native saves require refresh before further edits/review. Snapshot digests are optional details. No approval or staging command is exposed.
+
+Review found and closed two database ownership gaps: views/triggers count as existing schema objects, and SQLite refuses a symlinked database leaf. Trusted parent aliases must be resolved separately so macOS /var works without following the leaf. Tests cover both plan and approval stores. A separate fixture-lifecycle component is still isolated pending coordinator review; journal-derived paths and cross-instance operation claims must pass regression checks before integration.
+
+Review-only checkpoint validation:57 workspace Rust tests passed, including10 plan-store and8 approval-ledger tests; strict workspace/native Clippy and formatting passed; frontend build/version guard passed;36 evaluation and42 probe Python tests passed. Native0.0.4 debug bundle built and persistence flow was exercised. Later keyboard/error-state refinements compile but still need a final native interaction check. CI remains unrun due the known account restriction. No milestone completion or release is claimed.
+
+
+## M1A — Native disposable lifecycle in validation (0.0.4)
+
+The persistent plan now connects to a separate app-created fixture workflow: create five files → prepare exact review → native confirmation → one-time approval → recoverable stage → persistent results → fresh review/confirmation → restore. Existing metadata reviews remain non-executable. The coordinator observed cancellation, stage, quit/reopen, restore and preparation for restaging in the actual desktop app; details and limitations are in docs/M1A-VALIDATION.md.
+
+Luna implemented the bounded execution service, fixture component, lifecycle UI and native bridge. Coordinator review closed live-instance recovery, journal-derived paths, unbounded hashing, schema ownership, post-claim uncertainty, selected-action tampering, and edit-versus-execution races. An exclusive OS lease precedes recovery. Ambiguous outcomes retain files and block further preparation; no automatic retries or permanent removal exist. Staging and restoration report zero recovered space.
+
+Validation:83 then-current workspace tests passed with local socket access; two later service regression tests passed separately (85 total in the current set). Seven native backend tests passed; strict workspace/native Clippy, formatting, frontend build/version policy and actual macOS debug bundling passed. Final cosmetic navigation/zero-unit edits compile and await one final native smoke check. Cross-platform CI is still unrun due the known account restriction. M1A remains Validation pending final checkpoint/forecast; M0 remains In progress with its existing external and technical gates. Draft PR2 remains stacked on PR1. No release was published.
+
+
+## M1A — Complete within the disposable slice
+
+Independent review closed three concrete gaps: the exact prepared-review ID/creation/expiry are now hashed and lifetime-checked; crash recovery retains completed child-byte totals; and a second live app instance cannot edit the owner's plan. All88 workspace Rust tests and8 native tests passed, strict workspace/native Clippy and formatting passed, and the final0.0.4 bundle built. Native smoke check confirmed owner edits to Revisions5/6, new expiry-bound review and native cancel with Test cache still Restored. The app is closed. docs/M1A-VALIDATION.md records the acceptance matrix; docs/IMPLEMENTATION-FORECAST.md replaces the old calendar placeholder with42–75 provisional verified work batches across the remaining scope, including external waiting-time limits.
+
+M1A's five-action disposable-file lifecycle is complete; general inventory/editor breadth and user-file execution are not included in that claim. M0 remains In progress. M1B is next, following a new purpose/scope/failure checkpoint. Versions remain0.0.4; no release is published. M0 cache and HTTPS worker probes are progressing independently and will be kept in a separate feature branch/PR.

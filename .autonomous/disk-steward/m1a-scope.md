@@ -1,0 +1,21 @@
+# M1A purpose and scope checkpoint
+
+The product helps people understand disk use and edit exact cleanup decisions before changes. M1A makes the plan authoritative in the backend and proves a small complete lifecycle before adding scanner/detector breadth. M0 remains In progress; unavailable CI, human evaluation, full private Git proof, access matrix, detector freeze and forecast are explicit unresolved gates. The M1A dependency is the tested M0 contracts. User-file execution remains unavailable.
+
+First bounded slice (version0.0.4): a persistent five-action, non-executable example plan. It has Keep/Include decisions, evidence, exact totals, optimistic-concurrency revision tokens and immutable frozen review snapshots. Ordinary app database writes are allowed; there is no file staging, approval issuance, cleanup, model call or generic renderer filesystem/SQL access in this slice. The full M1A checkpoint remains unfinished until later disposable-file stage/results/restore and native confirmation integration pass.
+
+Failure cornerstones: stale edits cannot overwrite newer decisions; unknown IDs/decisions are rejected; every real edit invalidates earlier reviews; equal no-op edits preserve revision; empty selection cannot freeze; frozen records survive reopening unchanged; malformed/unknown database schemas are refused without reset; command errors reveal no paths/SQL/credentials. Review IDs are not approvals. Canonical review hashing uses a fixed versioned struct encoding, not map ordering dependent on serde feature unification. No existing synthetic review can later be upgraded to execution authority.
+
+Backend owns crates/review-plan only; coordinator owns workspace/native bridge/versioning. Frontend owns src plan UI only, reads docs/contracts/example-plan-v1.md. UI uses the existing creator-confirmed .impeccable.md design context: desktop utility, expressive meaningful category colors, linked selection/evidence, subtle proportional bars behind text, readable keyboard navigation. Backend responses own decisions/totals/revision state; pending saves block review, and errors preserve a clear refresh path. Browser preview is explicitly nonpersistent/non-executable.
+
+After this slice: detailed native review from the frozen backend record; creation/registration of disposable file fixtures; exact approval/ledger/holding integration; stage results and collision-safe restore. Keep production capability reports unsupported until their gates actually pass. No permanent removal before M1C.
+
+## Disposable lifecycle integration checkpoint
+
+This slice tests the application's central promise: an editable plan produces an exact review, a separate native confirmation, verified execution and recoverable results. It must prove that chain on internally created files before discovery can propose user files. It does not close M0 or imply that production cleanup is supported.
+
+The five metadata rows remain non-executable. A distinct disposable-file review binds the current metadata revision to a registered session's exact identities, contents, operation and recovery state. Only the native backend can provide confirmation; the renderer passes typed references, never paths or an approval boolean. A single-use approval ledger and per-file attempts precede each move.
+
+Cornerstones reviewed during integration: concurrent app ownership before crash recovery; stale edits or changed files during the native dialog; expiry and backward clock movement; reuse of saved reviews; corruption and partial creation; durable intent before moves; uncertain finalization after a successful move; collision-safe restore; accurate staged versus recovered byte counts; and a usable return to the plan without clearing error state. No automatic retry, rollback or permanent removal is added. The interface must distinguish a refresh from a resolution of an uncertain outcome.
+
+Verification still required before claiming this slice complete: service regression tests, native command/request boundary tests, an actual desktop create → review → cancel → review → stage → restart → restore flow, and the outstanding M1A gates in the roadmap. Cross-platform and packaged-permission claims remain separate.

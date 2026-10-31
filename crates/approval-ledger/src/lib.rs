@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 const APPLICATION_ID: i64 = 0x4453_414C; // "DSAL"
 const SCHEMA_VERSION: i64 = 1;
@@ -127,7 +127,14 @@ impl ApprovalLedger {
     /// current schema; any non-empty database without this ledger's identity
     /// and supported schema version is rejected.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        let connection = Connection::open(path)?;
+        let database_path = nofollow_database_path(path.as_ref())?;
+        let connection = Connection::open_with_flags(
+            database_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         initialize_or_validate(&connection)?;
@@ -347,7 +354,7 @@ fn initialize_or_validate(connection: &Connection) -> Result<(), LedgerError> {
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let user_tables: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
         [],
         |row| row.get(0),
     )?;
@@ -369,6 +376,15 @@ fn initialize_or_validate(connection: &Connection) -> Result<(), LedgerError> {
 }
 
 fn validate_tables(connection: &Connection) -> Result<(), LedgerError> {
+    let objects: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
+        [],
+        |row| row.get(0),
+    )?;
+    if objects != 2 {
+        return Err(LedgerError::UnsupportedSchema);
+    }
+
     for (table, expected_sql) in [
         ("approvals", APPROVALS_SCHEMA),
         ("execution_intents", INTENTS_SCHEMA),
@@ -493,6 +509,19 @@ fn intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionIntent>
         started_at_unix_ms: row.get(3)?,
         finished_at_unix_ms: row.get(4)?,
     })
+}
+
+// Resolve trusted parent aliases (notably macOS /var) without resolving the
+// final filename. SQLite NOFOLLOW must still reject a symlink at that leaf.
+fn nofollow_database_path(path: &Path) -> Result<std::path::PathBuf, rusqlite::Error> {
+    let invalid = || rusqlite::Error::InvalidPath(path.to_path_buf());
+    let name = path.file_name().ok_or_else(invalid)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|_| invalid())?;
+    Ok(parent.join(name))
 }
 
 #[cfg(test)]
@@ -647,5 +676,47 @@ mod tests {
             ledger.record_intent_uncertain("i", 4),
             Err(LedgerError::InvalidIntentTransition)
         ));
+    }
+    #[test]
+    fn unrelated_view_and_extra_trigger_are_not_an_owned_empty_schema() {
+        let (_dir, path) = db_path();
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch("CREATE VIEW sqliteXunrelated AS SELECT 1")
+            .unwrap();
+        drop(c);
+        assert!(matches!(
+            ApprovalLedger::open(&path),
+            Err(LedgerError::UnsupportedSchema)
+        ));
+        let c = Connection::open(&path).unwrap();
+        let app: i64 = c
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(app, 0);
+        c.execute_batch("DROP VIEW sqliteXunrelated").unwrap();
+        drop(c);
+        let ledger = ApprovalLedger::open(&path).unwrap();
+        ledger
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER sqliteXunknown_trigger AFTER INSERT ON approvals BEGIN SELECT 1; END",
+            )
+            .unwrap();
+        drop(ledger);
+        assert!(matches!(
+            ApprovalLedger::open(&path),
+            Err(LedgerError::UnsupportedSchema)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_symlink_is_refused_without_changing_target() {
+        let (dir, target) = db_path();
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.path().join("linked.sqlite");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(ApprovalLedger::open(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
     }
 }
