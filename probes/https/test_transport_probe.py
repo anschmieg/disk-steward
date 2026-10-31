@@ -1,10 +1,12 @@
 import unittest
 import time
+from contextlib import redirect_stdout
+from io import StringIO
 
 try:
-    from https.transport_probe import ProbeError, probe, validate_endpoint
+    from https.transport_probe import DENIED_AUTH_ENDPOINT, ProbeError, denied_auth_probe, main, probe, validate_endpoint
 except ModuleNotFoundError:
-    from transport_probe import ProbeError, probe, validate_endpoint
+    from transport_probe import DENIED_AUTH_ENDPOINT, ProbeError, denied_auth_probe, main, probe, validate_endpoint
 
 URL = "https://github.com/example/project.git/info/refs?service=git-upload-pack"
 
@@ -89,6 +91,46 @@ class HttpsProbeTests(unittest.TestCase):
             probe(URL, transport=fake, token=secret)
         self.assertEqual(len(calls), 1)
         self.assertIn("Authorization", calls[0][1])
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertTrue(response.closed)
+
+    def test_denied_auth_probe_defaults_to_dry_run(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main([]), 0)
+        self.assertIn("Dry-run", output.getvalue())
+        self.assertNotIn("invalid-token", output.getvalue())
+
+    def test_denied_auth_probe_requires_both_live_and_read_consent(self):
+        calls = []
+        fake = lambda *args: calls.append(args)
+        for kwargs in ({}, {"live": True}, {"consent_remote_read": True}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ProbeError, "both required"):
+                denied_auth_probe(transport=fake, **kwargs)
+        self.assertEqual(calls, [])
+
+    def test_denied_auth_probe_one_fixed_request_with_synthetic_auth(self):
+        response = FakeResponse(status=404)
+        calls = []
+
+        def fake(url, headers, timeout):
+            calls.append((url, dict(headers), timeout))
+            return response
+
+        result = denied_auth_probe(live=True, consent_remote_read=True, transport=fake)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], DENIED_AUTH_ENDPOINT)
+        self.assertEqual(calls[0][2], 8.0)
+        self.assertIn("Authorization", calls[0][1])
+        self.assertNotIn("disk-steward-synthetic-invalid-token-not-a-secret", calls[0][1]["Authorization"])
+        self.assertEqual(result, "access not established (HTTP 404)")
+        self.assertTrue(response.closed)
+
+    def test_denied_auth_probe_rejects_redirect_without_leaking(self):
+        secret = "disk-steward-synthetic-invalid-token-not-a-secret"
+        response = FakeResponse(status=302, headers={"Location": f"https://attacker.example/{secret}"})
+        with self.assertRaisesRegex(ProbeError, "redirect rejected") as caught:
+            denied_auth_probe(live=True, consent_remote_read=True, transport=lambda *_: response)
         self.assertNotIn(secret, str(caught.exception))
         self.assertTrue(response.closed)
 

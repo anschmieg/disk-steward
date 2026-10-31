@@ -1,3 +1,23 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+static NATIVE_CHECK_ACTIVE: AtomicBool = AtomicBool::new(false);
+struct NativeCheckGuard;
+impl NativeCheckGuard {
+    fn acquire() -> Result<Self, String> {
+        NATIVE_CHECK_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| "Finish the open native check before starting another.".to_owned())
+    }
+}
+impl Drop for NativeCheckGuard {
+    fn drop(&mut self) {
+        NATIVE_CHECK_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 use disk_steward_core::{CapabilityReport, CapabilityStatus, HostPlatform, PlatformCapability};
 
 /// Backend-owned state, deliberately not exposed as a generic frontend command.
@@ -33,8 +53,13 @@ pub fn foundation_capabilities() -> Vec<CapabilityReport> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(foundation_capabilities())
-        .invoke_handler(tauri::generate_handler![foundation_status])
+        .invoke_handler(tauri::generate_handler![
+            foundation_status,
+            check_selected_folder_access,
+            preview_native_review
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Disk Steward");
 }
@@ -56,4 +81,63 @@ mod tests {
         assert_eq!(reports.len(), 7);
         assert!(reports.iter().all(|report| !report.is_available()));
     }
+}
+
+/// Development feasibility check. The renderer cannot supply a path. No scope
+/// grant is persisted, no contents are returned, and no recursive scan occurs.
+#[tauri::command]
+async fn check_selected_folder_access(app: tauri::AppHandle) -> Result<String, String> {
+    let guard = NativeCheckGuard::acquire()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let Some(selection) = app
+            .dialog()
+            .file()
+            .set_title("Choose a folder for a read-only access check")
+            .set_can_create_directories(false)
+            .blocking_pick_folder()
+        else {
+            return Ok("Folder check canceled; no folder was saved.".to_owned());
+        };
+        let path = selection
+            .into_path()
+            .map_err(|_| "The selected location is not a supported local folder.".to_owned())?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+            "Folder metadata could not be read. Access remains unavailable.".to_owned()
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(
+                "Select a local directory; links and files are unsupported in this check."
+                    .to_owned(),
+            );
+        }
+        // Opening an iterator probes access without consuming entry names or
+        // traversing the directory. This is not a durable authorization token.
+        std::fs::read_dir(&path)
+            .map_err(|_| "Folder access was denied or became unavailable.".to_owned())?;
+        Ok("Folder could be opened for reading. No scan ran and no folder was saved.".to_owned())
+    })
+    .await
+    .map_err(|_| "Folder access check did not complete.".to_owned())?
+}
+
+/// A fixed, backend-owned feasibility example. Acknowledgement is not approval,
+/// is never persisted, and cannot be consumed by an execution service.
+#[tauri::command]
+async fn preview_native_review(app: tauri::AppHandle) -> Result<String, String> {
+    let guard = NativeCheckGuard::acquire()?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window is unavailable.".to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let acknowledged = app.dialog().message(
+            "Synthetic plan · revision 1\nOne disposable cache fixture · 4 MiB\nExample action: recoverable staging. Staging does not free space.\n\nThis is a dialog preview. No approval is issued, no folder is accessed, and nothing can be changed.")
+            .title("Preview a cleanup review")
+            .parent(&window)
+            .buttons(MessageDialogButtons::OkCancelCustom("Acknowledge example".into(), "Cancel".into()))
+            .blocking_show();
+        if acknowledged { "Example acknowledged. No approval was issued and nothing changed.".to_owned() }
+        else { "Review preview canceled. Nothing changed.".to_owned() }
+    }).await.map_err(|_| "Native review preview did not complete.".to_owned())
 }

@@ -37,6 +37,28 @@ export default function App() {
       .catch(() => { if (active) setBridgeStatus("Native capability query failed · cleanup remains unavailable"); });
     return () => { active = false; };
   }, []);
+  const [folderCheckStatus, setFolderCheckStatus] = useState("");
+  const [checkingFolder, setCheckingFolder] = useState(false);
+  const checkFolderAccess = async () => {
+    setCheckingFolder(true);
+    try {
+      setFolderCheckStatus(await invoke<string>("check_selected_folder_access"));
+    } catch (error) {
+      setFolderCheckStatus(typeof error === "string" ? error : "Folder check failed; access remains unavailable.");
+    } finally {
+      setCheckingFolder(false);
+    }
+  };
+  const previewNativeReview = async () => {
+    setCheckingFolder(true);
+    try {
+      setFolderCheckStatus(await invoke<string>("preview_native_review"));
+    } catch (error) {
+      setFolderCheckStatus(typeof error === "string" ? error : "Review preview could not complete.");
+    } finally {
+      setCheckingFolder(false);
+    }
+  };
   const [items, setItems] = useState(initialItems);
   const [selectedId, setSelectedId] = useState("build-atlas");
   const [view, setView] = useState<"map" | "list">("map");
@@ -76,6 +98,11 @@ export default function App() {
             <h1>{page === "space" ? "See what’s taking space." : "Review your plan."}</h1>
             <p className="subtitle">{page === "space" ? "Explore the example folders. Inspect the notes. Decide what stays." : "Change example decisions and see how the plan responds."}</p>
             <p className="subtitle" role="status">{bridgeStatus}</p>
+            <button className="text-button" disabled={!isTauri() || checkingFolder} onClick={checkFolderAccess}>
+              {checkingFolder ? "Native check in progress…" : "Check folder access"}
+            </button>
+            <button className="text-button" disabled={!isTauri() || checkingFolder} onClick={previewNativeReview}>Preview native review</button>
+            {folderCheckStatus && <p className="subtitle" role="status">{folderCheckStatus}</p>}
           </div>
           <button className="quiet-button" onClick={() => setPage(page === "space" ? "plan" : "space")}>{page === "space" ? "Review your plan" : "Back to space map"}<ArrowUpRight size={15} /></button>
         </div>
@@ -114,15 +141,15 @@ export default function App() {
             <div className="plan-summary"><strong>{fmt(selectedBytes)} selected <span>·</span> {included.length} {included.length === 1 ? "item" : "items"}</strong><span>Example only. Staging keeps data recoverable; it does not free space.</span></div>
             <button className="primary-button" onClick={() => setPage("plan")}>Review example plan <ArrowUpRight size={15} /></button>
           </section>
-          <div className="footnote">Synthetic example · no filesystem access · no AI requests</div>
+          <div className="footnote">Synthetic example · no scanning or cleanup · no AI requests</div>
         </> : <>
           <section className="plan-page-card">
             <div className="plan-card-head"><div><div className="inspector-label">EXAMPLE PLAN · REVISION 1</div><h2>Items you’ve selected</h2><p>These choices are temporary and reset when the app reloads.</p></div><div className="plan-total">{fmt(selectedBytes)}<small>selected size</small></div></div>
             {included.length ? included.map((item) => <div className="plan-row" key={item.id}><span className={`list-swatch zone-${item.zone}`} /><div className="row-title"><b>{item.title}</b><small>{item.folder} · example evidence only</small></div><span className="row-size">{fmt(item.size)}</span><button className="text-button" onClick={() => setDecision(item.id, "Review")}>Remove from plan</button></div>) : <div className="empty-plan"><Archive size={22} /><b>No items selected</b><span>Choose an item and set its decision to “Remove” to add it here.</span></div>}
-            <div className="plan-callout"><ShieldCheck size={17} /><div><b>No action can run in this prototype.</b><span>This review is made from fixed example data. There is no scanner, filesystem access, or execution command.</span></div></div>
+            <div className="plan-callout"><ShieldCheck size={17} /><div><b>No action can run in this prototype.</b><span>This review is made from fixed example data. The optional folder check is read-only. Scanning, approval, and cleanup are not implemented.</span></div></div>
             <div className="plan-actions"><button className="quiet-button" onClick={() => setPage("space")}>Back to example</button><button className="primary-button disabled" disabled>Approve and stage <ArrowUpRight size={15} /></button></div>
           </section>
-          <div className="footnote">Synthetic example · no filesystem access · approval and execution are not implemented</div>
+          <div className="footnote">Synthetic example · optional read-only access check · approval and execution are not implemented</div>
         </>}
       </main>
     </div>

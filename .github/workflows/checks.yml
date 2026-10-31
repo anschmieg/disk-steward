@@ -43,6 +43,7 @@ jobs:
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo check --manifest-path src-tauri/Cargo.toml --locked -j 2
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked -j 2
       - name: Compile native feasibility helpers without performing cleanup
         run: |
           swiftc probes/native/RecoveryProbe.swift -o "$RUNNER_TEMP/recovery-probe"

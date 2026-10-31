@@ -18,13 +18,15 @@ Observed on macOS 27.0 / Apple Silicon / Swift 6.4: compilation and default
 dry-run passed, with stable plan digest
 `69f85730b44a1a49d5fb9def0c02424941fc8404c17c83507f7c5166957dcdb5`.
 The dialog was not tested through the Cancel button. Running the bare command
-line binary did not expose a dialog through the available UI automation, and
-attempting to open a temporary `.app` wrapper failed with Launch Services
-`kLSNoExecutableErr` (-10827). No dialog choice was made.
+line binary did not expose a dialog through the available UI automation. A
+second attempt created a uniquely named temporary `.app` with a matching
+`CFBundleExecutable`, `PkgInfo`, and ad-hoc signature; Launch Services still
+returned `kLSNoExecutableErr` (-10827), and the wrapper did not appear in the
+UI app inventory. That temporary wrapper was removed after the failed launch.
+No dialog choice was made.
 
 This does not exercise the current Tauri window. The existing Tauri backend
-registers only a read-only foundation status command; it has no dialog plugin,
-confirmation command, execution service, or cleanup operation. This probe
+has read-only foundation status and selected-folder access checks. Its dialog plugin is not an execution confirmation service; no cleanup operation exists. This probe
 shows that a native AppKit dialog can present a digest-bearing synthetic
 summary, not that a Tauri renderer can safely request or bind an approval.
 

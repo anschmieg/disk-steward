@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-native-review"
+description = "Enables the preview_native_review command without any pre-configured scope."
+commands.allow = ["preview_native_review"]
+
+[[permission]]
+identifier = "deny-preview-native-review"
+description = "Denies the preview_native_review command without any pre-configured scope."
+commands.deny = ["preview_native_review"]

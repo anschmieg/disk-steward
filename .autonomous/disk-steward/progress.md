@@ -24,3 +24,15 @@ Resumed after Adrian correctly challenged a premature short run. Automation prom
 Verified: 20 Rust workspace tests, fmt/strict Clippy, desktop cargo check, frontend build/version guard, native 0.0.2 debug bundle, 26 evaluation tests and 25 probe tests. All production adapters remain unsupported. Security-scoped bookmark and actual native confirmation cancellation paths remain unproven. Jev four development calls establish connectivity only; human labels remain outstanding. Private HTTPS advertisement worked but full proof/broker/worker limits remain open.
 
 Next active bounded work: journal_feasibility agent implementing probes/worker disposable child cancellation/accounting harness. Review it before integration. Then package-level selected-folder/denial/revocation/confirmation tests and production transport/storage enforcement choices. Do not redo completed probes or mark M0 complete. Last quota sampling: 43% remaining; heartbeat active.
+
+### Follow-through checkpoint — 0.0.3
+
+Committed/pushed 0.0.2 as b2855b6 and updated draft PR #1. Continued immediately: native Tauri folder selection read-only check worked on an own empty fixture; cancellation worked; fixture removed. Fixed native dialog parent attachment: initial unparented preview had unsuitable Escape behavior, while attached sheet passed explicit Cancel and Escape. These input-free diagnostic commands never issue approval or scan/clean. Generic filesystem/dialog permissions remain absent. All production capability reports remain unsupported.
+
+Luna worker probe plus coordinator repeat passed owned-store/stopped-receipt checks; root observed 196608 bytes allocated overshoot and3ms timeout overshoot. 34 probe tests and26 evaluation tests pass. Invalid synthetic credential live GET returned401. Native .3 bundle and strict desktop Clippy passed before latest parent/wording follow-up; final checks and commit pending.
+
+Active next work: https_transport_probe is compiling a concrete gix custom transport byte-limiting seam in probes/git-transport, standalone0.0.3 crate. Do not add it to workspace or stage generated artifacts until reviewed. Existing M0 gaps remain; no strategic decision or quota stop currently triggered. Last remainingquota43%.
+
+0.0.3 final verification: frontend/version guard passed after copy correction; 20 workspace tests, strict core/desktop Clippy, formatting and one native backend unit test passed. Parented native preview Cancel/Escape passed in the actual app. Version guard now includes frontend lockfiles, explicit first-party Cargo probe versions and HTTP/evaluation user-agent versions. CI gained the native backend unit test but remains unrun externally.
+
+Further active work: journal_feasibility owns probes/crash process-interruption/reconciliation fixtures; https_transport_probe owns probes/git-transport custom HTTP trait accounting experiment. Both are bounded M0 proofs, not production adapters. Do not stage their unfinished work with this checkpoint.

@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import re
 import math
+import argparse
+import base64
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -13,10 +16,13 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Protocol
 from urllib.parse import urlsplit
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 _DEFAULT_MAX_BYTES = 1024 * 1024
 _DEFAULT_DEADLINE_SECONDS = 10.0
 _ENDPOINT = re.compile(r"^/([A-Za-z0-9_-][A-Za-z0-9_.-]*)/([A-Za-z0-9_-][A-Za-z0-9_.-]*\.git)/info/refs$")
+DENIED_AUTH_ENDPOINT = "https://github.com/anschmieg/disk-steward.git/info/refs?service=git-upload-pack"
+_SYNTHETIC_INVALID_TOKEN = "disk-steward-synthetic-invalid-token-not-a-secret"
+_DENIED_AUTH_TIMEOUT = 8.0
 
 
 class ProbeError(RuntimeError):
@@ -73,6 +79,45 @@ def _urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> R
     except urllib.error.HTTPError as error:
         # HTTPError is a response object, including redirects. Caller handles status.
         return error
+
+
+def denied_auth_probe(
+    *, live: bool = False, consent_remote_read: bool = False,
+    transport: Transport | None = None,
+) -> str:
+    """Try one GET to the fixed private repo using a synthetic invalid token.
+
+    Both live flags are mandatory. This intentionally performs a remote read
+    only after explicit consent; no system or user credential is consulted.
+    """
+    if not live or not consent_remote_read:
+        raise ProbeError("live mode and remote-read consent are both required")
+    endpoint = validate_endpoint(DENIED_AUTH_ENDPOINT)
+    token64 = base64.b64encode(f"x-access-token:{_SYNTHETIC_INVALID_TOKEN}".encode()).decode("ascii")
+    headers = {
+        "Accept": "application/x-git-upload-pack-advertisement",
+        "Authorization": f"Basic {token64}",
+    }
+    send = transport if transport is not None else _urllib_transport
+    response: Response | None = None
+    try:
+        response = send(endpoint, headers, _DENIED_AUTH_TIMEOUT)
+        status = response.status
+        if status in (301, 302, 303, 307, 308):
+            raise ProbeError("redirect rejected")
+        if status in (401, 403, 404):
+            return f"access not established (HTTP {status})"
+        return f"denial probe inconclusive (HTTP {status})"
+    except ProbeError:
+        raise
+    except Exception:
+        raise ProbeError("denied-auth request failed") from None
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def probe(
@@ -167,3 +212,24 @@ def probe(
                 response.close()
             except Exception:
                 pass
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Development-only denied-credential reachability probe")
+    parser.add_argument("--live", action="store_true", help="enable the single fixed-endpoint request")
+    parser.add_argument("--consent-remote-read", action="store_true", help="confirm consent to read the fixed private endpoint")
+    args = parser.parse_args(argv)
+    if not args.live and not args.consent_remote_read:
+        print("Dry-run only: no remote request sent.")
+        return 0
+    try:
+        result = denied_auth_probe(live=args.live, consent_remote_read=args.consent_remote_read)
+        print(result)
+        return 0 if result.startswith("access not established") else 1
+    except ProbeError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

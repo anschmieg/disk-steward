@@ -53,8 +53,8 @@ The earlier 12–16-week envelope is unvalidated and no longer an active deliver
 
 ## Development
 
-Version: 0.0.2. Repository: https://github.com/anschmieg/disk-steward (private). Current feature branch: feat/m0-foundation. See [progress](PROGRESS.md) for verified results and remaining gates.
+Version: 0.0.3. Repository: https://github.com/anschmieg/disk-steward (private). Current feature branch: feat/m0-foundation. See [progress](PROGRESS.md) for verified results and remaining gates.
 
 Use `npm ci` then `npm run dev` for the fixture UI, or `npm run tauri dev` for the desktop shell after installing the native prerequisites. `npm run build` checks TypeScript and builds the frontend. `cargo test --workspace` tests the portable contracts; `cargo check --manifest-path src-tauri/Cargo.toml -j 2` checks the native backend separately. `node scripts/check-version.mjs` enforces matching 0.0.x versions. The optional evaluation harness is development tooling: see [evaluation notes](evaluation/README.md).
 
-The current UI uses synthetic items only; it has no scan or execution commands. Core approval contracts are not yet a replay-safe execution service.
+The current UI uses synthetic items only; it has no scan or execution commands. Two backend-owned feasibility checks open a native folder chooser and a synthetic native review dialog; they retain no folder grant and issue no approval. Core approval contracts are not yet a replay-safe execution service.

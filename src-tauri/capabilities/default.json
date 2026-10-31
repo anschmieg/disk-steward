@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Core window permissions only; no filesystem or shell plugins are exposed.",
   "windows": ["main"],
-  "permissions": ["core:default", "allow-foundation-status"]
+  "permissions": ["core:default", "allow-foundation-status", "allow-check-selected-folder-access", "allow-preview-native-review"]
 }
