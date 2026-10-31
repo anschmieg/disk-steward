@@ -22,6 +22,6 @@ Verified locally on native aarch64-apple-darwin:
 - Five Python validator tests and fixture validation passed; held-out labels were not scored.
 - Browser smoke: fixture total, list bars, selection-to-example-plan, and disabled execution verified.
 
-CI results are recorded separately on GitHub; cross-platform compilation is not inferred from local tests.
+CI infrastructure blocker: GitHub run 41240218301 did not start its jobs because GitHub reports failed account payments or an insufficient spending limit. No code checks ran there; cross-platform compilation remains unverified. Account billing was not changed. Draft PR: https://github.com/anschmieg/disk-steward/pull/1 . Rerun CI after the account restriction is resolved.
 
 Outstanding M0 gates: permission/recovery experiments, private Git authentication and bounded verification probes, independent human label review plus consented live AI development evaluation, supported detector/version freeze, native runtime/packaged-app testing, desktop/core integration, and revised forecast. A scaffold does not complete M0. No actual user files were scanned, moved, or deleted by this implementation.
