@@ -13,6 +13,13 @@ fn main() {
             "prepare_fixture_stage",
             "prepare_fixture_restore",
             "request_fixture_execution",
+            "get_general_plan",
+            "edit_general_plan",
+            "undo_general_plan",
+            "redo_general_plan",
+            "freeze_general_review",
+            "get_general_review",
+            "list_general_reviews",
         ]),
     ))
     .expect("failed to generate application permission manifest");

@@ -1,3 +1,6 @@
+import GeneralPlanWorkspace, {
+  type GeneralPlanSummary,
+} from "./components/GeneralPlanWorkspace";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
@@ -132,10 +135,17 @@ const browserPlan: Plan = {
 };
 const categoryName = (category: Category) =>
   category === "build" ? "Build output" : "Cache";
-const fmt = (bytes: number) =>
-  bytes >= 1_048_576
-    ? `${(bytes / 1_048_576).toFixed(3).replace(/0+$/, "").replace(/\.$/, "")} MiB`
-    : `${Math.round(bytes / 1024)} KiB`;
+const fmt = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} ${bytes === 1 ? "byte" : "bytes"}`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "")} ${units[unit]}`;
+};
 
 export default function App() {
   const native = isTauri();
@@ -146,8 +156,14 @@ export default function App() {
   const [error, setError] = useState("");
   const [needsRefresh, setNeedsRefresh] = useState(false);
   const [nativePreviewMessage, setNativePreviewMessage] = useState("");
-  const [page, setPage] = useState<"edit" | "review" | "demo">("edit");
+  const [page, setPage] = useState<"edit" | "review" | "demo" | "advanced">(
+    native ? "advanced" : "edit",
+  );
   const [demoBusy, setDemoBusy] = useState(false);
+  const [generalBusy, setGeneralBusy] = useState(false);
+  const [generalSummary, setGeneralSummary] =
+    useState<GeneralPlanSummary | null>(null);
+  const workspaceBusy = demoBusy || generalBusy;
   const actionRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const refresh = useCallback(
@@ -177,7 +193,7 @@ export default function App() {
     if (!(await refresh(true))) throw new Error("Plan refresh failed");
   }, [refresh]);
   useEffect(() => {
-    if (native) void refresh();
+    if (native) void refresh(true);
   }, [native, refresh]);
   useEffect(() => {
     if (plan && !plan.actions.some((a) => a.id === selectedId))
@@ -191,7 +207,7 @@ export default function App() {
     if (
       !plan ||
       pending ||
-      demoBusy ||
+      workspaceBusy ||
       needsRefresh ||
       action.decision === decision
     )
@@ -220,7 +236,7 @@ export default function App() {
     if (
       !plan ||
       pending ||
-      demoBusy ||
+      workspaceBusy ||
       needsRefresh ||
       plan.selectedCount === 0
     )
@@ -244,7 +260,7 @@ export default function App() {
     }
   };
   const previewNativeReview = async () => {
-    if (!native || !review || pending || demoBusy || needsRefresh) return;
+    if (!native || !review || pending || workspaceBusy || needsRefresh) return;
     setPending(true);
     setError("");
     setNativePreviewMessage("");
@@ -313,33 +329,65 @@ export default function App() {
       <aside className="sidebar">
         <div className="nav-label">WORKSPACE</div>
         <button
-          className={`nav-item ${page !== "demo" ? "active" : ""}`}
-          disabled={demoBusy}
+          className={`nav-item ${page === "edit" || page === "review" ? "active" : ""}`}
+          disabled={workspaceBusy}
           onClick={() => setPage("edit")}
         >
           <Archive size={16} />
-          Review decisions
+          Five-action example
         </button>
         <button
           className={`nav-item ${page === "demo" ? "active" : ""}`}
-          disabled={demoBusy || !native}
+          disabled={workspaceBusy || !native}
           onClick={() => setPage("demo")}
         >
           <FilePlus2 size={16} />
           Fixture demo
         </button>
+        <button
+          className={`nav-item ${page === "advanced" ? "active" : ""}`}
+          disabled={workspaceBusy || !native}
+          onClick={() => setPage("advanced")}
+        >
+          <Archive size={16} />
+          Grouped editor
+        </button>
         <div className="side-rule" />
         <div className="side-metric">
-          <span>Plan size</span>
-          <b>{fmt(plan.totalBytes)}</b>
-          <small>5 synthetic actions</small>
+          <span>
+            {page === "advanced" ? "Known logical size" : "Plan size"}
+          </span>
+          <b>
+            {page === "advanced"
+              ? generalSummary
+                ? fmt(generalSummary.bytes)
+                : "Loading…"
+              : fmt(plan.totalBytes)}
+          </b>
+          <small>
+            {page === "advanced"
+              ? `${generalSummary?.count ?? "—"} example findings`
+              : "5 synthetic actions"}
+          </small>
         </div>
         <div className="side-metric selected-metric">
           <span>Included</span>
-          <b>{fmt(plan.selectedBytes)}</b>
+          <b>
+            {page === "advanced"
+              ? generalSummary
+                ? fmt(generalSummary.selectedBytes)
+                : "—"
+              : fmt(plan.selectedBytes)}
+          </b>
           <small>
-            {plan.selectedCount}{" "}
-            {plan.selectedCount === 1 ? "action" : "actions"}
+            {page === "advanced"
+              ? (generalSummary?.selectedCount ?? "—")
+              : plan.selectedCount}{" "}
+            {page === "advanced"
+              ? "items"
+              : plan.selectedCount === 1
+                ? "action"
+                : "actions"}
           </small>
         </div>
         <div className="side-note">
@@ -356,37 +404,43 @@ export default function App() {
           <div>
             <div className="crumb">
               EXAMPLE WORKSPACE <ChevronRight size={12} />{" "}
-              {page === "demo"
-                ? "FIXTURE DEMO"
-                : page === "edit"
-                  ? "PLAN EDITOR"
-                  : native
-                    ? "SAVED REVIEW"
-                    : "PREVIEW"}
+              {page === "advanced"
+                ? "GROUPED EDITOR"
+                : page === "demo"
+                  ? "FIXTURE DEMO"
+                  : page === "edit"
+                    ? "PLAN EDITOR"
+                    : native
+                      ? "SAVED REVIEW"
+                      : "PREVIEW"}
             </div>
             <h1>
-              {page === "demo"
-                ? "Test with disposable files."
-                : page === "edit"
-                  ? "Review each action."
-                  : native
-                    ? "Review saved."
-                    : "Preview decisions."}
+              {page === "advanced"
+                ? "Make the plan yours."
+                : page === "demo"
+                  ? "Test with disposable files."
+                  : page === "edit"
+                    ? "Review each action."
+                    : native
+                      ? "Review saved."
+                      : "Preview decisions."}
             </h1>
             <p>
-              {page === "demo"
-                ? "Review and restore files created only for this demo. Each operation needs its own native confirmation."
-                : page === "edit"
-                  ? "Choose what to include. The plan totals update from the current revision."
-                  : native
-                    ? "This immutable snapshot records the decisions you reviewed."
-                    : "This unsaved preview shows how the current decisions fit together."}
+              {page === "advanced"
+                ? "Review groups and exceptions, keep what matters, and inspect the evidence before saving a snapshot."
+                : page === "demo"
+                  ? "Review and restore files created only for this demo. Each operation needs its own native confirmation."
+                  : page === "edit"
+                    ? "Choose what to include. The plan totals update from the current revision."
+                    : native
+                      ? "This immutable snapshot records the decisions you reviewed."
+                      : "This unsaved preview shows how the current decisions fit together."}
             </p>
           </div>
           {page === "review" && (
             <button
               className="button secondary"
-              disabled={pending || demoBusy}
+              disabled={pending || workspaceBusy}
               onClick={() => setPage("edit")}
             >
               <ArrowLeft size={15} />
@@ -406,14 +460,20 @@ export default function App() {
             <span>{error}</span>
             <button
               onClick={() => void refresh(page === "demo")}
-              disabled={pending || demoBusy}
+              disabled={pending || workspaceBusy}
             >
               <RefreshCw size={14} />
               Refresh plan
             </button>
           </div>
         )}
-        {page === "demo" ? (
+        {page === "advanced" ? (
+          <GeneralPlanWorkspace
+            native={native}
+            onBusyChange={setGeneralBusy}
+            onSummaryChange={setGeneralSummary}
+          />
+        ) : page === "demo" ? (
           <DemoLifecyclePanel
             plan={{
               revisionId: plan.revisionId,
@@ -472,7 +532,7 @@ export default function App() {
                       } as React.CSSProperties
                     }
                     onClick={() => setSelectedId(action.id)}
-                    disabled={pending || demoBusy}
+                    disabled={pending || workspaceBusy}
                   >
                     <span className={`category-dot ${action.category}`} />
                     <span className="action-label">
@@ -512,7 +572,7 @@ export default function App() {
                 <button
                   className="button secondary"
                   onClick={() => void refresh()}
-                  disabled={!native || pending || demoBusy}
+                  disabled={!native || pending || workspaceBusy}
                 >
                   <RefreshCw className={pending ? "spin" : ""} size={15} />
                   Refresh
@@ -522,7 +582,7 @@ export default function App() {
                   onClick={() => void freeze()}
                   disabled={
                     pending ||
-                    demoBusy ||
+                    workspaceBusy ||
                     needsRefresh ||
                     plan.selectedCount === 0
                   }
@@ -576,7 +636,7 @@ export default function App() {
                           selected.decision === "keep" ? "chosen keep" : ""
                         }
                         onClick={() => void updateDecision(selected, "keep")}
-                        disabled={pending || demoBusy || needsRefresh}
+                        disabled={pending || workspaceBusy || needsRefresh}
                       >
                         <Check size={14} />
                         Keep
@@ -589,7 +649,7 @@ export default function App() {
                             : ""
                         }
                         onClick={() => void updateDecision(selected, "include")}
-                        disabled={pending || demoBusy || needsRefresh}
+                        disabled={pending || workspaceBusy || needsRefresh}
                       >
                         <Archive size={14} />
                         Include
@@ -663,7 +723,7 @@ export default function App() {
                   <button
                     className="button secondary"
                     onClick={() => void previewNativeReview()}
-                    disabled={pending || demoBusy || needsRefresh}
+                    disabled={pending || workspaceBusy || needsRefresh}
                   >
                     Preview native review
                   </button>

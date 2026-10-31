@@ -26,6 +26,16 @@ const checkManifests = (directory) => {
 };
 checkManifests('crates');
 checkManifests('probes');
+for (const path of ['Cargo.lock', 'src-tauri/Cargo.lock']) {
+  for (const block of read(path).split('[[package]]').slice(1)) {
+    const name = block.match(/^name = "([^"]+)"/m)?.[1];
+    if (name?.startsWith('disk-steward') ||
+        ['approval-ledger', 'verification-budget', 'atomic-rename-probe'].includes(name)) {
+      versions[`${path}:${name}`] = block.match(/^version = "([^"]+)"/m)?.[1];
+    }
+  }
+}
+
 if (Object.values(versions).some((version) => !/^0\.0\.\d+$/.test(version ?? '')) ||
     new Set(Object.values(versions)).size !== 1) {
   throw new Error(`Versions must match and remain 0.0.x until authorized: ${JSON.stringify(versions)}`);

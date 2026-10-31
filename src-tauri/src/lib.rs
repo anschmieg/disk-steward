@@ -1,5 +1,6 @@
 mod example_plan;
 mod fixture_demo;
+mod general_plan;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
@@ -61,6 +62,7 @@ pub fn run() {
         .setup(|app| {
             app.manage(example_plan::ExamplePlanState::open(app.handle()));
             app.manage(fixture_demo::FixtureDemoState::open(app.handle()));
+            app.manage(general_plan::GeneralPlanState::open(app.handle()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -75,7 +77,14 @@ pub fn run() {
             fixture_demo::start_fixture_demo,
             fixture_demo::prepare_fixture_stage,
             fixture_demo::prepare_fixture_restore,
-            fixture_demo::request_fixture_execution
+            fixture_demo::request_fixture_execution,
+            general_plan::get_general_plan,
+            general_plan::edit_general_plan,
+            general_plan::undo_general_plan,
+            general_plan::redo_general_plan,
+            general_plan::freeze_general_review,
+            general_plan::get_general_review,
+            general_plan::list_general_reviews
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disk Steward");

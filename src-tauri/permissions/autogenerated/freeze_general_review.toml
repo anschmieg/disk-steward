@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-freeze-general-review"
+description = "Enables the freeze_general_review command without any pre-configured scope."
+commands.allow = ["freeze_general_review"]
+
+[[permission]]
+identifier = "deny-freeze-general-review"
+description = "Denies the freeze_general_review command without any pre-configured scope."
+commands.deny = ["freeze_general_review"]

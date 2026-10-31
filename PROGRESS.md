@@ -112,3 +112,17 @@ Validation:83 then-current workspace tests passed with local socket access; two 
 Independent review closed three concrete gaps: the exact prepared-review ID/creation/expiry are now hashed and lifetime-checked; crash recovery retains completed child-byte totals; and a second live app instance cannot edit the owner's plan. All88 workspace Rust tests and8 native tests passed, strict workspace/native Clippy and formatting passed, and the final0.0.4 bundle built. Native smoke check confirmed owner edits to Revisions5/6, new expiry-bound review and native cancel with Test cache still Restored. The app is closed. docs/M1A-VALIDATION.md records the acceptance matrix; docs/IMPLEMENTATION-FORECAST.md replaces the old calendar placeholder with42–75 provisional verified work batches across the remaining scope, including external waiting-time limits.
 
 M1A's five-action disposable-file lifecycle is complete; general inventory/editor breadth and user-file execution are not included in that claim. M0 remains In progress. M1B is next, following a new purpose/scope/failure checkpoint. Versions remain0.0.4; no release is published. M0 cache and HTTPS worker probes are progressing independently and will be kept in a separate feature branch/PR.
+
+
+## M1B — In progress, bounded domain batch (0.0.5)
+
+Purpose/scope/failure checkpoint: .autonomous/disk-steward/m1b-scope.md. The first batch generalizes plan editing over a validated synthetic inventory, preserving user overrides separately from suggestions and adding membership/exclusions/survivors/undo/redo/groups/blockers with honest overlap estimates. It remains non-executable and separate from the five-file demo. Persistence, native additions, interface integration and participant pilots remain later M1B batches. A domain implementation is not milestone completion.
+
+Current feature branch is feat/m1b-plan-model based on completedM1A cf939a4. Versions are0.0.5; the version guard now also checks first-party Cargo lock entries. M0 follow-up code/evidence is isolated in /Users/adrian/Projects/disk-steward-worktrees/m0-feasibility on feat/m0-feasibility-followup at0.0.4, ready for a separate reviewable PR. No release is published.
+
+
+## M1B — Integrated persistent editor slice (0.0.5)
+
+The general editor now runs in the native app with separate 1,000- and 10,000-item synthetic workspaces, persistent revisions/undo/redo, membership, descendant exclusions, duplicate survivors, group choices, blockers and immutable saved reviews. The list has proportional background bars, bounded rendering, search and a linked evidence inspector. Root review corrected overlapping group counts and a native keyboard-focus failure. All 113 workspace Rust tests, nine native tests, strict workspace/native Clippy, formatting and frontend build/version checks passed during integration; the final macOS debug bundle built at 38.54 MiB. Native remove/re-add preserved the prior choice and returned the pilot selection to 790 at Revision 6. Saved-review persistence and 10,000-item keyboard navigation were observed in the app. See docs/M1B-VALIDATION.md.
+
+M1B remains In progress: native-selected additions, separately confirmed persistent global exclusions and the three-person preservation/comprehension pilot remain open. M0 stays In progress, CI remains unavailable due the known account restriction, and no user-file cleanup or release is enabled.
