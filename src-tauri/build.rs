@@ -4,6 +4,9 @@ fn main() {
             "foundation_status",
             "check_selected_folder_access",
             "preview_native_review",
+            "get_example_plan",
+            "edit_example_plan",
+            "freeze_example_review",
         ]),
     ))
     .expect("failed to generate application permission manifest");

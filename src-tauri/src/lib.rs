@@ -1,3 +1,5 @@
+mod example_plan;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -55,10 +57,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(foundation_capabilities())
+        .setup(|app| {
+            app.manage(example_plan::ExamplePlanState::open(app.handle()));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             foundation_status,
             check_selected_folder_access,
-            preview_native_review
+            preview_native_review,
+            example_plan::get_example_plan,
+            example_plan::edit_example_plan,
+            example_plan::freeze_example_review
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disk Steward");

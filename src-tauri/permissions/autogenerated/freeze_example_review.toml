@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-freeze-example-review"
+description = "Enables the freeze_example_review command without any pre-configured scope."
+commands.allow = ["freeze_example_review"]
+
+[[permission]]
+identifier = "deny-freeze-example-review"
+description = "Denies the freeze_example_review command without any pre-configured scope."
+commands.deny = ["freeze_example_review"]
