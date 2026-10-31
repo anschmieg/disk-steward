@@ -1,6 +1,6 @@
 # Implementation tasks
 
-See the [roadmap](../../../ROADMAP.md) for deliverables/dependencies and the [MVP catalog](../../../MVP-CATALOG.md) for the named detector/authentication scope and verification budgets. All implementation tasks remain unstarted. This document authorizes no cleanup of user data.
+See the [roadmap](../../../ROADMAP.md) for deliverables/dependencies and the [MVP catalog](../../../MVP-CATALOG.md) for the named detector/authentication scope and verification budgets. M0 foundation work is in progress; see [progress](../../../PROGRESS.md). No complete M0 gate is claimed yet. This document authorizes no cleanup of user data.
 
 M0–M6 remain the top-level milestones. M1A–M1C and M2A–M2B are sequential, demonstrable checkpoints inside M1/M2. The previous 12–16-week envelope is unvalidated: reforecast at M0 and M1A exits using observed effort and frozen scope. No calendar commitment is currently made.
 

@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/disk-steward-core"]
+exclude = ["src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

@@ -49,4 +49,12 @@ Build a five-action synthetic plan → edit → frozen approval → recoverable 
 
 Run a small bounded AI feasibility evaluation in M0 before freezing evidence contracts; full production Jev/agent integration remains M5 and uses held-out evaluation. Missing evaluation access is an explicit dependency, not evidence of success.
 
-The earlier 12–16-week envelope is unvalidated and no longer an active delivery forecast. Reforecast after M0 and again after M1A from measured effort and frozen scope. Windows/Linux production releases remain separate tracks. All implementation milestones are Planned.
+The earlier 12–16-week envelope is unvalidated and no longer an active delivery forecast. Reforecast after M0 and again after M1A from measured effort and frozen scope. Windows/Linux production releases remain separate tracks. M0 is in progress; other milestones remain Planned.
+
+## Development
+
+Version: 0.0.1. Repository: https://github.com/anschmieg/disk-steward (private). Current feature branch: feat/m0-foundation. See [progress](PROGRESS.md) for verified results and remaining gates.
+
+Use `npm ci` then `npm run dev` for the fixture UI, or `npm run tauri dev` for the desktop shell after installing the native prerequisites. `npm run build` checks TypeScript and builds the frontend. `cargo test --workspace` tests the portable contracts; `cargo check --manifest-path src-tauri/Cargo.toml -j 2` checks the native backend separately. `node scripts/check-version.mjs` enforces matching 0.0.x versions. The optional evaluation harness is development tooling: see [evaluation notes](evaluation/README.md).
+
+The current UI uses synthetic items only; it has no scan or execution commands. Core approval contracts are not yet a replay-safe execution service.
