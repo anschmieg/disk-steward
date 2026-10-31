@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "scope": "bounded feasibility; not production Git verification",
+  "public_attempt": {
+    "result": "failed_closed",
+    "elapsed_ms": 708,
+    "logical_store_bytes": 16321,
+    "failure": "WorkerFailed",
+    "cleaned": true,
+    "cause": "unknown; subsequent public attempts succeeded"
+  },
+  "private_own_repository": {
+    "existing_host_sign_in": true,
+    "repository_metadata_size_kib": 830,
+    "elapsed_ms": 1349,
+    "logical_store_bytes": 1000028,
+    "response_body_exposed_bytes": 980162,
+    "response_header_exposed_bytes": 1303,
+    "objects": 493,
+    "refs": 6,
+    "failure": null,
+    "cleaned": true,
+    "credential_echo_detected": false
+  },
+  "invalid_synthetic_credential": {
+    "exit_code": 1,
+    "elapsed_ms": 434,
+    "logical_store_bytes": 12915,
+    "failure": "WorkerFailed",
+    "cleaned": true,
+    "secret_echo_detected": false
+  },
+  "limitations": [
+    "Not app Keychain integration or signed permission validation",
+    "Object/ref counts do not prove local-ref preservation or complete object closure",
+    "Response exposure budget is not a wire/TLS/kernel ingress cap",
+    "No actual credential revoked or modified",
+    "No user clone inspected or changed"
+  ]
+}
