@@ -23,6 +23,9 @@ const CONTROL_SCHEMA_VERSION: i64 = 1;
 const MAX_TARGETS: usize = 5;
 const REVIEW_LIFETIME_MS: i64 = 5 * 60 * 1000;
 const MAX_TARGETS_JSON_BYTES: usize = 64 * 1024;
+/// Upper bound for typed identifier wires in stored rows (IDs are bounded
+/// JSON objects; anything longer is not an ID this store wrote).
+const MAX_ID_WIRE_BYTES: usize = 512;
 
 const REVIEWS_SCHEMA: &str = "CREATE TABLE purge_reviews(review_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, revision_id TEXT NOT NULL, session_id TEXT NOT NULL, operation TEXT NOT NULL CHECK(operation='permanently_remove_staged'), created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL, manifest_sha256 TEXT NOT NULL, targets_json TEXT NOT NULL, selected_logical_bytes INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','claimed','finished'))) STRICT";
 const EXECUTIONS_SCHEMA: &str = "CREATE TABLE purge_executions(execution_id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL, started_at_ms INTEGER NOT NULL, finished_at_ms INTEGER, state TEXT NOT NULL CHECK(state IN ('started','finished','partial','uncertain'))) STRICT";
@@ -42,6 +45,7 @@ pub enum PurgeError {
     StorageFailure,
     UncertainOutcome,
     InvalidInput,
+    UntrustedDirectory,
 }
 impl PurgeError {
     /// Sanitized stable error codes; never paths or SQL text.
@@ -58,6 +62,7 @@ impl PurgeError {
             Self::StorageFailure => "storage_failure",
             Self::UncertainOutcome => "uncertain_outcome",
             Self::InvalidInput => "invalid_input",
+            Self::UntrustedDirectory => "untrusted_directory",
         }
     }
 }
@@ -368,7 +373,9 @@ impl FixturePurgeService {
     ) -> Result<PurgeExecutionResult, PurgeError> {
         let stored = self.read_stored_review(&review_id)?;
         let now = (self.now)();
-        if now >= stored.prepared.expires_at_ms {
+        // A clock stepped backwards cannot revive or execute a review, and
+        // an expired one cannot be confirmed; the contract refuses both.
+        if now >= stored.prepared.expires_at_ms || now < stored.created_at_ms {
             return Err(PurgeError::ReviewExpired);
         }
         self.revalidate(&stored)?;
@@ -409,6 +416,15 @@ impl FixturePurgeService {
         let Some(row) = row else {
             return Err(PurgeError::ReviewReplayed);
         };
+        // SQL byte limits are checked before any JSON is loaded.
+        if row.0.len() > MAX_ID_WIRE_BYTES
+            || row.1.len() > MAX_ID_WIRE_BYTES
+            || row.2.len() > MAX_ID_WIRE_BYTES
+            || row.6.len() > MAX_TARGETS_JSON_BYTES
+            || row.5.len() != 64
+        {
+            return Err(PurgeError::UnsupportedSchema);
+        }
         let (
             plan_id,
             revision_id,
@@ -454,6 +470,7 @@ impl FixturePurgeService {
                 targets,
                 selected_logical_bytes: selected_logical_bytes as u64,
             },
+            created_at_ms,
         })
     }
 
@@ -639,12 +656,24 @@ impl FixturePurgeService {
                         stopped = true;
                         "uncertain"
                     }
-                    Err(_) => {
-                        if final_state == "finished" {
-                            final_state = "partial".to_owned();
+                    Err(error) => {
+                        // A failure after the lifecycle journaled its intent
+                        // (e.g. a post-commit checkpoint failure) is not a
+                        // clean refusal: the intent is durable and the item's
+                        // outcome cannot be established.
+                        let intent_pending = self.lifecycle.pending_intent_for(target.action_id)?;
+                        if intent_pending {
+                            final_state = "uncertain".to_owned();
+                            stopped = true;
+                            "uncertain"
+                        } else {
+                            let _ = error;
+                            if final_state == "finished" {
+                                final_state = "partial".to_owned();
+                            }
+                            stopped = true;
+                            "not_attempted"
                         }
-                        stopped = true;
-                        "not_attempted"
                     }
                 }
             };
@@ -688,6 +717,7 @@ impl FixturePurgeService {
 
 struct StoredReview {
     prepared: PreparedPurgeReview,
+    created_at_ms: i64,
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -739,7 +769,44 @@ fn open_control_db(root: &Path) -> Result<Connection, PurgeError> {
     db.pragma_update(None, "journal_mode", "WAL")?;
     db.pragma_update(None, "synchronous", "FULL")?;
     initialize_control(&db)?;
+    enforce_private_store(&db)?;
     Ok(db)
+}
+
+/// The control store itself must be private to the app's user (0600 file,
+/// 0700 parent), and the parent directory must be a real private directory —
+/// mirrors fixture-lifecycle's create_private_dir discipline on every open.
+fn enforce_private_store(db: &Connection) -> Result<(), PurgeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let db_path = db.path().ok_or(PurgeError::StorageFailure)?;
+    // SQLite creates new files with permissive defaults; strip group/other
+    // bits so the store is private to the app's user.
+    let db_meta = std::fs::metadata(db_path).map_err(|_| PurgeError::StorageFailure)?;
+    let mut db_permissions = db_meta.permissions();
+    let db_mode = db_permissions.mode();
+    if db_mode & 0o077 != 0 {
+        db_permissions.set_mode(db_mode & !0o077);
+        std::fs::set_permissions(db_path, db_permissions)
+            .map_err(|_| PurgeError::StorageFailure)?;
+    }
+    let db_mode = std::fs::metadata(db_path)
+        .map_err(|_| PurgeError::StorageFailure)?
+        .permissions()
+        .mode();
+    if db_mode & 0o077 != 0 {
+        return Err(PurgeError::UntrustedDirectory);
+    }
+    // The parent directory must already be private; the service never
+    // widens a directory's permissions.
+    let parent_mode = std::path::Path::new(db_path)
+        .parent()
+        .and_then(|parent| std::fs::metadata(parent).ok())
+        .map(|m| m.permissions().mode())
+        .ok_or(PurgeError::StorageFailure)?;
+    if parent_mode & 0o077 != 0 {
+        return Err(PurgeError::UntrustedDirectory);
+    }
+    Ok(())
 }
 
 fn initialize_control(db: &Connection) -> Result<(), PurgeError> {
@@ -796,8 +863,16 @@ mod tests {
     use tempfile::tempdir;
 
     fn demo_root() -> (tempfile::TempDir, [disk_steward_core::ActionId; 5]) {
+        // Mirror the production contract: the app-owned root is private
+        // (0700). Tempdir defaults to 0755; tighten it before any store is
+        // created inside.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
         (
-            tempdir().unwrap(),
+            dir,
             std::array::from_fn(|_| disk_steward_core::ActionId::new()),
         )
     }
@@ -1492,5 +1567,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(children, 1);
+    }
+
+    #[test]
+    fn clock_reversal_after_prepare_is_refused() {
+        let (dir, _ids) = demo_root();
+        let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(2_000_000_000_000_i64));
+        let (mut service, targets, plan_view) =
+            service_with_staged_and_clock_cell(dir.path(), 1, tick.clone());
+        let review = service
+            .prepare_purge_review(plan_view.revision_id, targets.clone())
+            .unwrap();
+        // Step the clock backwards past the review's creation.
+        tick.store(1_000_000_000_000_i64, std::sync::atomic::Ordering::SeqCst);
+        let error = service
+            .claim_and_execute(review.review_id, |_| true)
+            .unwrap_err();
+        assert_eq!(error.code(), "review_expired");
+        let receipt_wire = serde_json::to_string(&targets[0].receipt_id).unwrap();
+        assert!(holding_slot_for(dir.path(), &receipt_wire).exists());
     }
 }
