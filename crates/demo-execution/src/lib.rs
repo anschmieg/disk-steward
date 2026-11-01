@@ -1546,7 +1546,12 @@ fn to_demo_fixture(f: FixtureSnapshot) -> DemoFixture {
     }
 }
 
-#[cfg(test)]
+// Every test drives DemoExecutionService::open, which acquires the owner
+// lease — a Unix-only mechanism by design (non-unix returns
+// SessionUnavailable). Gate the whole module the same way acquire_lease is
+// gated, so cross-platform `cargo test --workspace` exercises exactly the
+// contracts that are portable.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::{
