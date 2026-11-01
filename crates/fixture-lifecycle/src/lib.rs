@@ -26,10 +26,14 @@ const MAX_FIXTURE_BYTES: u64 = 6 * 1024 * 1024;
 const ROOT_PREFIX: &str = ".disk-steward-fixtures-";
 const DB_NAME: &str = "lifecycle.sqlite3";
 const DB_APPLICATION_ID: i64 = 0x4453_464c;
-const DB_SCHEMA_VERSION: i64 = 1;
+const DB_SCHEMA_VERSION: i64 = 2;
+const LEGACY_SCHEMA_VERSION: i64 = 1;
 const MANIFEST_SCHEMA: &str = "CREATE TABLE manifest(singleton INTEGER PRIMARY KEY CHECK(singleton=1), session_id TEXT NOT NULL, parent_dev INTEGER NOT NULL,parent_ino INTEGER NOT NULL,root_dev INTEGER NOT NULL,root_ino INTEGER NOT NULL,source_dev INTEGER NOT NULL,source_ino INTEGER NOT NULL,holding_dev INTEGER NOT NULL,holding_ino INTEGER NOT NULL) STRICT";
-const FIXTURES_SCHEMA: &str = "CREATE TABLE fixtures(action_id TEXT PRIMARY KEY,slot TEXT NOT NULL UNIQUE,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('available','staged','restored','uncertain')),receipt_id TEXT UNIQUE) STRICT";
-const ATTEMPTS_SCHEMA: &str = "CREATE TABLE attempts(attempt_id TEXT PRIMARY KEY,action_id TEXT NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('stage','restore')),receipt_id TEXT,outcome TEXT NOT NULL CHECK(outcome IN ('intent','staged','restored','collision','uncertain'))) STRICT";
+const FIXTURES_SCHEMA_V1: &str = "CREATE TABLE fixtures(action_id TEXT PRIMARY KEY,slot TEXT NOT NULL UNIQUE,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('available','staged','restored','uncertain')),receipt_id TEXT UNIQUE) STRICT";
+const ATTEMPTS_SCHEMA_V1: &str = "CREATE TABLE attempts(attempt_id TEXT PRIMARY KEY,action_id TEXT NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('stage','restore')),receipt_id TEXT,outcome TEXT NOT NULL CHECK(outcome IN ('intent','staged','restored','collision','uncertain'))) STRICT";
+const FIXTURES_SCHEMA: &str = "CREATE TABLE fixtures(action_id TEXT PRIMARY KEY,slot TEXT NOT NULL UNIQUE,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('available','staged','restored','uncertain','permanently_removed')),receipt_id TEXT UNIQUE) STRICT";
+const ATTEMPTS_SCHEMA: &str = "CREATE TABLE attempts(attempt_id TEXT PRIMARY KEY,action_id TEXT NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('stage','restore','purge')),receipt_id TEXT,outcome TEXT NOT NULL CHECK(outcome IN ('intent','staged','restored','collision','uncertain','permanently_removed'))) STRICT";
+const MAX_ATTEMPTS: i64 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +236,7 @@ impl FixtureLifecycle {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         configure_db(&db, false)?;
+        migrate_legacy_v1(&db, id, &parent, &root_dir, &source_dir, &holding_dir)?;
         validate_schema(&db)?;
         validate_manifest(&db, id, &parent, &root_dir, &source_dir, &holding_dir)?;
         let lifecycle = Self {
@@ -261,6 +266,7 @@ impl FixtureLifecycle {
         action: ActionId,
         attempt: AttemptId,
     ) -> Result<ReceiptId, LifecycleError> {
+        validate_schema(&self.db)?;
         validate_registry(&self.db)?;
         let fixture = self
             .lookup_action(action)?
@@ -320,6 +326,7 @@ impl FixtureLifecycle {
         receipt: ReceiptId,
         attempt: AttemptId,
     ) -> Result<(), LifecycleError> {
+        validate_schema(&self.db)?;
         validate_registry(&self.db)?;
         let fixture = self
             .lookup_receipt(receipt)?
@@ -369,6 +376,7 @@ impl FixtureLifecycle {
     }
 
     pub fn snapshot(&self) -> Result<SessionSnapshot, LifecycleError> {
+        validate_schema(&self.db)?;
         validate_registry(&self.db)?;
         self.verify_directories()?;
         let directory_bindings = self.directory_bindings()?;
@@ -913,6 +921,13 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
     Ok(())
 }
 fn validate_schema(db: &Connection) -> Result<(), LifecycleError> {
+    validate_schema_version(db, DB_SCHEMA_VERSION, false)
+}
+fn validate_schema_version(
+    db: &Connection,
+    expected_version: i64,
+    legacy: bool,
+) -> Result<(), LifecycleError> {
     let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let schema_version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -924,16 +939,15 @@ fn validate_schema(db: &Connection) -> Result<(), LifecycleError> {
         [],
         |r| r.get(0),
     )?;
-    let known_tables: i64 = db.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('manifest','fixtures','attempts')",
-        [],
-        |r| r.get(0),
-    )?;
-    let strict_tables: i64 = db.query_row(
-        "SELECT COUNT(*) FROM pragma_table_list WHERE schema='main' AND name IN ('manifest','fixtures','attempts') AND strict=1",
-        [],
-        |r| r.get(0),
-    )?;
+    let known_tables: i64 = db.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('manifest','fixtures','attempts')", [], |r| r.get(0))?;
+    let strict_tables: i64 = db.query_row("SELECT COUNT(*) FROM pragma_table_list WHERE schema='main' AND name IN ('manifest','fixtures','attempts') AND strict=1", [], |r| r.get(0))?;
+    if objects != 3 || known_tables != 3 || strict_tables != 3 {
+        return Err(LifecycleError::InvalidSession);
+    }
+    let oversized_schema: i64 = db.query_row("SELECT count(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' AND (length(CAST(type AS BLOB))>64 OR length(CAST(name AS BLOB))>128 OR length(CAST(sql AS BLOB))>2048)", [], |r| r.get(0))?;
+    if oversized_schema != 0 {
+        return Err(LifecycleError::InvalidSession);
+    }
     let mut statement = db.prepare("SELECT name, sql FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' ORDER BY name")?;
     let schema_rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -943,12 +957,28 @@ fn validate_schema(db: &Connection) -> Result<(), LifecycleError> {
         exact_schema.push(row?);
     }
     let expected_schema = vec![
-        ("attempts".to_owned(), ATTEMPTS_SCHEMA.to_owned()),
-        ("fixtures".to_owned(), FIXTURES_SCHEMA.to_owned()),
+        (
+            "attempts".to_owned(),
+            if legacy {
+                ATTEMPTS_SCHEMA_V1
+            } else {
+                ATTEMPTS_SCHEMA
+            }
+            .to_owned(),
+        ),
+        (
+            "fixtures".to_owned(),
+            if legacy {
+                FIXTURES_SCHEMA_V1
+            } else {
+                FIXTURES_SCHEMA
+            }
+            .to_owned(),
+        ),
         ("manifest".to_owned(), MANIFEST_SCHEMA.to_owned()),
     ];
     if application_id != DB_APPLICATION_ID
-        || schema_version != DB_SCHEMA_VERSION
+        || schema_version != expected_version
         || integrity != "ok"
         || !journal_mode.eq_ignore_ascii_case("wal")
         || synchronous != 2
@@ -962,6 +992,90 @@ fn validate_schema(db: &Connection) -> Result<(), LifecycleError> {
     }
     Ok(())
 }
+fn validate_migration_row_bounds(db: &Connection) -> Result<(), LifecycleError> {
+    let (manifest_count, fixture_count, attempt_count): (i64,i64,i64) = db.query_row(
+        "SELECT (SELECT count(*) FROM manifest),(SELECT count(*) FROM fixtures),(SELECT count(*) FROM attempts)", [],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    if manifest_count != 1 || fixture_count != FIXTURES.len() as i64 || attempt_count > MAX_ATTEMPTS
+    {
+        return Err(LifecycleError::InvalidSession);
+    }
+    let oversized: i64 = db.query_row(
+        "SELECT (SELECT count(*) FROM manifest WHERE length(CAST(session_id AS BLOB))>128) + (SELECT count(*) FROM fixtures WHERE length(CAST(action_id AS BLOB))>128 OR length(CAST(slot AS BLOB))>64 OR length(CAST(sha256 AS BLOB))>64 OR length(CAST(status AS BLOB))>32 OR length(CAST(receipt_id AS BLOB))>128) + (SELECT count(*) FROM attempts WHERE length(CAST(attempt_id AS BLOB))>128 OR length(CAST(action_id AS BLOB))>128 OR length(CAST(operation AS BLOB))>32 OR length(CAST(receipt_id AS BLOB))>128 OR length(CAST(outcome AS BLOB))>32)", [], |r| r.get(0))?;
+    if oversized != 0 {
+        return Err(LifecycleError::InvalidSession);
+    }
+    Ok(())
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MigrationFault {
+    None,
+    AfterRename,
+    AfterCreate,
+    AfterCopy,
+    BeforeVersion,
+}
+fn migrate_legacy_v1(
+    db: &Connection,
+    id: SessionId,
+    parent: &File,
+    root: &File,
+    source: &File,
+    holding: &File,
+) -> Result<(), LifecycleError> {
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == DB_SCHEMA_VERSION {
+        validate_schema(db)?;
+        return Ok(());
+    }
+    if version != LEGACY_SCHEMA_VERSION {
+        return Err(LifecycleError::InvalidSession);
+    }
+    migrate_legacy_v1_inner(db, id, parent, root, source, holding, MigrationFault::None)
+}
+fn migrate_legacy_v1_inner(
+    db: &Connection,
+    id: SessionId,
+    parent: &File,
+    root: &File,
+    source: &File,
+    holding: &File,
+    fault: MigrationFault,
+) -> Result<(), LifecycleError> {
+    validate_schema_version(db, LEGACY_SCHEMA_VERSION, true)?;
+    validate_manifest(db, id, parent, root, source, holding)?;
+    validate_migration_row_bounds(db)?;
+    validate_registry(db)?;
+    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    validate_schema_version(&tx, LEGACY_SCHEMA_VERSION, true)?;
+    validate_manifest(&tx, id, parent, root, source, holding)?;
+    validate_migration_row_bounds(&tx)?;
+    validate_registry(&tx)?;
+    tx.execute_batch("ALTER TABLE fixtures RENAME TO fixtures_v1_backup; ALTER TABLE attempts RENAME TO attempts_v1_backup;")?;
+    if fault == MigrationFault::AfterRename {
+        return Err(LifecycleError::InvalidSession);
+    }
+    tx.execute_batch(FIXTURES_SCHEMA)?;
+    tx.execute_batch(ATTEMPTS_SCHEMA)?;
+    if fault == MigrationFault::AfterCreate {
+        return Err(LifecycleError::InvalidSession);
+    }
+    tx.execute_batch("INSERT INTO fixtures(rowid,action_id,slot,bytes,sha256,dev,ino,status,receipt_id) SELECT rowid,action_id,slot,bytes,sha256,dev,ino,status,receipt_id FROM fixtures_v1_backup ORDER BY rowid; INSERT INTO attempts(rowid,attempt_id,action_id,operation,receipt_id,outcome) SELECT rowid,attempt_id,action_id,operation,receipt_id,outcome FROM attempts_v1_backup ORDER BY rowid;")?;
+    if fault == MigrationFault::AfterCopy {
+        return Err(LifecycleError::InvalidSession);
+    }
+    tx.execute_batch("DROP TABLE fixtures_v1_backup; DROP TABLE attempts_v1_backup;")?;
+    validate_migration_row_bounds(&tx)?;
+    validate_registry(&tx)?;
+    if fault == MigrationFault::BeforeVersion {
+        return Err(LifecycleError::InvalidSession);
+    }
+    tx.pragma_update(None, "user_version", DB_SCHEMA_VERSION)?;
+    validate_schema(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn validate_manifest(
     db: &Connection,
     id: SessionId,
@@ -1302,8 +1416,129 @@ fn rename_no_replace(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    fn downgrade_to_v1(db: &Connection) {
+        let tx = db.unchecked_transaction().unwrap();
+        tx.execute_batch("ALTER TABLE fixtures RENAME TO fixtures_v2_backup; ALTER TABLE attempts RENAME TO attempts_v2_backup;").unwrap();
+        tx.execute_batch(FIXTURES_SCHEMA_V1).unwrap();
+        tx.execute_batch(ATTEMPTS_SCHEMA_V1).unwrap();
+        tx.execute_batch("INSERT INTO fixtures(rowid,action_id,slot,bytes,sha256,dev,ino,status,receipt_id) SELECT rowid,action_id,slot,bytes,sha256,dev,ino,status,receipt_id FROM fixtures_v2_backup ORDER BY rowid; INSERT INTO attempts(rowid,attempt_id,action_id,operation,receipt_id,outcome) SELECT rowid,attempt_id,action_id,operation,receipt_id,outcome FROM attempts_v2_backup ORDER BY rowid; DROP TABLE fixtures_v2_backup; DROP TABLE attempts_v2_backup;").unwrap();
+        tx.pragma_update(None, "user_version", LEGACY_SCHEMA_VERSION)
+            .unwrap();
+        tx.commit().unwrap();
+    }
     fn bindings() -> [ActionId; 5] {
         std::array::from_fn(|_| ActionId::new())
+    }
+    #[test]
+    fn legacy_v1_migrates_with_rowid_gaps_and_old_receipt_remains_restorable() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let first = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.restore(first, AttemptId::new()).unwrap();
+        let staged = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.db
+            .execute_batch(
+                "UPDATE fixtures SET rowid=rowid+10000; UPDATE attempts SET rowid=rowid+10000;",
+            )
+            .unwrap();
+        downgrade_to_v1(&life.db);
+        let session = life.session_id();
+        drop(life);
+        let (mut migrated, snapshot) = FixtureLifecycle::reopen(parent.path(), session).unwrap();
+        assert_eq!(snapshot.fixtures[0].receipt_id, Some(staged));
+        assert_eq!(snapshot.fixtures[0].status, FixtureStatus::Staged);
+        migrated.restore(staged, AttemptId::new()).unwrap();
+        assert_eq!(
+            migrated.snapshot().unwrap().fixtures[0].status,
+            FixtureStatus::Restored
+        );
+
+        let parent = tempfile::tempdir().unwrap();
+        let (life, _) = FixtureLifecycle::create(parent.path(), bindings()).unwrap();
+        downgrade_to_v1(&life.db);
+        let id = life.session_id();
+        drop(life);
+        let (_, empty) = FixtureLifecycle::reopen(parent.path(), id).unwrap();
+        assert!(empty
+            .fixtures
+            .iter()
+            .all(|f| f.status == FixtureStatus::Available));
+    }
+
+    #[test]
+    fn migration_fault_rolls_back_and_open_schema_changes_block_file_operations() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let staged = life.stage(ids[0], AttemptId::new()).unwrap();
+        downgrade_to_v1(&life.db);
+        for fault in [
+            MigrationFault::AfterRename,
+            MigrationFault::AfterCreate,
+            MigrationFault::AfterCopy,
+            MigrationFault::BeforeVersion,
+        ] {
+            assert!(migrate_legacy_v1_inner(
+                &life.db,
+                life.id,
+                &life.parent,
+                &life.root_dir,
+                &life.source_dir,
+                &life.holding_dir,
+                fault
+            )
+            .is_err());
+            assert_eq!(
+                life.db
+                    .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                LEGACY_SCHEMA_VERSION
+            );
+        }
+        validate_schema_version(&life.db, LEGACY_SCHEMA_VERSION, true).unwrap();
+        let id = life.session_id();
+        drop(life);
+        let (mut migrated, view) = FixtureLifecycle::reopen(parent.path(), id).unwrap();
+        assert_eq!(view.fixtures[0].receipt_id, Some(staged));
+        migrated
+            .db
+            .execute_batch(
+                "CREATE TRIGGER unexpected AFTER UPDATE ON fixtures BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            migrated.restore(staged, AttemptId::new()),
+            Err(LifecycleError::InvalidSession)
+        ));
+        assert!(matches!(
+            migrated.snapshot(),
+            Err(LifecycleError::InvalidSession)
+        ));
+        assert!(migrated
+            .root_path
+            .join("holding")
+            .join(receipt_slot(staged).unwrap())
+            .exists());
+    }
+
+    #[test]
+    fn reserved_v2_purge_attempt_vocabulary_is_rejected_by_runtime_validator() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        life.db.execute("INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'intent')", params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[0]).unwrap(), typed_wire(&ReceiptId::new()).unwrap()]).unwrap();
+        assert!(matches!(
+            life.snapshot(),
+            Err(LifecycleError::InvalidSession)
+        ));
+        assert_eq!(
+            life.db
+                .query_row("SELECT operation FROM attempts LIMIT 1", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "purge"
+        );
     }
     #[test]
     fn stage_restore_reopen_and_fixed_five_files() {
@@ -1618,7 +1853,7 @@ mod tests {
         drop(lifecycle);
         let tampered = Connection::open(&db_path).unwrap();
         tampered
-            .execute_batch("PRAGMA writable_schema=ON; UPDATE sqlite_schema SET sql=replace(sql, \"CHECK(status IN ('available','staged','restored','uncertain'))\", \"CHECK(status != 'forbidden')\") WHERE name='fixtures'; PRAGMA writable_schema=OFF;")
+            .execute_batch("PRAGMA writable_schema=ON; UPDATE sqlite_schema SET sql=replace(sql, \"CHECK(status IN ('available','staged','restored','uncertain','permanently_removed'))\", \"CHECK(status != 'forbidden')\") WHERE name='fixtures'; PRAGMA writable_schema=OFF;")
             .unwrap();
         drop(tampered);
         assert!(matches!(

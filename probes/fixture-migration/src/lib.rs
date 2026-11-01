@@ -87,6 +87,37 @@ mod probe {
             .join("lifecycle.sqlite3")
     }
 
+    // Construct a frozen legacy-format database from a self-created current
+    // fixture session. This is test setup only, never an application downgrade.
+    fn make_legacy_fixture(path: &Path) {
+        let mut conn = Connection::open(path).unwrap();
+        let (app, version, objects) = schema(&conn).unwrap();
+        assert_eq!(app, APP_ID);
+        if version == V1 {
+            return;
+        }
+        assert_eq!(version, V2);
+        assert_eq!(
+            objects,
+            vec![
+                ("table".into(), "attempts".into(), ATTEMPTS_V2.into()),
+                ("table".into(), "fixtures".into(), FIXTURES_V2.into()),
+                ("table".into(), "manifest".into(), MANIFEST_V1.into()),
+            ]
+        );
+        let before = load_rows(&conn).unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute_batch("ALTER TABLE fixtures RENAME TO fixtures_current_backup; ALTER TABLE attempts RENAME TO attempts_current_backup;").unwrap();
+        tx.execute_batch(FIXTURES_V1).unwrap();
+        tx.execute_batch(ATTEMPTS_V1).unwrap();
+        tx.execute_batch("INSERT INTO fixtures(rowid,action_id,slot,bytes,sha256,dev,ino,status,receipt_id) SELECT rowid,action_id,slot,bytes,sha256,dev,ino,status,receipt_id FROM fixtures_current_backup ORDER BY rowid; INSERT INTO attempts(rowid,attempt_id,action_id,operation,receipt_id,outcome) SELECT rowid,attempt_id,action_id,operation,receipt_id,outcome FROM attempts_current_backup ORDER BY rowid; DROP TABLE fixtures_current_backup; DROP TABLE attempts_current_backup;").unwrap();
+        assert_eq!(load_rows(&tx).unwrap(), before);
+        tx.pragma_update(None, "user_version", V1).unwrap();
+        tx.commit().unwrap();
+    }
+
     fn make_session(parent: &Path) -> (SessionId, SessionSnapshot, PathBuf) {
         let actions = std::array::from_fn(|_| ActionId::new());
         let id = SessionId::new();
@@ -108,6 +139,7 @@ mod probe {
         let (reopened, verified) = FixtureLifecycle::reopen(parent, id).unwrap();
         assert_eq!(verified, snapshot);
         drop(reopened);
+        make_legacy_fixture(&path);
         (id, snapshot, path)
     }
 
@@ -420,6 +452,7 @@ mod probe {
         let (life, gap_snapshot) = FixtureLifecycle::reopen(parent.path(), id).unwrap();
         assert_eq!(gap_snapshot, snapshot);
         drop(life);
+        make_legacy_fixture(&path);
         let conn = Connection::open(&path).unwrap();
         let before = load_rows(&conn).unwrap();
         validate_rows(&before, Some(&snapshot), V1).unwrap();
@@ -440,6 +473,7 @@ mod probe {
             FixtureLifecycle::create_for_session(parent.path(), id, actions).unwrap();
         let path = db_path(parent.path(), &id);
         drop(life);
+        make_legacy_fixture(&path);
         assert!(load_rows(&Connection::open(&path).unwrap())
             .unwrap()
             .attempts
@@ -497,6 +531,7 @@ mod probe {
                             None
                         }));
             drop(life);
+            make_legacy_fixture(&path);
             let before = load_rows(&Connection::open(&path).unwrap()).unwrap();
             migrate(&path, Some(&snapshot), Fault::None).unwrap();
             assert_eq!(ensure_valid_v2(&path, &snapshot).unwrap(), before);
