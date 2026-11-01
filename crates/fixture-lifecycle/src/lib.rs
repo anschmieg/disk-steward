@@ -41,6 +41,7 @@ pub enum FixtureStatus {
     Available,
     Staged,
     Restored,
+    PermanentlyRemoved,
     Uncertain,
     Changed,
 }
@@ -87,6 +88,25 @@ impl From<rusqlite::Error> for LifecycleError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Database(error)
     }
+}
+
+/// Outcome of one receipt-addressed purge attempt (contract
+/// `fixture-purge-v1`). `NotAttempted` is the batch-layer outcome for items
+/// whose unlink intent was never claimed; this crate reports refusals as
+/// typed errors instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeItemOutcome {
+    NotAttempted {
+        receipt_id: ReceiptId,
+    },
+    PermanentlyRemoved {
+        receipt_id: ReceiptId,
+        logical_bytes: u64,
+    },
+    Uncertain {
+        receipt_id: ReceiptId,
+    },
 }
 
 /// A process-local handle to one internally created fixture session.
@@ -378,6 +398,111 @@ impl FixtureLifecycle {
         }
     }
 
+    /// Permanently remove one staged fixture by its registered receipt.
+    /// The only address is the receipt within this open session; the unlink
+    /// is directory-relative through the already-opened holding-directory
+    /// handle after a full identity re-verification, so no caller path is
+    /// ever accepted.
+    ///
+    /// Residual same-user TOCTOU, per contract fixture-purge-v1: the
+    /// verification and the directory-relative unlink are bound by name, not
+    /// atomically by inode; portable filesystems provide no "unlink only if
+    /// this name still has this inode" primitive. A same-user process able
+    /// to mutate the private fixture directory can race the verification and
+    /// the unlink. The mitigations are the restrictive directory
+    /// ownership/mode, no-follow opened directory handles, and verification
+    /// twice — once before the intent is journaled and again immediately
+    /// before the unlink; when the outcome cannot be established, the
+    /// receipt state becomes Uncertain rather than guessed.
+    pub fn purge_receipt(
+        &mut self,
+        receipt: ReceiptId,
+        attempt: AttemptId,
+    ) -> Result<PurgeItemOutcome, LifecycleError> {
+        // Belt-and-braces for the destructive operation: no lifecycle
+        // instance can exist on unsupported hosts (create/reopen gate on
+        // this), but the purge path refuses before anything else regardless.
+        supported()?;
+        validate_schema(&self.db)?;
+        validate_registry(&self.db)?;
+        let fixture = self
+            .lookup_receipt(receipt)?
+            .ok_or(LifecycleError::UnknownReceipt)?;
+        if self.has_pending_intent(&fixture.action_id)? {
+            return Err(LifecycleError::Uncertain);
+        }
+        if fixture.status != "staged" {
+            return Err(LifecycleError::WrongState);
+        }
+        let slot = receipt_slot(receipt)?;
+        self.verify_fixture(&fixture, &self.holding_dir, &slot)?;
+        self.verify_directories()?;
+        self.record_intent(attempt, &fixture, "purge", Some(receipt))?;
+        self.complete_purge(receipt, attempt, &fixture, &slot)
+    }
+
+    /// Recheck, unlink, sync, and journal the terminal outcome. Split from
+    /// `purge_receipt` so each platform compiles exactly its own variant;
+    /// both are tail expressions, mirroring `open_regular`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn complete_purge(
+        &mut self,
+        receipt: ReceiptId,
+        attempt: AttemptId,
+        fixture: &Expected,
+        slot: &str,
+    ) -> Result<PurgeItemOutcome, LifecycleError> {
+        use rustix::fs::{unlinkat, AtFlags};
+        // Contract: recheck immediately before the unlink. The intent write
+        // takes time, so the verified identity is re-established here; a
+        // failure means the receipt mutated between verification and unlink
+        // and the outcome can no longer be established.
+        if self
+            .verify_fixture(fixture, &self.holding_dir, slot)
+            .is_err()
+        {
+            return Err(self.uncertain_error(attempt, &fixture.action_id));
+        }
+        if unlinkat(&self.holding_dir, slot, AtFlags::empty()).is_err()
+            || sync_dir(&self.holding_dir).is_err()
+        {
+            // The unlink may or may not have occurred; the result cannot be
+            // established, so the receipt state becomes Uncertain.
+            return Err(self.uncertain_error(attempt, &fixture.action_id));
+        }
+        if self
+            .record_outcome(
+                attempt,
+                &fixture.action_id,
+                "permanently_removed",
+                Some(receipt),
+            )
+            .is_err()
+        {
+            return Err(self.uncertain_error(attempt, &fixture.action_id));
+        }
+        Ok(PurgeItemOutcome::PermanentlyRemoved {
+            receipt_id: receipt,
+            logical_bytes: fixture.bytes,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn complete_purge(
+        &mut self,
+        receipt: ReceiptId,
+        attempt: AttemptId,
+        fixture: &Expected,
+        slot: &str,
+    ) -> Result<PurgeItemOutcome, LifecycleError> {
+        // Unreachable in practice: no lifecycle instance can exist on
+        // unsupported hosts. If one ever did, the journaled intent must
+        // become uncertain — no platform may claim success it cannot
+        // establish, and none of these hosts has an unlink implementation.
+        let _ = (receipt, slot);
+        Err(self.uncertain_error(attempt, &fixture.action_id))
+    }
+
     pub fn snapshot(&self) -> Result<SessionSnapshot, LifecycleError> {
         validate_schema(&self.db)?;
         validate_registry(&self.db)?;
@@ -438,6 +563,10 @@ impl FixtureLifecycle {
             };
             let status = if state == "uncertain" || self.has_pending_intent(&action)? {
                 FixtureStatus::Uncertain
+            } else if state == "permanently_removed" {
+                // Terminal state: the holding file is expected to be gone,
+                // so file verification must not run.
+                FixtureStatus::PermanentlyRemoved
             } else if self.verify_fixture(&expected, dir, &location).is_err() {
                 FixtureStatus::Changed
             } else {
@@ -552,6 +681,11 @@ impl FixtureLifecycle {
             },
         )?)
     }
+    /// Journal an attempt intent. If the post-commit WAL checkpoint fails,
+    /// the intent is already durable but the error is returned as-is — the
+    /// stage/restore/purge callers treat this identically: any later
+    /// operation on the same action converges to `Uncertain` via the
+    /// pending-intent guard, and no purge unlink can follow an intent error.
     fn record_intent(
         &mut self,
         attempt: AttemptId,
@@ -585,6 +719,10 @@ impl FixtureLifecycle {
         let allowed_state = match op {
             "stage" => current.status == "available" || current.status == "restored",
             "restore" => {
+                current.status == "staged"
+                    && current.receipt_id == receipt.map(|v| typed_wire(&v)).transpose()?
+            }
+            "purge" => {
                 current.status == "staged"
                     && current.receipt_id == receipt.map(|v| typed_wire(&v)).transpose()?
             }
@@ -631,10 +769,15 @@ impl FixtureLifecycle {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE attempts SET outcome=?1 WHERE attempt_id=?2",
             params![outcome, typed_wire(&attempt)?],
         )?;
+        if updated != 1 {
+            // The journal row must exist and match exactly one attempt;
+            // otherwise the journal contract is not self-enforcing.
+            return Err(LifecycleError::InvalidSession);
+        }
         if outcome == "staged" || outcome == "restored" {
             tx.execute(
                 "UPDATE fixtures SET status=?1, receipt_id=?2 WHERE action_id=?3",
@@ -643,6 +786,11 @@ impl FixtureLifecycle {
                     receipt.map(|v| typed_wire(&v)).transpose()?,
                     action
                 ],
+            )?;
+        } else if outcome == "permanently_removed" {
+            tx.execute(
+                "UPDATE fixtures SET status='permanently_removed' WHERE action_id=?1",
+                [&action],
             )?;
         }
         tx.commit()?;
@@ -777,6 +925,7 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
         match fixture.status.as_str() {
             "available" if fixture.receipt_id.is_none() => {}
             "staged" | "restored" if fixture.receipt_id.is_some() => {}
+            "permanently_removed" if fixture.receipt_id.is_some() => {}
             "uncertain" => {}
             _ => return Err(LifecycleError::InvalidSession),
         }
@@ -803,6 +952,7 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
     let mut issued_receipts = std::collections::HashSet::new();
     let mut restored_receipts = std::collections::HashSet::new();
     let mut uncertain_actions = std::collections::HashSet::new();
+    let mut purged_receipts = std::collections::HashSet::new();
     let mut attempts = db.prepare(
         "SELECT attempt_id, action_id, operation, receipt_id, outcome FROM attempts ORDER BY rowid",
     )?;
@@ -850,6 +1000,10 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
                 outcome.as_str(),
                 "intent" | "restored" | "collision" | "uncertain"
             ),
+            "purge" => matches!(
+                outcome.as_str(),
+                "intent" | "permanently_removed" | "uncertain"
+            ),
             _ => false,
         };
         if !valid_outcome || (outcome == "intent" && !pending_actions.insert(action_id.clone())) {
@@ -865,19 +1019,28 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
                     return Err(LifecycleError::InvalidSession);
                 }
                 if outcome == "staged" {
-                    staged_receipts.insert((action_id.clone(), receipt));
+                    staged_receipts.insert((action_id.clone(), receipt.clone()));
                 }
             }
             ("restore", "restored") => {
-                let key = (action_id.clone(), receipt);
+                let key = (action_id.clone(), receipt.clone());
                 if !staged_receipts.contains(&key) {
                     return Err(LifecycleError::InvalidSession);
                 }
                 restored_receipts.insert(key);
             }
-            ("restore", _) if staged_receipts.contains(&(action_id.clone(), receipt)) => {}
+            ("restore", _) if staged_receipts.contains(&(action_id.clone(), receipt.clone())) => {}
             ("restore", _) => return Err(LifecycleError::InvalidSession),
-            _ => {}
+            // A purge row is only credible for a receipt that a stage
+            // attempt issued and staged in this session's history; anything
+            // else is fabricated and refused.
+            ("purge", _)
+                if issued_receipts.contains(&(action_id.clone(), receipt.clone()))
+                    && staged_receipts.contains(&(action_id.clone(), receipt.clone())) => {}
+            _ => return Err(LifecycleError::InvalidSession),
+        }
+        if operation == "purge" && outcome == "permanently_removed" {
+            purged_receipts.insert((action_id.clone(), receipt.clone()));
         }
     }
     for (action, (status, receipt)) in fixture_state {
@@ -900,6 +1063,21 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
                     return Err(LifecycleError::InvalidSession);
                 }
             }
+            "permanently_removed" => {
+                let Some(ref id) = receipt else {
+                    return Err(LifecycleError::InvalidSession);
+                };
+                // Terminal fixture state requires the full credible history:
+                // the receipt was issued, staged, and actually purged with a
+                // durable terminal outcome — stage history alone is not a
+                // removal claim.
+                if !issued_receipts.contains(&(action.clone(), id.clone()))
+                    || !staged_receipts.contains(&(action.clone(), id.clone()))
+                    || !purged_receipts.contains(&(action.clone(), id.clone()))
+                {
+                    return Err(LifecycleError::InvalidSession);
+                }
+            }
             "uncertain"
                 if !uncertain_actions.contains(&action) && !pending_actions.contains(&action) =>
             {
@@ -916,6 +1094,10 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
             match operation.as_str() {
                 "stage" if status == "available" || status == "restored" => {}
                 "restore"
+                    if status == "staged" && receipt.as_deref() == Some(receipt_id.as_str()) => {}
+                // A pending purge intent claims a still-staged receipt; the
+                // crash leaves the outcome unknown until inspection.
+                "purge"
                     if status == "staged" && receipt.as_deref() == Some(receipt_id.as_str()) => {}
                 _ => return Err(LifecycleError::InvalidSession),
             }
@@ -1396,9 +1578,6 @@ fn rename_no_replace(
     if !is_fixture_component(source) || !is_fixture_component(dest) {
         return Err(RenameFailure::InvalidComponent);
     }
-    if !is_fixture_component(source) || !is_fixture_component(dest) {
-        return Err(RenameFailure::InvalidComponent);
-    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use rustix::fs::{renameat_with, RenameFlags};
@@ -1662,12 +1841,55 @@ mod tests {
     }
 
     #[test]
-    fn reserved_v2_purge_vocabulary_is_rejected_and_preserved_by_runtime_validator() {
-        // Each reserved token is legal at the CHECK layer (schema v2) but must
-        // be refused by the runtime allowlist validator, and the offending row
-        // must survive untouched: no deletion, no reset, no rewrite.
+    fn stored_permanently_removed_status_maps_to_snapshot_and_validates() {
+        // Once the purge primitive (Task 2) records the terminal state, a
+        // stored 'permanently_removed' fixture row must validate and map to
+        // FixtureStatus::PermanentlyRemoved — never to Changed, because the
+        // holding file is expected to be gone. Simulated here by direct SQL
+        // on a staged session, exactly as the terminal outcome will store it.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.db
+            .execute(
+                "UPDATE fixtures SET status='permanently_removed' WHERE status='staged'",
+                [],
+            )
+            .unwrap();
+        life.db
+            .execute(
+                "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'permanently_removed')",
+                params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[0]).unwrap(), typed_wire(&receipt).unwrap()],
+            )
+            .unwrap();
+        let snapshot = life.snapshot().unwrap();
+        assert_eq!(
+            snapshot.fixtures[0].status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        assert_eq!(snapshot.fixtures[0].receipt_id, Some(receipt));
+        // The purge operation with a non-terminal stage outcome stays rejected.
+        life.db
+            .execute(
+                "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'staged')",
+                params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[1]).unwrap(), Option::<String>::None],
+            )
+            .unwrap();
+        assert!(matches!(
+            life.snapshot(),
+            Err(LifecycleError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn purge_states_require_issued_staged_receipts_and_stay_preserved() {
+        // Since the purge primitive activated parts of the v2 vocabulary,
+        // these blocks pin the remaining refusals — each offending row must
+        // survive untouched: no deletion, no reset, no rewrite.
         {
-            // operation='purge'
+            // A purge attempt for a receipt that no stage attempt ever
+            // issued is refused by the registry cross-check.
             let parent = tempfile::tempdir().unwrap();
             let ids = bindings();
             let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
@@ -1713,7 +1935,8 @@ mod tests {
             );
         }
         {
-            // status='permanently_removed'
+            // status='permanently_removed' without any receipt: the status
+            // requires the purged receipt to be registered on the row.
             let parent = tempfile::tempdir().unwrap();
             let ids = bindings();
             let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
@@ -1734,9 +1957,344 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(preserved, 5, "all reserved rows must be preserved");
+            assert_eq!(preserved, 5, "all offending rows must be preserved");
         }
     }
+    #[test]
+    fn purge_receipt_removes_staged_fixture_and_records_terminal_outcome() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        let logical_bytes = life.snapshot().unwrap().fixtures[0].bytes;
+        let outcome = life.purge_receipt(receipt, AttemptId::new()).unwrap();
+        assert_eq!(
+            outcome,
+            PurgeItemOutcome::PermanentlyRemoved {
+                receipt_id: receipt,
+                logical_bytes
+            }
+        );
+        let slot = receipt_slot(receipt).unwrap();
+        assert!(open_regular(&life.holding_dir, &slot).is_err());
+        let recorded: String = life
+            .db
+            .query_row(
+                "SELECT outcome FROM attempts WHERE operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, "permanently_removed");
+        let snap = life.snapshot().unwrap();
+        assert_eq!(snap.fixtures[0].status, FixtureStatus::PermanentlyRemoved);
+        assert_eq!(snap.fixtures[0].receipt_id, Some(receipt));
+        assert_eq!(snap.fixtures[1].status, FixtureStatus::Available);
+        let sid = life.session_id();
+        drop(life);
+        let (mut reopened, view) = FixtureLifecycle::reopen(parent.path(), sid).unwrap();
+        assert_eq!(view.fixtures[0].status, FixtureStatus::PermanentlyRemoved);
+        assert!(matches!(
+            reopened.restore(receipt, AttemptId::new()),
+            Err(LifecycleError::WrongState)
+        ));
+    }
+
+    #[test]
+    fn purge_receipt_refuses_non_staged_unknown_or_changed_targets_without_mutation() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        // Unknown receipt: refused, nothing journaled.
+        assert!(matches!(
+            life.purge_receipt(ReceiptId::new(), AttemptId::new()),
+            Err(LifecycleError::UnknownReceipt)
+        ));
+        // Restored (not staged) receipt: refused as wrong state.
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.restore(receipt, AttemptId::new()).unwrap();
+        assert!(matches!(
+            life.purge_receipt(receipt, AttemptId::new()),
+            Err(LifecycleError::WrongState)
+        ));
+        // Changed content: refused before any intent, file kept, state kept.
+        let receipt2 = life.stage(ids[1], AttemptId::new()).unwrap();
+        let slot = receipt_slot(receipt2).unwrap();
+        {
+            // Overwrite the first bytes in place (no truncate) via a
+            // write-capable handle: same size, different digest.
+            let path = life.root.join("holding").join(&slot);
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).unwrap();
+            std::io::Write::write_all(&mut file, b"TAMPERED").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(matches!(
+            life.purge_receipt(receipt2, AttemptId::new()),
+            Err(LifecycleError::Changed)
+        ));
+        let purge_attempts: i64 = life
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM attempts WHERE operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(purge_attempts, 0, "no purge intent may be journaled");
+        assert!(open_regular(&life.holding_dir, &slot).is_ok());
+        // The database row is unchanged; the snapshot honestly reports the
+        // tampered file as Changed (the tamper is real and must be visible).
+        let stored_status: String = life
+            .db
+            .query_row(
+                "SELECT status FROM fixtures WHERE action_id=?1",
+                [encode_action(&ids[1]).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_status, "staged");
+        assert_eq!(
+            life.snapshot().unwrap().fixtures[1].status,
+            FixtureStatus::Changed
+        );
+    }
+
+    #[test]
+    fn purge_unlink_failure_is_uncertain_and_keeps_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // Make the holding directory non-writable so unlinkat fails after
+        // verification and intent: the result cannot be established, so the
+        // receipt state must become Uncertain — never a success claim.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.holding_dir
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let outcome = life.purge_receipt(receipt, AttemptId::new());
+        // Restore permissions so the tempdir can be cleaned up.
+        life.holding_dir
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(
+            matches!(outcome, Err(LifecycleError::Uncertain)),
+            "unlink failure must report uncertainty, got {outcome:?}"
+        );
+        // The file itself survived: unlink was refused, not silently done.
+        let slot = receipt_slot(receipt).unwrap();
+        assert!(open_regular(&life.holding_dir, &slot).is_ok());
+        // The attempt journal shows uncertain; the fixture is uncertain.
+        let recorded: String = life
+            .db
+            .query_row(
+                "SELECT outcome FROM attempts WHERE operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, "uncertain");
+        let status: String = life
+            .db
+            .query_row(
+                "SELECT status FROM fixtures WHERE action_id=?1",
+                [encode_action(&ids[0]).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "uncertain");
+        // Restore is blocked by the uncertain state.
+        assert!(matches!(
+            life.restore(receipt, AttemptId::new()),
+            Err(LifecycleError::WrongState)
+        ));
+    }
+
+    #[test]
+    fn purge_intent_crash_reopens_uncertain_without_retry_or_success_claim() {
+        // Simulate a crash between the durable purge intent and the unlink:
+        // journal the intent directly (the same private API purge_receipt
+        // uses), drop the process handle, and reopen.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        let fixture = life.lookup_receipt(receipt).unwrap().unwrap();
+        life.record_intent(AttemptId::new(), &fixture, "purge", Some(receipt))
+            .unwrap();
+        let sid = life.session_id();
+        drop(life);
+
+        let (mut reopened, view) = FixtureLifecycle::reopen(parent.path(), sid).unwrap();
+        assert_eq!(view.fixtures[0].status, FixtureStatus::Uncertain);
+        // The file was never unlinked and stays untouched in holding.
+        let slot = receipt_slot(receipt).unwrap();
+        assert!(open_regular(&reopened.holding_dir, &slot).is_ok());
+        // No automatic resolution, retry, or restore until inspection.
+        assert!(matches!(
+            reopened.restore(receipt, AttemptId::new()),
+            Err(LifecycleError::Uncertain)
+        ));
+        assert!(matches!(
+            reopened.purge_receipt(receipt, AttemptId::new()),
+            Err(LifecycleError::Uncertain)
+        ));
+        // The pending intent row is preserved exactly as the crash left it.
+        let pending: i64 = reopened
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM attempts WHERE outcome='intent' AND operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "intent row must survive untouched");
+    }
+
+    #[test]
+    fn purge_is_terminal_and_serial_batch_touches_only_selected_receipts() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        // Stage three, leave two available.
+        let receipts: Vec<ReceiptId> = ids[..3]
+            .iter()
+            .map(|id| life.stage(*id, AttemptId::new()).unwrap())
+            .collect();
+        // Purge all three staged receipts serially.
+        for (index, receipt) in receipts.iter().enumerate() {
+            let outcome = life
+                .purge_receipt(*receipt, AttemptId::new())
+                .unwrap_or_else(|e| panic!("purge {index} failed: {e:?}"));
+            assert!(matches!(
+                outcome,
+                PurgeItemOutcome::PermanentlyRemoved { logical_bytes, .. }
+                    if logical_bytes == FIXTURES[index].1
+            ));
+        }
+        // Terminal refusal, including after a reopen.
+        let sid = life.session_id();
+        drop(life);
+        let (mut reopened, view) = FixtureLifecycle::reopen(parent.path(), sid).unwrap();
+        for (index, receipt) in receipts.iter().enumerate() {
+            assert_eq!(
+                view.fixtures[index].status,
+                FixtureStatus::PermanentlyRemoved
+            );
+            assert!(matches!(
+                reopened.restore(*receipt, AttemptId::new()),
+                Err(LifecycleError::WrongState)
+            ));
+            assert!(matches!(
+                reopened.purge_receipt(*receipt, AttemptId::new()),
+                Err(LifecycleError::WrongState)
+            ));
+        }
+        // The two untouched fixtures are exactly as they were: available,
+        // with byte-identical file content and database rows.
+        for (index, id) in ids.iter().enumerate().skip(3) {
+            assert_eq!(view.fixtures[index].status, FixtureStatus::Available);
+            let expected = reopened.lookup_action(*id).unwrap().unwrap();
+            reopened
+                .verify_fixture(&expected, &reopened.source_dir, &expected.slot)
+                .unwrap();
+            let _ = id;
+        }
+        // Attempt history is append-only: every original row (stage
+        // history) is preserved, with only purge rows added afterwards.
+        // attempts columns: 0 attempt_id, 1 action_id, 2 operation,
+        // 3 receipt_id, 4 outcome.
+        let stage_rows = dump_table(&reopened.db, "attempts")
+            .into_iter()
+            .filter(|(_, row)| {
+                !matches!(
+                    row.get(2),
+                    Some(rusqlite::types::Value::Text(operation)) if operation == "purge"
+                )
+            })
+            .count();
+        assert_eq!(stage_rows, 3, "three stage attempts must be preserved");
+    }
+
+    #[test]
+    fn outcome_journaling_requires_a_live_attempt_row() {
+        // The journal contract is self-enforcing: an outcome update must
+        // match exactly one existing attempt row.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        let fixture = life.lookup_receipt(receipt).unwrap().unwrap();
+        assert!(matches!(
+            life.record_outcome(
+                AttemptId::new(),
+                &fixture.action_id,
+                "staged",
+                Some(receipt)
+            ),
+            Err(LifecycleError::InvalidSession)
+        ));
+    }
+
+    #[test]
+    fn purge_journal_rows_require_issued_and_staged_receipt_history() {
+        // A hand-crafted database must not pass validation when its purge
+        // rows have no matching stage history: the receipt was never issued
+        // by a stage attempt, so the permanently_removed claim is fabricated.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        life.db
+            .execute(
+                "UPDATE fixtures SET status='permanently_removed', receipt_id=?2 WHERE action_id=?1",
+                params![encode_action(&ids[0]).unwrap(), typed_wire(&ReceiptId::new()).unwrap()],
+            )
+            .unwrap();
+        life.db
+            .execute(
+                "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'permanently_removed')",
+                params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[0]).unwrap(), life.db.query_row("SELECT receipt_id FROM fixtures WHERE action_id=?1", [encode_action(&ids[0]).unwrap()], |r| r.get::<_, String>(0)).unwrap()],
+            )
+            .unwrap();
+        let sid = life.session_id();
+        drop(life);
+        assert!(
+            matches!(
+                FixtureLifecycle::reopen(parent.path(), sid),
+                Err(LifecycleError::InvalidSession)
+            ),
+            "a purge row without stage history must fail closed"
+        );
+    }
+
+    #[test]
+    fn permanently_removed_fixture_requires_a_terminal_purge_row() {
+        // A terminal fixture state must be backed by its terminal journal
+        // row: stage history alone cannot make a fixture permanently
+        // removed.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.db
+            .execute(
+                "UPDATE fixtures SET status='permanently_removed' WHERE action_id=?1",
+                [encode_action(&ids[0]).unwrap()],
+            )
+            .unwrap();
+        let sid = life.session_id();
+        drop(life);
+        assert!(
+            matches!(
+                FixtureLifecycle::reopen(parent.path(), sid),
+                Err(LifecycleError::InvalidSession)
+            ),
+            "permanently_removed without a purge journal row must fail closed"
+        );
+        let _ = receipt;
+    }
+
     #[test]
     fn stage_restore_reopen_and_fixed_five_files() {
         let parent = tempfile::tempdir().unwrap();

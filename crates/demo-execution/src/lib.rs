@@ -249,10 +249,14 @@ impl DemoExecutionService {
             self.ready_session()?;
             let snapshot = self.snapshot()?;
             fixtures = snapshot.fixtures.into_iter().map(to_demo_fixture).collect();
-            if fixtures
-                .iter()
-                .any(|f| matches!(f.status, FixtureStatus::Changed | FixtureStatus::Uncertain))
-            {
+            if fixtures.iter().any(|f| {
+                matches!(
+                    f.status,
+                    FixtureStatus::Changed
+                        | FixtureStatus::Uncertain
+                        | FixtureStatus::PermanentlyRemoved
+                )
+            }) {
                 "needs_inspection".to_owned()
             } else {
                 "ready".to_owned()
@@ -1370,6 +1374,7 @@ impl FixtureStatusText for FixtureSnapshot {
             FixtureStatus::Available => "available",
             FixtureStatus::Staged => "staged",
             FixtureStatus::Restored => "restored",
+            FixtureStatus::PermanentlyRemoved => "permanently_removed",
             FixtureStatus::Uncertain => "uncertain",
             FixtureStatus::Changed => "changed",
         }
@@ -1566,6 +1571,56 @@ mod tests {
         service.start_demo().expect("create disposable fixture");
         let plan = service.plan.get_plan().expect("plan");
         (dir, service, plan)
+    }
+
+    #[test]
+    fn status_reports_needs_inspection_for_permanently_removed_fixtures() {
+        let (dir, mut service, _plan) = fixture_service();
+        // Fabricate a fully-journaled permanent removal directly in the
+        // lifecycle store (the coordinator purge flow arrives in a later
+        // batch): a stage row, a purge terminal row, and the terminal fixture
+        // state. The demo state machine must not call such a session "ready".
+        let fixture_root = std::fs::read_dir(dir.path())
+            .unwrap()
+            .find_map(|e| {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                name.starts_with(".disk-steward-fixtures-")
+                    .then(|| dir.path().join(name))
+            })
+            .unwrap();
+        let db = Connection::open(fixture_root.join("lifecycle.sqlite3")).unwrap();
+        let action: String = db
+            .query_row(
+                "SELECT action_id FROM fixtures ORDER BY rowid LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let receipt = wire(&disk_steward_core::ReceiptId::new()).unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'stage',?3,'staged')",
+            params![wire(&AttemptId::new()).unwrap(), action, receipt],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'permanently_removed')",
+            params![wire(&AttemptId::new()).unwrap(), action, receipt],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE fixtures SET status='permanently_removed', receipt_id=?2 WHERE action_id=?1",
+            params![action, receipt],
+        )
+        .unwrap();
+        drop(db);
+        let status = service.status().unwrap();
+        assert_eq!(
+            status.state, "needs_inspection",
+            "a permanently removed fixture must not report the session ready"
+        );
+        assert!(status.fixtures.iter().all(|f| f.status
+            != disk_steward_fixture_lifecycle::FixtureStatus::Available
+            || f.action_id != serde_json::from_str(&action).unwrap()));
     }
 
     #[test]

@@ -10,7 +10,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows is intentionally absent: the disposable-file adapter and
+        # its lease are Unix-only by design, and Windows support is deferred
+        # by user decision (the native adapter refuses at runtime there).
+        # Re-add only with a designed Windows milestone, not as ad-hoc CI
+        # fixes.
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

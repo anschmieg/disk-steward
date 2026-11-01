@@ -295,6 +295,7 @@ mod probe {
                     FixtureStatus::Available => "available",
                     FixtureStatus::Staged => "staged",
                     FixtureStatus::Restored => "restored",
+                    FixtureStatus::PermanentlyRemoved => return Err(ProbeError::InvalidRows),
                     FixtureStatus::Uncertain => "uncertain",
                     FixtureStatus::Changed => return Err(ProbeError::InvalidRows),
                 };
