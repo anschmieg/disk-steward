@@ -1975,6 +1975,57 @@ mod tests {
     }
 
     #[test]
+    fn purge_unlink_failure_is_uncertain_and_keeps_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // Make the holding directory non-writable so unlinkat fails after
+        // verification and intent: the result cannot be established, so the
+        // receipt state must become Uncertain — never a success claim.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.holding_dir
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let outcome = life.purge_receipt(receipt, AttemptId::new());
+        // Restore permissions so the tempdir can be cleaned up.
+        life.holding_dir
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(
+            matches!(outcome, Err(LifecycleError::Uncertain)),
+            "unlink failure must report uncertainty, got {outcome:?}"
+        );
+        // The file itself survived: unlink was refused, not silently done.
+        let slot = receipt_slot(receipt).unwrap();
+        assert!(open_regular(&life.holding_dir, &slot).is_ok());
+        // The attempt journal shows uncertain; the fixture is uncertain.
+        let recorded: String = life
+            .db
+            .query_row(
+                "SELECT outcome FROM attempts WHERE operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, "uncertain");
+        let status: String = life
+            .db
+            .query_row(
+                "SELECT status FROM fixtures WHERE action_id=?1",
+                [encode_action(&ids[0]).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "uncertain");
+        // Restore is blocked by the uncertain state.
+        assert!(matches!(
+            life.restore(receipt, AttemptId::new()),
+            Err(LifecycleError::WrongState)
+        ));
+    }
+
+    #[test]
     fn stage_restore_reopen_and_fixed_five_files() {
         let parent = tempfile::tempdir().unwrap();
         let ids = bindings();
