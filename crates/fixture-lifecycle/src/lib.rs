@@ -1417,6 +1417,7 @@ fn rename_no_replace(
 mod tests {
     use super::*;
     fn downgrade_to_v1(db: &Connection) {
+        let before = dump_all(db);
         let tx = db.unchecked_transaction().unwrap();
         tx.execute_batch("ALTER TABLE fixtures RENAME TO fixtures_v2_backup; ALTER TABLE attempts RENAME TO attempts_v2_backup;").unwrap();
         tx.execute_batch(FIXTURES_SCHEMA_V1).unwrap();
@@ -1425,6 +1426,11 @@ mod tests {
         tx.pragma_update(None, "user_version", LEGACY_SCHEMA_VERSION)
             .unwrap();
         tx.commit().unwrap();
+        assert_eq!(
+            dump_all(db),
+            before,
+            "downgrade_to_v1 must preserve every rowid and column, so the migration baseline is not lossy"
+        );
     }
     fn bindings() -> [ActionId; 5] {
         std::array::from_fn(|_| ActionId::new())
@@ -1524,6 +1530,60 @@ mod tests {
     }
 
     #[test]
+    fn reopen_refuses_future_schema_version_without_reset() {
+        // A schema_version newer than this build understands must fail closed
+        // (InvalidSession) and must never reset or rewrite the database. Only
+        // the exact legacy v1 is migrated; any other value is refused.
+        // user_version is a signed 32-bit field in the SQLite header, so the
+        // extreme case is i32::MAX, not i64::MAX (which would truncate).
+        for future in [0_i64, 3, 9, i32::MAX as i64] {
+            let parent = tempfile::tempdir().unwrap();
+            let ids = bindings();
+            let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+            life.db
+                .execute_batch(&format!("PRAGMA user_version = {future};"))
+                .unwrap();
+            assert_eq!(
+                life.db
+                    .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                future,
+                "setup must actually persist user_version={future}"
+            );
+            let baseline = dump_all(&life.db);
+            let id = life.session_id();
+            drop(life);
+            assert!(
+                matches!(
+                    FixtureLifecycle::reopen(parent.path(), id),
+                    Err(LifecycleError::InvalidSession)
+                ),
+                "future schema_version {future} must be refused, not migrated"
+            );
+            // Re-open raw to prove nothing was reset or rewritten.
+            let raw = Connection::open_with_flags(
+                parent
+                    .path()
+                    .join(format!("{ROOT_PREFIX}{}", typed_component(&id).unwrap()))
+                    .join(DB_NAME),
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            assert_eq!(
+                raw.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                future,
+                "refusal must not rewrite user_version for {future}"
+            );
+            assert_eq!(
+                dump_all(&raw),
+                baseline,
+                "refusal must not rewrite any row for {future}"
+            );
+        }
+    }
+
+    #[test]
     fn migration_fault_rolls_back_and_open_schema_changes_block_file_operations() {
         let parent = tempfile::tempdir().unwrap();
         let ids = bindings();
@@ -1537,16 +1597,21 @@ mod tests {
             MigrationFault::AfterCopy,
             MigrationFault::BeforeVersion,
         ] {
-            assert!(migrate_legacy_v1_inner(
-                &life.db,
-                life.id,
-                &life.parent,
-                &life.root_dir,
-                &life.source_dir,
-                &life.holding_dir,
-                fault
-            )
-            .is_err());
+            assert!(
+                matches!(
+                    migrate_legacy_v1_inner(
+                        &life.db,
+                        life.id,
+                        &life.parent,
+                        &life.root_dir,
+                        &life.source_dir,
+                        &life.holding_dir,
+                        fault
+                    ),
+                    Err(LifecycleError::InvalidSession)
+                ),
+                "fault {fault:?} must fail closed with InvalidSession, not an unrelated error"
+            );
             assert_eq!(
                 life.db
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
@@ -1591,22 +1656,80 @@ mod tests {
     }
 
     #[test]
-    fn reserved_v2_purge_attempt_vocabulary_is_rejected_by_runtime_validator() {
-        let parent = tempfile::tempdir().unwrap();
-        let ids = bindings();
-        let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
-        life.db.execute("INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'intent')", params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[0]).unwrap(), typed_wire(&ReceiptId::new()).unwrap()]).unwrap();
-        assert!(matches!(
-            life.snapshot(),
-            Err(LifecycleError::InvalidSession)
-        ));
-        assert_eq!(
+    fn reserved_v2_purge_vocabulary_is_rejected_and_preserved_by_runtime_validator() {
+        // Each reserved token is legal at the CHECK layer (schema v2) but must
+        // be refused by the runtime allowlist validator, and the offending row
+        // must survive untouched: no deletion, no reset, no rewrite.
+        {
+            // operation='purge'
+            let parent = tempfile::tempdir().unwrap();
+            let ids = bindings();
+            let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
             life.db
-                .query_row("SELECT operation FROM attempts LIMIT 1", [], |r| r
-                    .get::<_, String>(0))
-                .unwrap(),
-            "purge"
-        );
+                .execute(
+                    "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'intent')",
+                    params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[0]).unwrap(), typed_wire(&ReceiptId::new()).unwrap()],
+                )
+                .unwrap();
+            assert!(matches!(
+                life.snapshot(),
+                Err(LifecycleError::InvalidSession)
+            ));
+            assert_eq!(
+                life.db
+                    .query_row("SELECT operation FROM attempts LIMIT 1", [], |r| r
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "purge"
+            );
+        }
+        {
+            // outcome='permanently_removed'
+            let parent = tempfile::tempdir().unwrap();
+            let ids = bindings();
+            let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+            life.db
+                .execute(
+                    "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'stage',?3,'permanently_removed')",
+                    params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[0]).unwrap(), typed_wire(&ReceiptId::new()).unwrap()],
+                )
+                .unwrap();
+            assert!(matches!(
+                life.snapshot(),
+                Err(LifecycleError::InvalidSession)
+            ));
+            assert_eq!(
+                life.db
+                    .query_row("SELECT outcome FROM attempts LIMIT 1", [], |r| r
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "permanently_removed"
+            );
+        }
+        {
+            // status='permanently_removed'
+            let parent = tempfile::tempdir().unwrap();
+            let ids = bindings();
+            let (life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+            let changed = life
+                .db
+                .execute("UPDATE fixtures SET status='permanently_removed'", [])
+                .unwrap();
+            assert_eq!(changed, 5, "fixed fixture set must be five rows");
+            assert!(matches!(
+                life.snapshot(),
+                Err(LifecycleError::InvalidSession)
+            ));
+            let preserved: i64 = life
+                .db
+                .query_row(
+                    "SELECT COUNT(*) FROM fixtures WHERE status='permanently_removed'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(preserved, 5, "all reserved rows must be preserved");
+        }
     }
     #[test]
     fn stage_restore_reopen_and_fixed_five_files() {
