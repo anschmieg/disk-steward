@@ -831,6 +831,7 @@ mod tests {
         ));
         let other = path.with_file_name("other.sqlite");
         fs::write(&other, b"preserve me").unwrap();
+        #[cfg(unix)]
         let link = path.with_file_name("linked.sqlite");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&other, &link).unwrap();

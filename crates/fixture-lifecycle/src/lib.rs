@@ -94,7 +94,10 @@ pub struct FixtureLifecycle {
     id: SessionId,
     parent_path: PathBuf,
     root_path: PathBuf,
-    #[cfg(test)]
+    // Same gate as the tests module below: this field exists only where the
+    // tests that read it are compiled, so the lib-test target on other
+    // hosts does not carry an unread field.
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     root: PathBuf,
     parent: File,
     root_dir: File,
@@ -201,7 +204,7 @@ impl FixtureLifecycle {
                 id,
                 parent_path: parent_path.clone(),
                 root_path: root.clone(),
-                #[cfg(test)]
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
                 root,
                 parent: parent_file,
                 root_dir,
@@ -243,7 +246,7 @@ impl FixtureLifecycle {
             id,
             parent_path,
             root_path: root.clone(),
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
             root,
             parent,
             root_dir,
