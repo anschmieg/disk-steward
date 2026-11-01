@@ -339,7 +339,7 @@ fn private_database_path(path: &Path) -> StoreResult<PathBuf> {
     #[cfg(not(unix))]
     {
         let _ = path;
-        return Err(RegistryError::PrivacyUnavailable);
+        Err(RegistryError::PrivacyUnavailable)
     }
 
     #[cfg(unix)]
