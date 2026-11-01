@@ -26,11 +26,11 @@ const checkManifests = (directory) => {
 };
 checkManifests('crates');
 checkManifests('probes');
-for (const path of ['Cargo.lock', 'src-tauri/Cargo.lock']) {
+for (const path of ['Cargo.lock', 'src-tauri/Cargo.lock', 'probes/fixture-migration/Cargo.lock']) {
   for (const block of read(path).split('[[package]]').slice(1)) {
     const name = block.match(/^name = "([^"]+)"/m)?.[1];
     if (name?.startsWith('disk-steward') ||
-        ['approval-ledger', 'verification-budget', 'atomic-rename-probe'].includes(name)) {
+        ['approval-ledger', 'verification-budget', 'atomic-rename-probe', 'fixture-lifecycle-migration-probe'].includes(name)) {
       versions[`${path}:${name}`] = block.match(/^version = "([^"]+)"/m)?.[1];
     }
   }

@@ -140,3 +140,11 @@ The0.0.6 exclusion registry slice is verified:128workspace/24native tests, stric
 
 
 M1B0.0.7 adds blocked selected-folder metadata through a native picker, with unknown size and explicitly un-inventoried contents. Native26tests/strictClippy/fmt/frontendbuild/version and40.14MiB bundle pass. Native cancel/add/restart/undo/redo passed on the disposable directory: current pilotRev12/1,002entries/790selected,0remembered exclusions, sentinel unchanged. Full source discovery/eligibility and human pilots remain open; M1B is not complete. Work is on feat/m1b-folder-metadata, stacked on PR5.
+
+
+## M1C — In progress, bounded migration preparation (0.0.8)
+
+PR6 folder metadata checkpoint4e49476 is pushed. Work starts on feat/m1c-purge-schema, matching0.0.8 versions. Scope and failure cases are recorded in .autonomous/disk-steward/m1c-scope.md. The first experiment uses disposable lifecycle databases to prove allowlisted, rollback-safe v1→v2 migration before a purge operation is integrated. It exposes no deletion command and does not migrate the running app. M1B human pilots remain open; M1C lifecycle/native/permanent-removal/measurement gates are not complete.
+
+
+M1C migration experiment verified on disposable databases: five tests pass, with real stage/restore/restage history, empty history, separately simulated uncertain and pending-intent states, four injected transaction rollback points, exact rowid/order preservation (including gaps), and independent refusal/preservation of unknown objects, future versions and malformed typed IDs/digests. Strict Clippy/fmt and frontend build/version guard pass. This is not runtime migration or process-crash/WAL durability proof, and it exposes no purge API. The last native application verification remains0.0.7; the0.0.8 changes add the isolated probe, matching version fields and developer version checks only. M1C and M1B remain In progress.

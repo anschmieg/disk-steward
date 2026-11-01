@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "fixture-lifecycle-migration-probe"
+version = "0.0.8"
+edition = "2021"
+publish = false
+
+[dependencies]
+disk-steward-core = { path = "../../crates/disk-steward-core" }
+disk-steward-fixture-lifecycle = { path = "../../crates/fixture-lifecycle" }
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.27"
