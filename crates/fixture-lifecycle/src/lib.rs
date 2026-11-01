@@ -1396,9 +1396,6 @@ fn rename_no_replace(
     if !is_fixture_component(source) || !is_fixture_component(dest) {
         return Err(RenameFailure::InvalidComponent);
     }
-    if !is_fixture_component(source) || !is_fixture_component(dest) {
-        return Err(RenameFailure::InvalidComponent);
-    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use rustix::fs::{renameat_with, RenameFlags};
