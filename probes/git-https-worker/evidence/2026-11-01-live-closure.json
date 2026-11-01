@@ -31,6 +31,16 @@
     "No source clone or local-only state assessed",
     "Closure budgets apply after ingestion; gix receive/header delta resolution allocations have no proven memory ceiling",
     "Response exposure is not a wire-level ingress ceiling",
-    "Extensionless endpoint failed safely; canonical .git endpoint succeeded; no URL rewriting or redirects enabled"
-  ]
+    "Earlier extensionless endpoint attempts failed safely, but a later retry succeeded; cause remains unknown. No URL rewriting or redirects enabled."
+  ],
+  "extensionless_retry": {
+    "elapsed_ms": 736,
+    "logical_store_bytes": 16383,
+    "body_exposed_bytes": 2191,
+    "header_exposed_bytes": 1303,
+    "reachable_objects": 13,
+    "reachable_decoded_bytes": 1991,
+    "refs": 4,
+    "cleaned": true
+  }
 }
