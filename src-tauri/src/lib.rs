@@ -90,6 +90,7 @@ pub fn run() {
             general_plan::get_general_review,
             general_plan::list_general_reviews,
             general_plan::add_selected_general_item,
+            general_plan::add_selected_general_folder,
             global_exclusions::get_exclusion_registry,
             global_exclusions::add_global_exclusion,
             global_exclusions::remove_global_exclusion

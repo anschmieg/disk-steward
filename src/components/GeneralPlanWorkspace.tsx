@@ -136,11 +136,13 @@ export default function GeneralPlanWorkspace({
       );
     }
   };
-  const addSelectedItem = async () => {
+  const addSelectedItem = async (kind: "file" | "folder") => {
     if (!snapshot || !confirmed || showReview || profile !== "pilot") return;
     const result = await request(() =>
       invoke<{ snapshot: EditorSnapshot | null; canceled: boolean }>(
-        "add_selected_general_item",
+        kind === "folder"
+          ? "add_selected_general_folder"
+          : "add_selected_general_item",
         { request: { profile, expectedRevisionId: snapshot.revisionId } },
       ),
     );
@@ -149,8 +151,10 @@ export default function GeneralPlanWorkspace({
       setConfirmed(true);
       setNotice(
         result.canceled
-          ? "File selection canceled. The plan is unchanged."
-          : "Selected file metadata added with Keep. Cleanup stays blocked; its contents were not read. Find it under Other findings.",
+          ? "Selection canceled. The plan is unchanged."
+          : kind === "folder"
+            ? "Folder metadata added with Keep. Its contents have not been inventoried; cleanup stays blocked. Find it under Other findings."
+            : "Selected file metadata added with Keep. Cleanup stays blocked; its contents were not read. Find it under Other findings.",
       );
     }
   };
@@ -240,15 +244,23 @@ export default function GeneralPlanWorkspace({
           </select>
         </label>
         <span>
-          Example inventory · optional selected-file metadata · no content reads
+          Example inventory · optional selected-item metadata · no content reads
         </span>
         <button
           className="ap-button quiet"
           disabled={busy || !confirmed || showReview || profile !== "pilot"}
-          onClick={() => void addSelectedItem()}
+          onClick={() => void addSelectedItem("file")}
           title="Select one file for a metadata-only review entry. Cleanup remains blocked. Available in the 1,000-item workspace."
         >
           Add file metadata…
+        </button>
+        <button
+          className="ap-button quiet"
+          disabled={busy || !confirmed || showReview || profile !== "pilot"}
+          onClick={() => void addSelectedItem("folder")}
+          title="Add one folder's name for review. Children will not be inventoried and cleanup remains blocked. This does not create a remembered exclusion."
+        >
+          Add folder metadata…
         </button>
         {reviewHistory.length > 0 && (
           <label>

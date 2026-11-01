@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-selected-general-folder"
+description = "Enables the add_selected_general_folder command without any pre-configured scope."
+commands.allow = ["add_selected_general_folder"]
+
+[[permission]]
+identifier = "deny-add-selected-general-folder"
+description = "Denies the add_selected_general_folder command without any pre-configured scope."
+commands.deny = ["add_selected_general_folder"]

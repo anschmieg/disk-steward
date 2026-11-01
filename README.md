@@ -1,6 +1,6 @@
 # Disk Steward
 
-Working name; no naming or trademark research performed. Implementation is in progress at 0.0.6. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore cycle for five disposable files it creates itself. Native file selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. User-file scanning and cleanup are not enabled.
+Working name; no naming or trademark research performed. Implementation is in progress at 0.0.7. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore cycle for five disposable files it creates itself. Native file and folder selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. User-file scanning and cleanup are not enabled.
 
 ## Product
 
@@ -53,7 +53,7 @@ The earlier 12–16-week envelope is unvalidated and no longer an active deliver
 
 ## Development
 
-Version: 0.0.6. Repository: https://github.com/anschmieg/disk-steward (private). Current feature branch: feat/m1b-exclusions (stacked on feat/m1b-plan-model). See [progress](PROGRESS.md) for verified results and remaining gates.
+Version: 0.0.7. Repository: https://github.com/anschmieg/disk-steward (private). Current feature branch: feat/m1b-folder-metadata (stacked on feat/m1b-exclusions). See [progress](PROGRESS.md) for verified results and remaining gates.
 
 Use `npm ci` then `npm run dev` for the fixture UI, or `npm run tauri dev` for the desktop shell after installing the native prerequisites. `npm run build` checks TypeScript and builds the frontend. `cargo test --workspace` tests the portable contracts, including the local-only gix transport seam; target that probe with `cargo test -p disk-steward-gix-byte-probe`. Run workspace formatting and lint checks with `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`. `cargo check --manifest-path src-tauri/Cargo.toml -j 2` checks the native backend separately. `node scripts/check-version.mjs` enforces matching 0.0.x versions. The optional evaluation harness is development tooling: see [evaluation notes](evaluation/README.md).
 

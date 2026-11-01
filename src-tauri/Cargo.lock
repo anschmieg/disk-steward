@@ -49,7 +49,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "approval-ledger"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "rusqlite",
 ]
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-core"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "serde",
  "uuid",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-demo-execution"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "approval-ledger",
  "disk-steward-core",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-desktop"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "disk-steward-core",
  "disk-steward-demo-execution",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-exclusion-store"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "disk-steward-core",
  "rusqlite",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-fixture-lifecycle"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "disk-steward-core",
  "rusqlite",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-plan-model"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "disk-steward-core",
  "serde",
@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-plan-store"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "disk-steward-core",
  "disk-steward-plan-model",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-review-plan"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "disk-steward-core",
  "rusqlite",

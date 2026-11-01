@@ -36,3 +36,11 @@ Validation passed:128 workspace Rust tests (including11 registry tests),24 nativ
 This host rejected creating a non-UTF-8 directory name. Unicode directory identity was exercised on disk; invalid-byte locator roundtrips were checked separately without claiming filesystem support. Packaged permission/revocation, volume remount and other-platform gates remain open.
 
 Saved rules are explicitly for future scans and do not apply to the synthetic plan or source-less metadata additions. M2 must match them before traversal through independently authorized scopes, account for path/case/alias semantics and invalidate affected coverage/reviews. M1B is not complete: folder additions/full discovery eligibility and the three-participant preservation/comprehension pilot remain outstanding. No user-file cleanup or release is enabled.
+
+## Selected-folder metadata — 0.0.7
+
+The pilot can now add a folder through its own native picker and typed profile/revision command. Only leaf metadata is observed. The parentless folder record has unknown logical/recovery size, default Keep and explicit metadata-only/contents-not-inventoried blockers. No path, child inventory, access grant or operation binding is retained. Include is refused by the domain, even through a direct edit.
+
+All26 native tests, strict native Clippy, formatting and frontend type/build/version checks passed. The40.14MiB macOS debug bundle passed picker cancellation at revision9, addition at revision10 (1,002 entries/790 selected), restart persistence, undo at revision11 (1,001/790) and redo at revision12 (1,002/790), using the same disposable directory. The inspector showed unknown size/recovery and explicitly unknown contents/emptiness; Include was disabled. The valuable sentinel remained unchanged. Shared workspace code last passed its128 tests in the preceding0.0.6 checkpoint; this batch changes native metadata/UI plus matching versions.
+
+File/folder additions are available as blocked observations. Real source inventory and eligibility still belong to discovery, and the three-participant preservation/comprehension pilot remains unperformed. M1B stays In progress.

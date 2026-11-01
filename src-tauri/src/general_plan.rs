@@ -322,6 +322,84 @@ pub(crate) async fn add_selected_general_item(
     .map_err(|_| unavailable())?
 }
 
+/// Adds a blocked folder observation without learning or asserting anything
+/// about its children. This remains a separate native command from file add.
+#[tauri::command]
+pub(crate) async fn add_selected_general_folder(
+    request: RevisionRequest,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, GeneralPlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
+) -> Result<AddSelectedItemOutcome, GeneralPlanError> {
+    if request.profile != Profile::Pilot {
+        return Err(GeneralPlanError {
+            code: "unsupported_profile",
+            message: "Adding a native folder is available only in the pilot workspace.",
+        });
+    }
+    if !demo.permits_plan_edits() {
+        return Err(GeneralPlanError {
+            code: "plan_in_use",
+            message: "Another Disk Steward instance owns this workspace. Return to that instance to edit it.",
+        });
+    }
+    let guard = edit_guard(&demo)?;
+    let stores = Arc::clone(&state.0);
+    let expected_revision_id = request.expected_revision_id;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let mut stores = stores.lock().map_err(|_| unavailable())?;
+        let directory = stores.directory.as_ref().map_err(|error| *error)?.clone();
+        let stored = stores.profiles.entry(Profile::Pilot).or_insert_with(|| {
+            GeneralPlanStore::open(
+                directory.join(Profile::Pilot.filename()),
+                Profile::Pilot.scale(),
+            )
+            .map_err(public_error)
+        });
+        let store = stored.as_mut().map_err(|error| *error)?;
+
+        // Reject stale UI state before opening the native chooser. append_item
+        // repeats this check transactionally after the no-follow observation.
+        let before = store.get_plan().map_err(public_error)?;
+        if before.revision_id != expected_revision_id {
+            return Err(public_error(StoreError::StaleRevision));
+        }
+
+        let Some(selection) = app
+            .dialog()
+            .file()
+            .set_title("Add folder metadata only · contents not inventoried")
+            .set_can_create_directories(false)
+            .blocking_pick_folder()
+        else {
+            return Ok(AddSelectedItemOutcome {
+                snapshot: Some(before),
+                canceled: true,
+            });
+        };
+        let path = selection.into_path().map_err(|_| GeneralPlanError {
+            code: "unsupported_selection",
+            message: "The selected folder is unsupported. Nothing was added.",
+        })?;
+        let item = crate::selected_metadata::inspect_selected_folder(&path).map_err(|message| {
+            GeneralPlanError {
+                code: "metadata_unavailable",
+                message,
+            }
+        })?;
+        let snapshot = store
+            .append_item(expected_revision_id, item)
+            .map_err(public_error)?;
+        Ok(AddSelectedItemOutcome {
+            snapshot: Some(snapshot),
+            canceled: false,
+        })
+    })
+    .await
+    .map_err(|_| unavailable())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

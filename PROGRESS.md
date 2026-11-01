@@ -137,3 +137,6 @@ Editor PR4 checkpoint b3cd202 is pushed. New feature branch feat/m1b-exclusions 
 
 
 The0.0.6 exclusion registry slice is verified:128workspace/24native tests, strictClippy/fmt/frontendbuild/version and40.07MiB native bundle pass. Native cancel-add/confirm-add/restart/cancel-remove/confirm-remove passed on a disposable directory, preserving the existing plan revision and fixture sentinel. Private directory/database side-file modes were0700/0600. No source paths or identity bytes reach the renderer, and rules remain saved-unverified for future scans. Details are in docs/M1B-VALIDATION.md. M1B remains In progress; folder additions/eligibility, M2 rule application and human pilots remain open.
+
+
+M1B0.0.7 adds blocked selected-folder metadata through a native picker, with unknown size and explicitly un-inventoried contents. Native26tests/strictClippy/fmt/frontendbuild/version and40.14MiB bundle pass. Native cancel/add/restart/undo/redo passed on the disposable directory: current pilotRev12/1,002entries/790selected,0remembered exclusions, sentinel unchanged. Full source discovery/eligibility and human pilots remain open; M1B is not complete. Work is on feat/m1b-folder-metadata, stacked on PR5.

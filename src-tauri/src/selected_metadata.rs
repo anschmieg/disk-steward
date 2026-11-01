@@ -1,7 +1,8 @@
-//! Bounded metadata extraction for one native file picker selection.
+//! Bounded metadata extraction for one native file or folder selection.
 //!
-//! This module never opens or reads the selected file. The selected path is
-//! used only for a no-follow metadata query and is never returned or persisted.
+//! This module never opens or reads the selected entry or enumerates a selected
+//! folder. The selected path is used only for a no-follow metadata query and is
+//! never returned or persisted.
 
 use std::path::Path;
 
@@ -44,17 +45,54 @@ pub(crate) fn inspect_selected_file(path: &Path) -> Result<InventoryItem, &'stat
     })
 }
 
-fn bounded_basename(path: &Path) -> Option<String> {
+pub(crate) fn inspect_selected_folder(path: &Path) -> Result<InventoryItem, &'static str> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| "The selected folder metadata is unavailable. Nothing was added.")?;
+    if !metadata.file_type().is_dir() {
+        return Err("Select a directory; files and symbolic links are unsupported.");
+    }
+
+    let label = bounded_basename(path)
+        .ok_or("The selected folder has no usable name. Nothing was added.")?;
+
+    Ok(InventoryItem {
+        id: InventoryItemId::new(),
+        parent_id: None,
+        label,
+        kind: ItemKind::Folder,
+        logical_bytes: None,
+        recovery_lower_bytes: None,
+        recovery_upper_bytes: None,
+        storage_identity: None,
+        blockers: vec![
+            Blocker {
+                code: "native_metadata_only".to_owned(),
+                reason: "Only the selected folder entry's name and directory metadata were observed. The folder is blocked from cleanup; its contents and identity were not established.".to_owned(),
+            },
+            Blocker {
+                code: "contents_not_inventoried".to_owned(),
+                reason: "The folder's children were not enumerated. Its contents and whether it is empty are unknown.".to_owned(),
+            },
+        ],
+        evidence: vec![EvidenceRef {
+            id: EvidenceId::new(),
+            summary: "Native no-follow metadata observation of the selected directory entry. Children were not enumerated; contents and emptiness remain unknown.".to_owned(),
+        }],
+        suggestion: Suggestion {
+            choice: Choice::Keep,
+            rationale: "Keep by default until a supported inventory can establish trustworthy evidence about this folder and its contents.".to_owned(),
+        },
+    })
+}
+
+pub(crate) fn bounded_basename(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     if name.is_empty() || name == "." || name == ".." {
         return None;
     }
 
-    let sanitized: String = name
+    let mut visible: Vec<char> = name
         .chars()
-        .filter(|ch| !ch.is_control())
-        // Render directional formatting explicitly so a basename cannot visually
-        // reorder an extension. This bounded label is never a source identity.
         .flat_map(|ch| {
             if is_bidi_control(ch) {
                 format!("\\u{{{:x}}}", ch as u32)
@@ -64,8 +102,25 @@ fn bounded_basename(path: &Path) -> Option<String> {
                 vec![ch]
             }
         })
-        .take(MAX_LABEL_CHARS)
         .collect();
+    let first_nonspace = visible
+        .iter()
+        .position(|character| !character.is_whitespace());
+    let last_nonspace = visible
+        .iter()
+        .rposition(|character| !character.is_whitespace());
+    if let (Some(first), Some(last)) = (first_nonspace, last_nonspace) {
+        let mut bounded = Vec::with_capacity(visible.len() + 16);
+        for (index, character) in visible.drain(..).enumerate() {
+            if (index < first || index > last) && character.is_whitespace() {
+                bounded.extend(format!("\\u{{{:04x}}}", character as u32).chars());
+            } else {
+                bounded.push(character);
+            }
+        }
+        visible = bounded;
+    }
+    let sanitized: String = visible.into_iter().take(MAX_LABEL_CHARS).collect();
     if sanitized.trim().is_empty() {
         None
     } else {
@@ -82,6 +137,7 @@ pub(crate) fn is_bidi_control(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use disk_steward_plan_model::{synthetic_fixture, PlanEdit, PlanEditor};
 
     #[test]
     fn emits_only_bounded_basename_and_conservative_metadata() {
@@ -143,5 +199,85 @@ mod tests {
         let label = bounded_basename(&path).unwrap();
         assert_eq!(label, "x".repeat(MAX_LABEL_CHARS));
         assert!(!label.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn selected_folder_stays_unknown_blocked_and_does_not_touch_valuable_children() {
+        let fixture = tempfile::tempdir().unwrap();
+        let folder = fixture.path().join("Important Folder");
+        std::fs::create_dir(&folder).unwrap();
+        let valuable_child = folder.join("valuable-notes.txt");
+        std::fs::write(&valuable_child, b"keep these original bytes").unwrap();
+        let original = std::fs::read(&valuable_child).unwrap();
+
+        let item = inspect_selected_folder(&folder).unwrap();
+        assert_eq!(item.kind, ItemKind::Folder);
+        assert_eq!(item.label, "Important Folder");
+        assert_eq!(item.parent_id, None);
+        assert_eq!(item.logical_bytes, None);
+        assert_eq!(item.recovery_lower_bytes, None);
+        assert_eq!(item.recovery_upper_bytes, None);
+        assert_eq!(item.storage_identity, None);
+        assert_eq!(item.suggestion.choice, Choice::Keep);
+        assert_eq!(item.blockers.len(), 2);
+        assert!(item
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "native_metadata_only"));
+        assert!(item
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "contents_not_inventoried"));
+        assert!(item.evidence[0]
+            .summary
+            .contains("Children were not enumerated"));
+        assert_eq!(std::fs::read(&valuable_child).unwrap(), original);
+
+        let mut editor = PlanEditor::new(synthetic_fixture(9, 1).unwrap()).unwrap();
+        let appended = editor
+            .add_items(editor.snapshot().revision_id, vec![item.clone()])
+            .unwrap();
+        let attempt = editor
+            .edit(
+                appended.revision_id,
+                PlanEdit::SetChoice {
+                    item_id: item.id,
+                    choice: Choice::Include,
+                },
+            )
+            .unwrap();
+        assert!(!attempt.changed);
+        assert_eq!(attempt.blocked.len(), 1);
+        let projection = attempt
+            .snapshot
+            .items
+            .iter()
+            .find(|projected| projected.item_id == item.id)
+            .unwrap();
+        assert_eq!(projection.kind, ItemKind::Folder);
+        assert_eq!(projection.logical_bytes, None);
+        assert_eq!(projection.user_choice, None);
+        assert!(!projection.effective_selected);
+        assert_eq!(std::fs::read(&valuable_child).unwrap(), original);
+    }
+
+    #[test]
+    fn rejects_folder_symlinks_files_and_missing_paths() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let directory = fixture.path().join("directory");
+        let file = fixture.path().join("file");
+        let link = fixture.path().join("link");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"fixture bytes").unwrap();
+        #[cfg(unix)]
+        symlink(&directory, &link).unwrap();
+
+        assert!(inspect_selected_folder(&file).is_err());
+        assert!(inspect_selected_folder(&fixture.path().join("missing")).is_err());
+        #[cfg(unix)]
+        assert!(inspect_selected_folder(&link).is_err());
     }
 }
