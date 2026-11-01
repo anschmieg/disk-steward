@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "scope": "bounded object-closure feasibility, not clone-removal authority",
+  "public_canonical_git_endpoint": {
+    "elapsed_ms": 712,
+    "logical_store_bytes": 16387,
+    "body_exposed_bytes": 2191,
+    "header_exposed_bytes": 1303,
+    "fetched_objects": 13,
+    "refs": 4,
+    "reachable_objects": 13,
+    "reachable_decoded_bytes": 1991,
+    "excluded_gitlinks": 0,
+    "cleaned": true
+  },
+  "private_own_repository": {
+    "elapsed_ms": 1662,
+    "logical_store_bytes": 1053626,
+    "body_exposed_bytes": 1032118,
+    "header_exposed_bytes": 1303,
+    "fetched_objects": 552,
+    "refs": 6,
+    "reachable_objects": 552,
+    "reachable_decoded_bytes": 4408809,
+    "excluded_gitlinks": 0,
+    "cleaned": true,
+    "credential_echo_detected": false
+  },
+  "limitations": [
+    "Existing host GitHub sign-in, not app Keychain integration",
+    "No source clone or local-only state assessed",
+    "Closure budgets apply after ingestion; gix receive/header delta resolution allocations have no proven memory ceiling",
+    "Response exposure is not a wire-level ingress ceiling",
+    "Extensionless endpoint failed safely; canonical .git endpoint succeeded; no URL rewriting or redirects enabled"
+  ]
+}

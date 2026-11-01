@@ -9,6 +9,14 @@ unproven. It does not certify the Git verification adapter or close M0.
 - The probe validates only `https://github.com/OWNER/REPO[.git]` URLs. It
   rejects credentials, query/fragment data, escapes, other hosts, and nested
   paths before creating a worker.
+- The syntactic allowlist accepts both `https://github.com/OWNER/REPO` and
+  `https://github.com/OWNER/REPO.git`; the exact caller URL is used and never
+  canonicalized. In-memory configuration disables redirects. An extensionless
+  URL that GitHub redirects to `.git` therefore fails closed at fetch. A root
+  run of the extensionless form failed with zero response bytes; a later
+  canonical `.git` run completed successfully as recorded below. That suggests
+  a blocked redirect, but the earlier run predates stage diagnostics and did
+  not establish the cause.
 - The public manual network entry point is `--bounded-probe URL`, fixed at a
   32 MiB logical temporary-store limit and a 60-second deadline for a tiny
   public test repository. A root-reviewed run against public octocat/Hello-World
@@ -22,7 +30,12 @@ unproven. It does not certify the Git verification adapter or close M0.
   ms and 769 ms; each reported 16,387 logical store bytes, 2,191 response-body
   bytes exposed, 1,303 header bytes exposed, 13 objects, 4 refs, and cleaned
   the owned store. The failure was not reproducible in those runs, so its
-  transient cause remains unknown. A parent
+  transient cause remains unknown. The later root-reviewed version-2 run of
+  `https://github.com/octocat/Hello-World.git` completed in 712 ms with 16,387
+  logical store bytes, 2,191 body bytes, 1,303 header bytes, 13 fetched
+  objects, 4 refs, 13 reachable objects, 1,991 decoded bytes, zero Gitlinks,
+  and cleaned=true. This is the first recorded public fetch with the closure
+  validator active. A parent
   creates a private temporary directory with
   mode 0700, an exclusive random ownership receipt, and an empty isolated Git
   config. The child checks the receipt, then initializes a separate bare
@@ -50,8 +63,9 @@ unproven. It does not certify the Git verification adapter or close M0.
 - After successful fetch the child writes one JSON receipt to its stdout pipe.
   The parent reads at most 4,097 bytes, rejects over-4-KiB or invalid JSON, and
   strictly validates a deny-unknown-fields schema before temporary-store
-  cleanup. The receipt contains schema version, bare-fetch-complete flag,
-  exposed response body/header byte counts, and bounded object/ref counts only.
+  cleanup. The version-2 receipt contains schema version, bare-fetch-complete flag,
+  exposed response body/header byte counts, fetched object/ref counts, reachable
+  object count and decoded byte count, and excluded Gitlink count only.
   It has no URL, branch name, private path, or credential field. The parent
   prints only these safe counts. A missing or malformed receipt fails closed
   and still follows owned-store cleanup.
@@ -85,6 +99,22 @@ unproven. It does not certify the Git verification adapter or close M0.
   bytes; any available excess remains hidden and raises a cap error. This EOF
   check can call a buffered reader that has already prefetched data internally,
   so it is an exposure boundary to gix, not a one-byte wire probe.
+- After fetching, the worker traverses every advertised ref root in gix's fetch
+  ref map. It follows annotated tag targets, commit trees and parents, tree
+  entries/subtrees, and blobs. It checks each object header against per-object
+  and cumulative decoded-byte budgets before loading contents, parses each
+  typed object with gix's object parsers, recomputes the Git object hash, and
+  compares it with the referenced ID. Missing, malformed, wrong-kind,
+  hash-mismatched, or over-budget objects fail closed before a success receipt.
+  Gitlinks are counted and excluded because their targets belong to separate
+  submodule repositories; they are not fetched or claimed as part of closure.
+  Fixed limits are 100,000 unique objects, 64 MiB cumulative decoded object
+  bytes, 16 MiB per object, 250,000 work units, and 100,000 pending object IDs.
+  The worker's overall deadline remains active during traversal. gix header
+  lookup can resolve packed delta chains; any internal allocations in that
+  resolution are outside the decoded-byte budget and have not been measured.
+  These are post-fetch closure bounds: gix unpacks the incoming pack before
+  this check, so they do not establish a memory cap during pack ingestion.
 - The internal worker starts its own read-only watchdog before gix repository
   initialization. It independently enforces the same 60-second deadline,
   logical store cap, and free-space reserve every 20 ms, even if invoked
@@ -95,7 +125,13 @@ unproven. It does not certify the Git verification adapter or close M0.
   registered temporary store. The marker protects against accidental path
   selection, not arbitrary same-user code that can forge it; the direct worker
   applies the same limits regardless.
-- Thirty-five local tests cover endpoint rejection, receipt-based store cleanup,
+- Before a receipt is written, the worker uses fixed exit codes that the parent
+  maps to sanitized stages: 74 is the watchdog, 75 is fetch failure or blocked
+  redirect, 77 is receipt failure, and 80-84 identify closure missing,
+  malformed, wrong-kind, hash-mismatch, and budget failure. No transport error
+  text, URL, or child stderr is exposed. The codes distinguish the stage while
+  collapsing library errors within that stage.
+- Forty-three local tests cover endpoint rejection, receipt-based store cleanup,
   child deadline termination/join, a successful exit without a receipt failing
   closed, an exited child that has already exceeded
   the size cap, an exited child past its deadline, temporary-store budget
@@ -105,7 +141,13 @@ unproven. It does not certify the Git verification adapter or close M0.
   operation or network connection for the transport, byte-budget, watchdog,
   credential-canary, receipt, and disk-space tests. They test secret input
   limits, EOF/closed-pipe handling, and direct private-worker terminal-input
-  rejection, callback URL matching and single issue,
+  rejection, typed object-graph traversal with parent commits, nested trees and
+  Gitlink exclusion, hash and malformed/missing/type failures, a duplicate-ID
+  wrong-kind edge after the ID was already visited, and object,
+  decoded-byte, work, and pending-ID budget failures, a local gix object-store
+  adapter fixture, fixed worker-exit stage mapping, extensionless URL syntax
+  acceptance without canonicalization, callback URL matching and
+  single issue,
   Store/Erase no-op behavior, child-pipe failure cleanup, and absence of a
   synthetic canary (plaintext and both Basic/base64 encodings) from child
   stdout, stderr, and store files. A callback-level Erase simulation checks
@@ -138,6 +180,9 @@ them and independently stops a redirect to another host. References:
 - [rustix 1.1.6 statvfs API](https://docs.rs/rustix/1.1.6/rustix/fs/fn.statvfs.html)
 - [zeroize `Zeroizing` documentation](https://docs.rs/zeroize/1.9.1/zeroize/struct.Zeroizing.html)
 - [gix 0.81 HTTP transport feature definitions](https://docs.rs/crate/gix/0.81.0/source/Cargo.toml)
+- [gix 0.81 object lookup and header APIs](https://docs.rs/gix/0.81.0/src/gix/repository/object.rs.html)
+- [gix-object 0.58 typed object parsing and hash API](https://docs.rs/gix-object/0.58.0/gix_object/)
+- [gix 0.81 repository initialization API](https://docs.rs/gix/0.81.0/src/gix/lib.rs.html)
 
 The existing gix 0.60 HTTP trait probe is not source-compatible with gix
 0.81.0's gix-transport 0.55.1 trait, so the accounting wrapper was ported to
@@ -173,19 +218,24 @@ This prototype connects the wrapper to the concrete fetch-to-bare-store path.
   reconciliation, aggregate-store budget, or allocation-based accounting.
   The identity-bound receipt is process-lifetime probe evidence, not a durable
   production receipt protocol.
-- The fetch result is only a successful gix fetch into the temporary object
-  store of advertised refs and reachable objects. The prototype does not yet
-  verify that all required refs/objects are present for D8's complete-remote
-  proof, inspect source clone state, or cover
-  shallow/partial/worktree/submodule/LFS/alternate exclusions.
-- Private GitHub HTTPS with an app-owned Keychain credential is still
-  unproven. The new private path only has a synthetic canary handoff/callback
-  test; no actual credential, private disposable repository, app Keychain
-  identity, signing, revocation, or live private auth request was used.
-  Zeroizing covers the prototype-owned input buffers, not Gix's internal
+- The closure validator covers advertised ref roots returned by this gix fetch
+  and their reachable commit/tree/blob/tag graph, while counting and excluding
+  Gitlink targets. It does not prove preservation of pre-existing local refs,
+  LFS payloads, worktree material, external alternates, or submodule object
+  graphs. Synthetic object tests cover traversal and limits, but the public and
+  private live observations above predate this validator. A reviewed network
+  run with the validator in place remains outstanding.
+  Pack ingestion itself still relies on gix's bounded transfer body/store and
+  worker deadline; this probe has no hard cap for memory used while gix receives
+  and unpacks a malicious compressed pack. The post-fetch closure budget cannot
+  prevent that earlier allocation.
+- One bounded private GitHub HTTPS fetch with the existing host sign-in
+  succeeded, as recorded below. App-owned Keychain credential integration,
+  identity, signing, and revocation remain unproven. Zeroizing covers the
+  prototype-owned input buffers, not Gix's internal
   Account/header copies, Reqwest/TLS buffers, allocator remnants, or OS memory.
 - The gix and gix-transport backends are pinned in the probe manifest. Build,
-  thirty-three local tests and clippy pass after fetching the pinned Rust
+  forty-three local tests and clippy pass after fetching the pinned Rust
   dependencies. One reviewed public tiny-repository object fetch is observed
   above; it validates the bounded transport/worker integration and object-store
   writing before receipt and private-handoff additions, but not authenticated
@@ -201,4 +251,6 @@ blocked pending those proofs.
 
 ## Coordinator private-path observation
 
-A bounded fetch of this app's own small private repository succeeded using the existing host GitHub sign-in handed through memory and stdin. The receipt reported 493 objects, six refs, 980,162 body bytes exposed, 1,303 header bytes exposed and 1,000,028 logical temporary-store bytes, in 1,349 ms. Owned-store cleanup succeeded and captured output contained no credential echo. A deliberately invalid synthetic credential failed closed in 434 ms with owned cleanup. Sanitized observations are in `probes/git-https-worker/evidence/2026-11-01-live-checks.json`. No credential was persisted, changed or revoked by these checks. This does not demonstrate the app's OS credential-store integration, complete object closure, local-only preservation analysis or production verification budgets; those gates remain open.
+A bounded fetch of this app's own small private repository succeeded using the existing host GitHub sign-in handed through memory and stdin. The receipt reported 493 objects, six refs, 980,162 body bytes exposed, 1,303 header bytes exposed and 1,000,028 logical temporary-store bytes, in 1,349 ms. Owned-store cleanup succeeded and captured output contained no credential echo. A deliberately invalid synthetic credential failed closed in 434 ms with owned cleanup. Sanitized observations are in `probes/git-https-worker/evidence/2026-11-01-live-checks.json`. No credential was persisted, changed or revoked by these checks. This does not demonstrate app OS credential-store integration. These runs predate object-closure validation; complete closure with the new code, local-only preservation analysis and production verification budgets remain open.
+
+A coordinator run of the schema-v2 closure path against the app's own private repository succeeded in1,662ms, with552 fetched/reachable objects, six refs,4,408,809 decoded reachable bytes,1,032,118 body bytes exposed,1,303 header bytes exposed and1,053,626 logical temporary-store bytes. Cleanup succeeded and captured output contained no credential echo. It reused the existing host sign-in through memory/stdin; it did not create or change credentials. Sanitized evidence is in `probes/git-https-worker/evidence/2026-11-01-live-closure.json`. This is not app Keychain or local-clone preservation proof.

@@ -3,7 +3,9 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 mod bounded_http;
+mod object_closure;
 use bounded_http::{AttemptBudget, BudgetedHttp};
+use object_closure::{validate_advertised_refs, MAX_CLOSURE_DECODED_BYTES, MAX_CLOSURE_OBJECTS};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -32,6 +34,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OWNER_MARKER: &str = ".disk-steward-git-https-probe-owner";
 const EMPTY_GIT_CONFIG: &str = ".gitconfig-empty";
 const WORKER_GUARD_EXIT_CODE: i32 = 74;
+const WORKER_FETCH_EXIT_CODE: i32 = 75;
+const WORKER_RECEIPT_EXIT_CODE: i32 = 77;
+const WORKER_CLOSURE_MISSING_EXIT_CODE: i32 = 80;
+const WORKER_CLOSURE_MALFORMED_EXIT_CODE: i32 = 81;
+const WORKER_CLOSURE_TYPE_EXIT_CODE: i32 = 82;
+const WORKER_CLOSURE_HASH_EXIT_CODE: i32 = 83;
+const WORKER_CLOSURE_BUDGET_EXIT_CODE: i32 = 84;
 const MAX_SECRET_BYTES: usize = 512;
 const MAX_RECEIPT_BYTES: usize = 4096;
 const MAX_RECEIPT_REFS: u32 = 100_000;
@@ -47,6 +56,10 @@ enum Failure {
     StoreAccounting,
     FreeSpace,
     CredentialInput,
+    WorkerFetchOrRedirect,
+    WorkerReceipt,
+    WorkerGuard,
+    ObjectClosure(object_closure::ClosureError),
 }
 
 #[derive(Debug)]
@@ -67,11 +80,19 @@ struct WorkerReceipt {
     response_header_exposed_bytes: u32,
     object_count: Option<u32>,
     ref_count: Option<u32>,
+    reachable_object_count: u32,
+    reachable_decoded_bytes: u64,
+    excluded_gitlink_count: u32,
 }
 
 fn main() {
     let mut args = env::args_os().skip(1);
-    let result = match args.next().as_deref() {
+    let command = args.next();
+    let internal_worker = matches!(
+        command.as_deref(),
+        Some(arg) if arg == "--fetch-worker" || arg == "--private-fetch-worker"
+    );
+    let result = match command.as_deref() {
         Some(arg) if arg == "--fetch-worker" => {
             worker_entry(args.next(), args.next(), args.next(), false)
         }
@@ -90,7 +111,11 @@ fn main() {
     };
     if let Err(failure) = result {
         eprintln!("verification failed: {}", failure.as_str());
-        std::process::exit(1);
+        std::process::exit(if internal_worker {
+            failure.worker_exit_code()
+        } else {
+            1
+        });
     }
 }
 
@@ -104,6 +129,34 @@ impl Failure {
             Self::StoreAccounting => "temporary store accounting failed",
             Self::FreeSpace => "verification volume free-space reserve unavailable",
             Self::CredentialInput => "credential input invalid",
+            Self::WorkerFetchOrRedirect => "fetch failed or redirect was blocked",
+            Self::WorkerReceipt => "worker receipt invalid",
+            Self::WorkerGuard => "worker guard stopped the attempt",
+            Self::ObjectClosure(_) => "reachable object closure invalid or over budget",
+        }
+    }
+
+    fn worker_exit_code(self) -> i32 {
+        match self {
+            Self::WorkerFetchOrRedirect => WORKER_FETCH_EXIT_CODE,
+            Self::WorkerReceipt => WORKER_RECEIPT_EXIT_CODE,
+            Self::ObjectClosure(object_closure::ClosureError::Missing) => {
+                WORKER_CLOSURE_MISSING_EXIT_CODE
+            }
+            Self::ObjectClosure(object_closure::ClosureError::Malformed) => {
+                WORKER_CLOSURE_MALFORMED_EXIT_CODE
+            }
+            Self::ObjectClosure(object_closure::ClosureError::TypeMismatch) => {
+                WORKER_CLOSURE_TYPE_EXIT_CODE
+            }
+            Self::ObjectClosure(object_closure::ClosureError::HashMismatch) => {
+                WORKER_CLOSURE_HASH_EXIT_CODE
+            }
+            Self::ObjectClosure(object_closure::ClosureError::Budget) => {
+                WORKER_CLOSURE_BUDGET_EXIT_CODE
+            }
+            Self::WorkerGuard => WORKER_GUARD_EXIT_CODE,
+            _ => 1,
         }
     }
 }
@@ -151,7 +204,7 @@ fn private_probe(input: Option<OsString>, extra: Option<OsString>) -> Result<(),
 }
 
 fn print_attempt(attempt: &Attempt) {
-    let (body, headers, objects, refs) = attempt
+    let (body, headers, objects, refs, reachable, decoded, gitlinks) = attempt
         .worker_receipt
         .as_ref()
         .map(|receipt| {
@@ -160,17 +213,23 @@ fn print_attempt(attempt: &Attempt) {
                 receipt.response_header_exposed_bytes,
                 receipt.object_count,
                 receipt.ref_count,
+                receipt.reachable_object_count,
+                receipt.reachable_decoded_bytes,
+                receipt.excluded_gitlink_count,
             )
         })
         .unwrap_or_default();
     println!(
-        "fetch elapsed_ms={} logical_store_bytes={} body_exposed_bytes={} header_exposed_bytes={} objects={} refs={} failure={:?} cleaned={}",
+        "fetch elapsed_ms={} logical_store_bytes={} body_exposed_bytes={} header_exposed_bytes={} objects={} refs={} reachable_objects={} reachable_decoded_bytes={} excluded_gitlinks={} failure={:?} cleaned={}",
         attempt.elapsed.as_millis(),
         attempt.logical_store_bytes,
         body,
         headers,
         objects.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
         refs.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+        reachable,
+        decoded,
+        gitlinks,
         attempt.failure,
         attempt.cleaned
     );
@@ -512,8 +571,11 @@ fn supervise_with_space(
     } else {
         None
     };
+    if require_receipt && !status.success() && failure.is_none() {
+        failure = Some(worker_failure_for_exit_code(status.code()));
+    }
     if require_receipt && worker_receipt.is_none() && failure.is_none() {
-        failure = Some(Failure::WorkerFailed);
+        failure = Some(Failure::WorkerReceipt);
     }
     if !status.success() && failure.is_none() {
         failure = Some(Failure::WorkerFailed);
@@ -558,7 +620,7 @@ fn parse_worker_receipt(bytes: &[u8]) -> Result<WorkerReceipt, Failure> {
 }
 
 fn validate_worker_receipt(receipt: &WorkerReceipt) -> Result<(), Failure> {
-    if receipt.schema_version != 1
+    if receipt.schema_version != 2
         || !receipt.bare_fetch_completed
         || receipt.response_body_exposed_bytes > BOUNDED_PROBE_RESPONSE_BYTES as u32
         || receipt.response_header_exposed_bytes > BOUNDED_PROBE_HEADER_BYTES as u32
@@ -568,10 +630,37 @@ fn validate_worker_receipt(receipt: &WorkerReceipt) -> Result<(), Failure> {
         || receipt
             .object_count
             .is_none_or(|count| count > MAX_RECEIPT_OBJECTS)
+        || receipt.reachable_object_count as usize > MAX_CLOSURE_OBJECTS
+        || receipt.reachable_decoded_bytes > MAX_CLOSURE_DECODED_BYTES
+        || receipt.excluded_gitlink_count as usize > MAX_CLOSURE_OBJECTS
     {
         return Err(Failure::WorkerFailed);
     }
     Ok(())
+}
+
+fn worker_failure_for_exit_code(code: Option<i32>) -> Failure {
+    match code {
+        Some(WORKER_GUARD_EXIT_CODE) => Failure::WorkerGuard,
+        Some(WORKER_FETCH_EXIT_CODE) => Failure::WorkerFetchOrRedirect,
+        Some(WORKER_RECEIPT_EXIT_CODE) => Failure::WorkerReceipt,
+        Some(WORKER_CLOSURE_MISSING_EXIT_CODE) => {
+            Failure::ObjectClosure(object_closure::ClosureError::Missing)
+        }
+        Some(WORKER_CLOSURE_MALFORMED_EXIT_CODE) => {
+            Failure::ObjectClosure(object_closure::ClosureError::Malformed)
+        }
+        Some(WORKER_CLOSURE_TYPE_EXIT_CODE) => {
+            Failure::ObjectClosure(object_closure::ClosureError::TypeMismatch)
+        }
+        Some(WORKER_CLOSURE_HASH_EXIT_CODE) => {
+            Failure::ObjectClosure(object_closure::ClosureError::HashMismatch)
+        }
+        Some(WORKER_CLOSURE_BUDGET_EXIT_CODE) => {
+            Failure::ObjectClosure(object_closure::ClosureError::Budget)
+        }
+        _ => Failure::WorkerFailed,
+    }
 }
 
 fn violation(
@@ -906,9 +995,11 @@ fn worker_entry(
     let receipt = worker(store, receipt, url, private)?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, &receipt).map_err(|_| Failure::WorkerFailed)?;
-    output.write_all(b"\n").map_err(|_| Failure::WorkerFailed)?;
-    output.flush().map_err(|_| Failure::WorkerFailed)
+    serde_json::to_writer(&mut output, &receipt).map_err(|_| Failure::WorkerReceipt)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| Failure::WorkerReceipt)?;
+    output.flush().map_err(|_| Failure::WorkerReceipt)
 }
 
 #[allow(clippy::result_large_err)] // gix's credential callback fixes this error type.
@@ -957,7 +1048,7 @@ fn worker(
     let authentication_url = url.clone();
     let repository_path = store_root.join("objects.git");
     let mut prepare = gix::prepare_clone_bare(url, &repository_path)
-        .map_err(|_| Failure::WorkerFailed)?
+        .map_err(|_| Failure::WorkerFetchOrRedirect)?
         .with_in_memory_config_overrides([
             "credential.helper=",
             "http.followRedirects=false",
@@ -996,9 +1087,9 @@ fn worker(
         Ok(())
     });
     let interrupted = AtomicBool::new(false);
-    let (_repository, fetch_outcome) = prepare
+    let (repository, fetch_outcome) = prepare
         .fetch_only(gix::progress::Discard, &interrupted)
-        .map_err(|_| Failure::WorkerFailed)?;
+        .map_err(|_| Failure::WorkerFetchOrRedirect)?;
     let ref_count = u32::try_from(fetch_outcome.ref_map.remote_refs.len())
         .map_err(|_| Failure::WorkerFailed)?;
     let object_count = match fetch_outcome.status {
@@ -1007,17 +1098,22 @@ fn worker(
             write_pack_bundle, ..
         } => Some(write_pack_bundle.index.num_objects),
     };
+    let closure = validate_advertised_refs(&repository, &fetch_outcome.ref_map.remote_refs)
+        .map_err(Failure::ObjectClosure)?;
     let receipt = WorkerReceipt {
-        schema_version: 1,
+        schema_version: 2,
         bare_fetch_completed: true,
         response_body_exposed_bytes: u32::try_from(attempt_budget.body_bytes_used())
-            .map_err(|_| Failure::WorkerFailed)?,
+            .map_err(|_| Failure::WorkerReceipt)?,
         response_header_exposed_bytes: u32::try_from(attempt_budget.header_bytes_used())
-            .map_err(|_| Failure::WorkerFailed)?,
+            .map_err(|_| Failure::WorkerReceipt)?,
         object_count,
         ref_count: Some(ref_count),
+        reachable_object_count: closure.object_count,
+        reachable_decoded_bytes: closure.decoded_bytes,
+        excluded_gitlink_count: closure.excluded_gitlink_count,
     };
-    validate_worker_receipt(&receipt)?;
+    validate_worker_receipt(&receipt).map_err(|_| Failure::WorkerReceipt)?;
     worker_guard.finish();
     Ok(receipt)
 }
@@ -1032,6 +1128,10 @@ mod tests {
             validate_github_https("https://github.com/octo/repo.git"),
             Ok(())
         );
+        assert_eq!(
+            validate_github_https("https://github.com/octo/repo"),
+            Ok(())
+        );
         for bad in [
             "https://user:secret@github.com/octo/repo.git",
             "https://github.com/octo/repo.git?token=secret",
@@ -1042,6 +1142,55 @@ mod tests {
             assert_eq!(validate_github_https(bad), Err(Failure::InvalidEndpoint));
         }
         assert!(!Failure::WorkerFailed.as_str().contains("secret"));
+    }
+
+    #[test]
+    fn worker_exit_codes_report_only_fixed_diagnostic_stages() {
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_FETCH_EXIT_CODE)),
+            Failure::WorkerFetchOrRedirect
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_RECEIPT_EXIT_CODE)),
+            Failure::WorkerReceipt
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_GUARD_EXIT_CODE)),
+            Failure::WorkerGuard
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_CLOSURE_MISSING_EXIT_CODE)),
+            Failure::ObjectClosure(object_closure::ClosureError::Missing)
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_CLOSURE_MALFORMED_EXIT_CODE)),
+            Failure::ObjectClosure(object_closure::ClosureError::Malformed)
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_CLOSURE_TYPE_EXIT_CODE)),
+            Failure::ObjectClosure(object_closure::ClosureError::TypeMismatch)
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_CLOSURE_HASH_EXIT_CODE)),
+            Failure::ObjectClosure(object_closure::ClosureError::HashMismatch)
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(WORKER_CLOSURE_BUDGET_EXIT_CODE)),
+            Failure::ObjectClosure(object_closure::ClosureError::Budget)
+        );
+        assert_eq!(
+            worker_failure_for_exit_code(Some(99)),
+            Failure::WorkerFailed
+        );
+        for diagnostic in [
+            Failure::WorkerFetchOrRedirect.as_str(),
+            Failure::WorkerReceipt.as_str(),
+            Failure::WorkerGuard.as_str(),
+            Failure::ObjectClosure(object_closure::ClosureError::HashMismatch).as_str(),
+        ] {
+            assert!(!diagnostic.contains("https://"));
+            assert!(!diagnostic.contains("synthetic-private-token"));
+        }
     }
 
     #[test]
@@ -1124,15 +1273,15 @@ mod tests {
 
     #[test]
     fn worker_receipt_is_bounded_strict_and_secret_free() {
-        let valid = br#"{"schema_version":1,"bare_fetch_completed":true,"response_body_exposed_bytes":1200,"response_header_exposed_bytes":2048,"object_count":12,"ref_count":4}"#;
+        let valid = br#"{"schema_version":2,"bare_fetch_completed":true,"response_body_exposed_bytes":1200,"response_header_exposed_bytes":2048,"object_count":12,"ref_count":4,"reachable_object_count":10,"reachable_decoded_bytes":800,"excluded_gitlink_count":0}"#;
         let receipt = parse_worker_receipt(valid).unwrap();
         assert_eq!(receipt.response_body_exposed_bytes, 1200);
         assert_eq!(receipt.object_count, Some(12));
         assert_eq!(receipt.ref_count, Some(4));
         for invalid in [
-            br#"{"schema_version":1,"bare_fetch_completed":true,"response_body_exposed_bytes":0,"response_header_exposed_bytes":0,"object_count":0,"ref_count":0,"token":"secret"}"#.as_slice(),
-            br#"{"schema_version":1,"bare_fetch_completed":false,"response_body_exposed_bytes":0,"response_header_exposed_bytes":0,"object_count":0,"ref_count":0}"#.as_slice(),
-            br#"{"schema_version":1,"bare_fetch_completed":true,"response_body_exposed_bytes":33554433,"response_header_exposed_bytes":0,"object_count":0,"ref_count":0}"#.as_slice(),
+            br#"{"schema_version":2,"bare_fetch_completed":true,"response_body_exposed_bytes":0,"response_header_exposed_bytes":0,"object_count":0,"ref_count":0,"reachable_object_count":0,"reachable_decoded_bytes":0,"excluded_gitlink_count":0,"token":"secret"}"#.as_slice(),
+            br#"{"schema_version":2,"bare_fetch_completed":false,"response_body_exposed_bytes":0,"response_header_exposed_bytes":0,"object_count":0,"ref_count":0,"reachable_object_count":0,"reachable_decoded_bytes":0,"excluded_gitlink_count":0}"#.as_slice(),
+            br#"{"schema_version":2,"bare_fetch_completed":true,"response_body_exposed_bytes":33554433,"response_header_exposed_bytes":0,"object_count":0,"ref_count":0,"reachable_object_count":0,"reachable_decoded_bytes":0,"excluded_gitlink_count":0}"#.as_slice(),
         ] {
             assert_eq!(parse_worker_receipt(invalid), Err(Failure::WorkerFailed));
         }
@@ -1146,7 +1295,7 @@ mod tests {
     fn parent_verifies_child_receipt_before_owned_store_cleanup() {
         let store = OwnedStore::create().unwrap();
         let path = store.path().to_owned();
-        let json = r#"{"schema_version":1,"bare_fetch_completed":true,"response_body_exposed_bytes":100,"response_header_exposed_bytes":40,"object_count":7,"ref_count":3}"#;
+        let json = r#"{"schema_version":2,"bare_fetch_completed":true,"response_body_exposed_bytes":100,"response_header_exposed_bytes":40,"object_count":7,"ref_count":3,"reachable_object_count":5,"reachable_decoded_bytes":500,"excluded_gitlink_count":0}"#;
         let child = Command::new("/usr/bin/printf")
             .arg("%s\\n")
             .arg(json)
@@ -1172,7 +1321,7 @@ mod tests {
     fn malformed_child_receipt_fails_before_owned_store_cleanup() {
         let store = OwnedStore::create().unwrap();
         let path = store.path().to_owned();
-        let json = r#"{"schema_version":1,"bare_fetch_completed":true,"response_body_exposed_bytes":100,"response_header_exposed_bytes":40,"object_count":7,"ref_count":3,"token":"canary"}"#;
+        let json = r#"{"schema_version":2,"bare_fetch_completed":true,"response_body_exposed_bytes":100,"response_header_exposed_bytes":40,"object_count":7,"ref_count":3,"reachable_object_count":5,"reachable_decoded_bytes":500,"excluded_gitlink_count":0,"token":"canary"}"#;
         let child = Command::new("/usr/bin/printf")
             .arg("%s\\n")
             .arg(json)
@@ -1188,7 +1337,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(attempt.failure, Some(Failure::WorkerFailed));
+        assert_eq!(attempt.failure, Some(Failure::WorkerReceipt));
         assert!(attempt.worker_receipt.is_none());
         assert!(attempt.cleaned);
         assert!(!path.exists());
@@ -1211,7 +1360,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(attempt.failure, Some(Failure::WorkerFailed));
+        assert_eq!(attempt.failure, Some(Failure::WorkerReceipt));
         assert!(attempt.worker_receipt.is_none());
         assert!(attempt.cleaned);
         assert!(!path.exists());
