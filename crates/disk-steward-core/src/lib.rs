@@ -306,7 +306,8 @@ impl ActionBinding {
 }
 
 /// A deliberately closed operation set. There is no arbitrary path or shell action.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SupportedOperation {
     StageToRecovery,
     RestoreFromRecovery,
