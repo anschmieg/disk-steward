@@ -1,0 +1,32 @@
+{
+  "cpython": {
+    "cache_tag": "cpython-315",
+    "changed_cache_refused": true,
+    "changed_source_refused": true,
+    "checked_hash_source_match": true,
+    "compatible_source_pair": true,
+    "magic": "520e0d0a",
+    "missing_source_refused": true,
+    "python_version": "3.15.0",
+    "regeneration_exact_match": true,
+    "source_not_executed": true,
+    "status": "fixture-passed",
+    "symlink_refused": true,
+    "unexpected_file_refused": true,
+    "unknown_header_refused": true
+  },
+  "pytest": {
+    "cache_root": ".pytest_cache (fixture only)",
+    "nodeids": [
+      "test_fixture_only.py::test_fixture_value"
+    ],
+    "pytest_version": "9.2.0",
+    "recognized_records": {
+      "nodeids": "validated-sorted-string-array"
+    },
+    "status": "fixture-passed",
+    "unexpected_cache_records": [],
+    "unexpected_top_level_entries": []
+  },
+  "scope": "synthetic fixtures only; no user paths, no global installation"
+}
