@@ -1,6 +1,6 @@
 [package]
 name = "disk-steward-desktop"
-version = "0.0.10"
+version = "0.0.11"
 description = "Disk Steward desktop application"
 authors = ["Disk Steward"]
 edition = "2021"
