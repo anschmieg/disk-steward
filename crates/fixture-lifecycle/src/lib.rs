@@ -90,6 +90,25 @@ impl From<rusqlite::Error> for LifecycleError {
     }
 }
 
+/// Outcome of one receipt-addressed purge attempt (contract
+/// `fixture-purge-v1`). `NotAttempted` is the batch-layer outcome for items
+/// whose unlink intent was never claimed; this crate reports refusals as
+/// typed errors instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeItemOutcome {
+    NotAttempted {
+        receipt_id: ReceiptId,
+    },
+    PermanentlyRemoved {
+        receipt_id: ReceiptId,
+        logical_bytes: u64,
+    },
+    Uncertain {
+        receipt_id: ReceiptId,
+    },
+}
+
 /// A process-local handle to one internally created fixture session.
 pub struct FixtureLifecycle {
     id: SessionId,
@@ -379,6 +398,66 @@ impl FixtureLifecycle {
         }
     }
 
+    /// Permanently remove one staged fixture by its registered receipt.
+    /// The only address is the receipt within this open session; the unlink
+    /// is directory-relative through the already-opened holding-directory
+    /// handle after a full identity re-verification, so no caller path is
+    /// ever accepted.
+    ///
+    /// Residual same-user TOCTOU, per contract fixture-purge-v1: the final
+    /// verification and the directory-relative unlink are bound by name, not
+    /// atomically by inode; portable filesystems provide no "unlink only if
+    /// this name still has this inode" primitive. A same-user process able
+    /// to mutate the private fixture directory can race the verification and
+    /// the unlink. The mitigations are the restrictive directory
+    /// ownership/mode, no-follow opened directory handles, and immediate
+    /// re-verification before the unlink; when the outcome cannot be
+    /// established, the receipt state becomes Uncertain rather than guessed.
+    pub fn purge_receipt(
+        &mut self,
+        receipt: ReceiptId,
+        attempt: AttemptId,
+    ) -> Result<PurgeItemOutcome, LifecycleError> {
+        use rustix::fs::{unlinkat, AtFlags};
+        validate_schema(&self.db)?;
+        validate_registry(&self.db)?;
+        let fixture = self
+            .lookup_receipt(receipt)?
+            .ok_or(LifecycleError::UnknownReceipt)?;
+        if self.has_pending_intent(&fixture.action_id)? {
+            return Err(LifecycleError::Uncertain);
+        }
+        if fixture.status != "staged" {
+            return Err(LifecycleError::WrongState);
+        }
+        let slot = receipt_slot(receipt)?;
+        self.verify_fixture(&fixture, &self.holding_dir, &slot)?;
+        self.verify_directories()?;
+        self.record_intent(attempt, &fixture, "purge", Some(receipt))?;
+        if unlinkat(&self.holding_dir, &slot, AtFlags::empty()).is_err()
+            || sync_dir(&self.holding_dir).is_err()
+        {
+            // The unlink may or may not have occurred; the result cannot be
+            // established, so the receipt state becomes Uncertain.
+            return Err(self.uncertain_error(attempt, &fixture.action_id));
+        }
+        if self
+            .record_outcome(
+                attempt,
+                &fixture.action_id,
+                "permanently_removed",
+                Some(receipt),
+            )
+            .is_err()
+        {
+            return Err(self.uncertain_error(attempt, &fixture.action_id));
+        }
+        Ok(PurgeItemOutcome::PermanentlyRemoved {
+            receipt_id: receipt,
+            logical_bytes: fixture.bytes,
+        })
+    }
+
     pub fn snapshot(&self) -> Result<SessionSnapshot, LifecycleError> {
         validate_schema(&self.db)?;
         validate_registry(&self.db)?;
@@ -593,6 +672,10 @@ impl FixtureLifecycle {
                 current.status == "staged"
                     && current.receipt_id == receipt.map(|v| typed_wire(&v)).transpose()?
             }
+            "purge" => {
+                current.status == "staged"
+                    && current.receipt_id == receipt.map(|v| typed_wire(&v)).transpose()?
+            }
             _ => false,
         };
         let pending: bool = tx.query_row(
@@ -648,6 +731,11 @@ impl FixtureLifecycle {
                     receipt.map(|v| typed_wire(&v)).transpose()?,
                     action
                 ],
+            )?;
+        } else if outcome == "permanently_removed" {
+            tx.execute(
+                "UPDATE fixtures SET status='permanently_removed' WHERE action_id=?1",
+                [&action],
             )?;
         }
         tx.commit()?;
@@ -1786,6 +1874,106 @@ mod tests {
             assert_eq!(preserved, 5, "all reserved rows must be preserved");
         }
     }
+    #[test]
+    fn purge_receipt_removes_staged_fixture_and_records_terminal_outcome() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        let logical_bytes = life.snapshot().unwrap().fixtures[0].bytes;
+        let outcome = life.purge_receipt(receipt, AttemptId::new()).unwrap();
+        assert_eq!(
+            outcome,
+            PurgeItemOutcome::PermanentlyRemoved {
+                receipt_id: receipt,
+                logical_bytes
+            }
+        );
+        let slot = receipt_slot(receipt).unwrap();
+        assert!(open_regular(&life.holding_dir, &slot).is_err());
+        let recorded: String = life
+            .db
+            .query_row(
+                "SELECT outcome FROM attempts WHERE operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, "permanently_removed");
+        let snap = life.snapshot().unwrap();
+        assert_eq!(snap.fixtures[0].status, FixtureStatus::PermanentlyRemoved);
+        assert_eq!(snap.fixtures[0].receipt_id, Some(receipt));
+        assert_eq!(snap.fixtures[1].status, FixtureStatus::Available);
+        let sid = life.session_id();
+        drop(life);
+        let (mut reopened, view) = FixtureLifecycle::reopen(parent.path(), sid).unwrap();
+        assert_eq!(view.fixtures[0].status, FixtureStatus::PermanentlyRemoved);
+        assert!(matches!(
+            reopened.restore(receipt, AttemptId::new()),
+            Err(LifecycleError::WrongState)
+        ));
+    }
+
+    #[test]
+    fn purge_receipt_refuses_non_staged_unknown_or_changed_targets_without_mutation() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        // Unknown receipt: refused, nothing journaled.
+        assert!(matches!(
+            life.purge_receipt(ReceiptId::new(), AttemptId::new()),
+            Err(LifecycleError::UnknownReceipt)
+        ));
+        // Restored (not staged) receipt: refused as wrong state.
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.restore(receipt, AttemptId::new()).unwrap();
+        assert!(matches!(
+            life.purge_receipt(receipt, AttemptId::new()),
+            Err(LifecycleError::WrongState)
+        ));
+        // Changed content: refused before any intent, file kept, state kept.
+        let receipt2 = life.stage(ids[1], AttemptId::new()).unwrap();
+        let slot = receipt_slot(receipt2).unwrap();
+        {
+            // Overwrite the first bytes in place (no truncate) via a
+            // write-capable handle: same size, different digest.
+            let path = life.root.join("holding").join(&slot);
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).unwrap();
+            std::io::Write::write_all(&mut file, b"TAMPERED").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(matches!(
+            life.purge_receipt(receipt2, AttemptId::new()),
+            Err(LifecycleError::Changed)
+        ));
+        let purge_attempts: i64 = life
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM attempts WHERE operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(purge_attempts, 0, "no purge intent may be journaled");
+        assert!(open_regular(&life.holding_dir, &slot).is_ok());
+        // The database row is unchanged; the snapshot honestly reports the
+        // tampered file as Changed (the tamper is real and must be visible).
+        let stored_status: String = life
+            .db
+            .query_row(
+                "SELECT status FROM fixtures WHERE action_id=?1",
+                [encode_action(&ids[1]).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_status, "staged");
+        assert_eq!(
+            life.snapshot().unwrap().fixtures[1].status,
+            FixtureStatus::Changed
+        );
+    }
+
     #[test]
     fn stage_restore_reopen_and_fixed_five_files() {
         let parent = tempfile::tempdir().unwrap();
