@@ -114,6 +114,9 @@ fn single_component(name: &str) -> bool {
         && components.next().is_none()
 }
 
+// Only the unix rename implementation and the unix-gated tests call this;
+// on other hosts neither is compiled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn revalidation_outcome(
     before_dev: i128,
     before_ino: i128,

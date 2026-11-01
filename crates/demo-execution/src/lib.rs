@@ -938,6 +938,12 @@ impl DemoExecutionService {
             });
         }
         if self.lifecycle.is_none() {
+            // Contract fixture-runtime-schema-v2: the owner lease must be held
+            // for the complete reopen, since reopen may perform the v1->v2
+            // write migration. A poisoned service has released the lease, so
+            // refuse instead of migrating leaseless. (With the lifecycle
+            // handle still held, status() stays usable after a poison.)
+            self.ensure_active()?;
             let id: SessionId = serde_json::from_str(&sid.ok_or(DemoError::CorruptData)?)
                 .map_err(|_| DemoError::CorruptData)?;
             let (lifecycle, _) = FixtureLifecycle::reopen(&self.root, id).map_err(map_lifecycle)?;
@@ -1540,7 +1546,12 @@ fn to_demo_fixture(f: FixtureSnapshot) -> DemoFixture {
     }
 }
 
-#[cfg(test)]
+// Every test drives DemoExecutionService::open, which acquires the owner
+// lease — a Unix-only mechanism by design (non-unix returns
+// SessionUnavailable). Gate the whole module the same way acquire_lease is
+// gated, so cross-platform `cargo test --workspace` exercises exactly the
+// contracts that are portable.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::{
@@ -1555,6 +1566,25 @@ mod tests {
         service.start_demo().expect("create disposable fixture");
         let plan = service.plan.get_plan().expect("plan");
         (dir, service, plan)
+    }
+
+    #[test]
+    fn status_refuses_to_reopen_fixtures_without_owner_lease() {
+        // The fixture-runtime-schema-v2 contract requires the owner lease to
+        // be held for the complete reopen, because reopen may now perform the
+        // v1->v2 write migration. After a poison released the lease, status()
+        // must refuse to lazily reopen the fixtures instead of migrating
+        // leaseless. (With the lifecycle handle still held, status() remains
+        // usable after a poison so the UI can show the uncertain state.)
+        let (_dir, mut service, _plan) = fixture_service();
+        service.poisoned = true;
+        service.lease.take();
+        service.lifecycle = None;
+        assert_eq!(
+            service.status().unwrap_err(),
+            DemoError::NeedsInspection,
+            "leaseless reopen must be refused, not performed"
+        );
     }
 
     fn include_one(service: &mut DemoExecutionService, plan: &PlanView) -> PlanView {
