@@ -151,3 +151,6 @@ M1C migration experiment verified on disposable databases: five tests pass, with
 
 
 PR7 contains the isolated migration experiment (b2a9984). A proposed fixture-purge contract now describes receipt-only low-level APIs, exact separate review/confirmation, unchanged non-executable general-editor authority, ledger/intent ordering, uncertainty/restore rules, residual unlink races and separate space observations. It is not implemented or frozen. No permanent-removal API or runtime migration is enabled.
+
+
+Autonomous work paused at the requested quota boundary: Codex usage reached76% (24% remaining), and the heartbeat was set toPAUSED. The isolated0.0.9 runtime-schema work passed131 workspace tests and five standalone migration tests plus strictClippy, but remains a local checkpoint pending final review and native startup verification. No purge API or user-file cleanup is enabled. Resume state and exact worktree/next steps are in .autonomous/disk-steward/progress.md.
