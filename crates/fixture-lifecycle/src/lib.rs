@@ -1015,6 +1015,10 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
                 "stage" if status == "available" || status == "restored" => {}
                 "restore"
                     if status == "staged" && receipt.as_deref() == Some(receipt_id.as_str()) => {}
+                // A pending purge intent claims a still-staged receipt; the
+                // crash leaves the outcome unknown until inspection.
+                "purge"
+                    if status == "staged" && receipt.as_deref() == Some(receipt_id.as_str()) => {}
                 _ => return Err(LifecycleError::InvalidSession),
             }
         }
@@ -2023,6 +2027,47 @@ mod tests {
             life.restore(receipt, AttemptId::new()),
             Err(LifecycleError::WrongState)
         ));
+    }
+
+    #[test]
+    fn purge_intent_crash_reopens_uncertain_without_retry_or_success_claim() {
+        // Simulate a crash between the durable purge intent and the unlink:
+        // journal the intent directly (the same private API purge_receipt
+        // uses), drop the process handle, and reopen.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        let fixture = life.lookup_receipt(receipt).unwrap().unwrap();
+        life.record_intent(AttemptId::new(), &fixture, "purge", Some(receipt))
+            .unwrap();
+        let sid = life.session_id();
+        drop(life);
+
+        let (mut reopened, view) = FixtureLifecycle::reopen(parent.path(), sid).unwrap();
+        assert_eq!(view.fixtures[0].status, FixtureStatus::Uncertain);
+        // The file was never unlinked and stays untouched in holding.
+        let slot = receipt_slot(receipt).unwrap();
+        assert!(open_regular(&reopened.holding_dir, &slot).is_ok());
+        // No automatic resolution, retry, or restore until inspection.
+        assert!(matches!(
+            reopened.restore(receipt, AttemptId::new()),
+            Err(LifecycleError::Uncertain)
+        ));
+        assert!(matches!(
+            reopened.purge_receipt(receipt, AttemptId::new()),
+            Err(LifecycleError::Uncertain)
+        ));
+        // The pending intent row is preserved exactly as the crash left it.
+        let pending: i64 = reopened
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM attempts WHERE outcome='intent' AND operation='purge'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "intent row must survive untouched");
     }
 
     #[test]
