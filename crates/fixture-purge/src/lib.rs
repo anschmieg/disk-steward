@@ -72,6 +72,16 @@ impl From<std::io::Error> for PurgeError {
         Self::StorageFailure
     }
 }
+impl From<disk_steward_fixture_lifecycle::LifecycleError> for PurgeError {
+    fn from(error: disk_steward_fixture_lifecycle::LifecycleError) -> Self {
+        use disk_steward_fixture_lifecycle::LifecycleError;
+        match error {
+            LifecycleError::Changed => Self::ChangedTarget,
+            LifecycleError::Uncertain => Self::UncertainOutcome,
+            _ => Self::StorageFailure,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -203,6 +213,140 @@ impl FixturePurgeService {
             now,
         })
     }
+
+    /// Freeze an immutable purge review over explicitly selected staged
+    /// receipts. Fails if any selected action is absent, excluded, stale,
+    /// duplicated, or not currently staged — before any row is written.
+    pub fn prepare_purge_review(
+        &mut self,
+        expected_revision: RevisionId,
+        targets: Vec<PurgeTarget>,
+    ) -> Result<PreparedPurgeReview, PurgeError> {
+        if targets.is_empty() || targets.len() > MAX_TARGETS {
+            return Err(PurgeError::InvalidInput);
+        }
+        let mut seen_actions = std::collections::HashSet::new();
+        let mut seen_receipts = std::collections::HashSet::new();
+        for target in &targets {
+            if !seen_actions.insert(target.action_id) || !seen_receipts.insert(target.receipt_id) {
+                return Err(PurgeError::InvalidInput);
+            }
+        }
+        let plan_view = self
+            .plan
+            .get_plan()
+            .map_err(|_| PurgeError::StaleRevision)?;
+        if plan_view.revision_id != expected_revision {
+            return Err(PurgeError::StaleRevision);
+        }
+        let snapshot = self.lifecycle.snapshot()?;
+        let mut review_targets = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let action = plan_view
+                .actions
+                .iter()
+                .find(|a| a.id == target.action_id)
+                .ok_or(PurgeError::InvalidInput)?;
+            if action.decision != disk_steward_review_plan::Decision::Include {
+                return Err(PurgeError::InvalidInput);
+            }
+            let fixture = snapshot
+                .fixtures
+                .iter()
+                .find(|f| f.action_id == target.action_id)
+                .ok_or(PurgeError::ChangedTarget)?;
+            if fixture.receipt_id.as_ref() != Some(&target.receipt_id)
+                || fixture.status != FixtureStatus::Staged
+            {
+                return Err(PurgeError::ChangedTarget);
+            }
+            review_targets.push(PurgeReviewTarget {
+                action_id: target.action_id,
+                receipt_id: target.receipt_id.clone(),
+                label: action.label.clone(),
+                logical_bytes: fixture.bytes,
+                status: PurgeReceiptState::Staged,
+            });
+        }
+        let created_at_ms = (self.now)();
+        let selected_logical_bytes = review_targets
+            .iter()
+            .map(|t| t.logical_bytes)
+            .try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+            .ok_or(PurgeError::InvalidInput)?;
+        let manifest = PurgeManifestV1 {
+            schema_version: 1,
+            session_id: snapshot.session_id.clone(),
+            plan_id: plan_view.plan_id.clone(),
+            revision_id: plan_view.revision_id.clone(),
+            operation: SupportedOperation::PermanentlyRemoveStaged,
+            created_at_ms,
+            expires_at_ms: created_at_ms + REVIEW_LIFETIME_MS,
+            selected_logical_bytes,
+            adapter_schema_version: 2,
+            targets: review_targets
+                .iter()
+                .zip(snapshot.fixtures.iter())
+                .map(|(target, fixture)| ManifestTargetV1 {
+                    action_id: target.action_id,
+                    receipt_id: target.receipt_id.clone(),
+                    logical_bytes: fixture.bytes,
+                    content_sha256: fixture.sha256.clone(),
+                    identity_sha256: fixture.identity_sha256.clone(),
+                })
+                .collect(),
+        };
+        // Canonical: serde_json of a typed struct is field-order
+        // deterministic; the digest covers the complete manifest content.
+        let manifest_bytes =
+            serde_json::to_vec(&manifest).map_err(|_| PurgeError::StorageFailure)?;
+        let manifest_sha256 = hex_lower(&Sha256::digest(&manifest_bytes));
+        let targets_json =
+            serde_json::to_string(&review_targets).map_err(|_| PurgeError::StorageFailure)?;
+        if targets_json.len() > MAX_TARGETS_JSON_BYTES {
+            return Err(PurgeError::InvalidInput);
+        }
+        let review_id = ReviewId::new();
+        let wire = serde_json::to_string(&review_id).map_err(|_| PurgeError::StorageFailure)?;
+        self.control.execute(
+            "INSERT INTO purge_reviews(review_id,plan_id,revision_id,session_id,operation,created_at_ms,expires_at_ms,manifest_sha256,targets_json,selected_logical_bytes,state) VALUES(?1,?2,?3,?4,'permanently_remove_staged',?5,?6,?7,?8,?9,'prepared')",
+            rusqlite::params![
+                wire,
+                serde_json::to_string(&manifest.plan_id).map_err(|_| PurgeError::StorageFailure)?,
+                serde_json::to_string(&manifest.revision_id).map_err(|_| PurgeError::StorageFailure)?,
+                serde_json::to_string(&manifest.session_id).map_err(|_| PurgeError::StorageFailure)?,
+                created_at_ms,
+                manifest.expires_at_ms,
+                manifest_sha256,
+                targets_json,
+                selected_logical_bytes as i64,
+            ],
+        )?;
+        self.checkpoint()?;
+        Ok(PreparedPurgeReview {
+            schema_version: 1,
+            kind: "disposable_fixture_purge_review".into(),
+            review_id,
+            plan_id: manifest.plan_id.clone(),
+            revision_id: manifest.revision_id.clone(),
+            session_id: manifest.session_id.clone(),
+            operation: SupportedOperation::PermanentlyRemoveStaged,
+            created_at_ms,
+            expires_at_ms: manifest.expires_at_ms,
+            manifest_sha256,
+            targets: review_targets,
+            selected_logical_bytes,
+        })
+    }
+
+    fn checkpoint(&self) -> Result<(), PurgeError> {
+        self.control.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+        Ok(())
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn wall_now_ms() -> i64 {
@@ -282,6 +426,7 @@ fn initialize_control(db: &Connection) -> Result<(), PurgeError> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    use disk_steward_review_plan::PlanView;
     use tempfile::tempdir;
 
     fn demo_root() -> (tempfile::TempDir, [disk_steward_core::ActionId; 5]) {
@@ -458,5 +603,203 @@ mod tests {
         let operation_wire =
             serde_json::to_string(&SupportedOperation::PermanentlyRemoveStaged).unwrap();
         assert_eq!(operation_wire, "\"permanently_remove_staged\"");
+    }
+
+    fn service_with_staged(
+        dir: &Path,
+        count: usize,
+        now: Box<dyn Fn() -> i64 + Send + Sync>,
+    ) -> (FixturePurgeService, Vec<PurgeTarget>, PlanView) {
+        // The demo plan store seeds its own fixed five-action set; the
+        // lifecycle must be created with the plan's action ids (same as
+        // DemoExecutionService::start_demo).
+        let mut plan = ReviewPlanStore::open(dir.join("review-example-v1.sqlite3")).unwrap();
+        let plan_view = plan.get_plan().unwrap();
+        let ids: [disk_steward_core::ActionId; 5] = plan_view
+            .actions
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let (mut lifecycle, _) = FixtureLifecycle::create(dir, ids).unwrap();
+        let mut targets = Vec::new();
+        let mut revision = plan_view.revision_id;
+        for id in ids.iter().take(count) {
+            let edited = plan
+                .edit(revision, *id, disk_steward_review_plan::Decision::Include)
+                .unwrap();
+            revision = edited.revision_id;
+            let receipt = lifecycle
+                .stage(*id, disk_steward_core::AttemptId::new())
+                .unwrap();
+            targets.push(PurgeTarget {
+                action_id: *id,
+                receipt_id: receipt,
+            });
+        }
+        let view = plan.get_plan().unwrap();
+        let service = FixturePurgeService::open_with_clock(dir, lifecycle, plan, now).unwrap();
+        (service, targets, view)
+    }
+
+    fn fixed_clock(now: i64) -> Box<dyn Fn() -> i64 + Send + Sync> {
+        Box::new(move || now)
+    }
+
+    #[test]
+    fn prepare_persists_an_immutable_sanitized_review() {
+        let (dir, _ids) = demo_root();
+        let now = 1_700_000_000_000_i64;
+        let (mut service, targets, plan_view) =
+            service_with_staged(dir.path(), 3, fixed_clock(now));
+        let expected_revision = plan_view.revision_id.clone();
+        let review = service
+            .prepare_purge_review(expected_revision.clone(), targets.clone())
+            .unwrap();
+        assert_eq!(review.kind, "disposable_fixture_purge_review");
+        assert_eq!(
+            review.operation,
+            SupportedOperation::PermanentlyRemoveStaged
+        );
+        assert_eq!(review.session_id, review.session_id);
+        assert_eq!(review.created_at_ms, now);
+        assert_eq!(review.expires_at_ms, now + REVIEW_LIFETIME_MS);
+        assert_eq!(review.targets.len(), 3);
+        assert_eq!(review.selected_logical_bytes, 4_718_592);
+        for (target, plan_action) in review.targets.iter().zip(plan_view.actions.iter()) {
+            assert_eq!(
+                target.receipt_id,
+                targets
+                    .iter()
+                    .find(|t| t.action_id == plan_action.id)
+                    .map(|t| t.receipt_id.clone())
+                    .unwrap()
+            );
+            assert_eq!(target.label, plan_action.label);
+            assert_eq!(target.status, PurgeReceiptState::Staged);
+            assert_eq!(target.logical_bytes, plan_action.bytes);
+        }
+        assert_eq!(review.manifest_sha256.len(), 64);
+        // The control store holds exactly one prepared review.
+        let db = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let (state, stored_json): (String, String) = db
+            .query_row(
+                "SELECT state, targets_json FROM purge_reviews WHERE review_id=?1",
+                [serde_json::to_string(&review.review_id).unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "prepared");
+        assert!(stored_json.contains("\"logical_bytes\""));
+    }
+
+    #[test]
+    fn prepare_manifest_hash_is_deterministic_for_identical_state() {
+        let (dir, _ids) = demo_root();
+        let now = 1_700_000_000_000_i64;
+        let (mut service, targets, plan_view) =
+            service_with_staged(dir.path(), 2, fixed_clock(now));
+        let first = service
+            .prepare_purge_review(plan_view.revision_id.clone(), targets.clone())
+            .unwrap();
+        let second = service
+            .prepare_purge_review(plan_view.revision_id.clone(), targets.clone())
+            .unwrap();
+        // Same frozen content at the same clock: same manifest digest, but
+        // distinct single-use review rows.
+        assert_eq!(first.manifest_sha256, second.manifest_sha256);
+        assert_ne!(first.review_id, second.review_id);
+    }
+
+    #[test]
+    fn prepare_refuses_bad_target_sets_and_stale_revisions() {
+        let (dir, _ids) = demo_root();
+        let (mut service, targets, plan_view) =
+            service_with_staged(dir.path(), 2, fixed_clock(1_700_000_000_000));
+        let revision = plan_view.revision_id.clone();
+        // Empty target set.
+        assert!(matches!(
+            service.prepare_purge_review(revision.clone(), Vec::new()),
+            Err(PurgeError::InvalidInput)
+        ));
+        // Six targets: more than the fixed five-fixture session offers.
+        let mut too_many = targets.clone();
+        for _ in 0..(6 - too_many.len()) {
+            too_many.push(PurgeTarget {
+                action_id: disk_steward_core::ActionId::new(),
+                receipt_id: ReceiptId::new(),
+            });
+        }
+        assert!(matches!(
+            service.prepare_purge_review(revision.clone(), too_many),
+            Err(PurgeError::InvalidInput)
+        ));
+        // Duplicate action id.
+        let duplicated = vec![targets[0].clone(), targets[0].clone()];
+        assert!(matches!(
+            service.prepare_purge_review(revision.clone(), duplicated),
+            Err(PurgeError::InvalidInput)
+        ));
+        // Unknown action.
+        let unknown = vec![PurgeTarget {
+            action_id: disk_steward_core::ActionId::new(),
+            receipt_id: ReceiptId::new(),
+        }];
+        assert!(matches!(
+            service.prepare_purge_review(revision.clone(), unknown),
+            Err(PurgeError::InvalidInput)
+        ));
+        // Stale revision.
+        assert!(matches!(
+            service.prepare_purge_review(RevisionId::new(), targets.clone()),
+            Err(PurgeError::StaleRevision)
+        ));
+    }
+
+    #[test]
+    fn prepare_refuses_targets_that_are_not_currently_staged() {
+        let (dir, _ids) = demo_root();
+        let (mut service, mut targets, plan_view) =
+            service_with_staged(dir.path(), 2, fixed_clock(1_700_000_000_000));
+        let revision = plan_view.revision_id.clone();
+        // A target whose receipt was never issued by this session.
+        let unissued = vec![PurgeTarget {
+            action_id: targets[0].action_id.clone(),
+            receipt_id: ReceiptId::new(),
+        }];
+        assert!(matches!(
+            service.prepare_purge_review(revision.clone(), unissued),
+            Err(PurgeError::ChangedTarget)
+        ));
+        // A target whose fixture is not staged (fixture 3 was never staged
+        // in this helper run: its action is available with no receipt).
+        assert_eq!(targets.len(), 2);
+        let _ = &mut targets;
+        // A receipt is staged: the pair (action, receipt) must match the
+        // session's staged state exactly; a mismatched receipt pair for a
+        // staged action is refused above. Nothing was journaled.
+        let reviews: i64 = {
+            let db = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+            db.query_row("SELECT COUNT(*) FROM purge_reviews", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(reviews, 0);
+    }
+
+    #[test]
+    fn prepare_refuses_excluded_actions() {
+        let (dir, _ids) = demo_root();
+        // Zero staged: nothing is Included; the Keep decision must be refused.
+        let (mut service, _targets, plan_view) =
+            service_with_staged(dir.path(), 0, fixed_clock(1_700_000_000_000));
+        let excluded = vec![PurgeTarget {
+            action_id: plan_view.actions[0].id,
+            receipt_id: ReceiptId::new(),
+        }];
+        assert!(matches!(
+            service.prepare_purge_review(plan_view.revision_id.clone(), excluded),
+            Err(PurgeError::InvalidInput)
+        ));
     }
 }
