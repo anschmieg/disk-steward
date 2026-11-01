@@ -1374,6 +1374,9 @@ fn sync_dir(dir: &File) -> Result<(), LifecycleError> {
     dir.sync_all()?;
     Ok(())
 }
+// `Collision` and `Uncertain` are constructed only by the unix rename
+// implementation below; other hosts fail closed with `Unsupported`.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Debug)]
 enum RenameFailure {
     Collision,
