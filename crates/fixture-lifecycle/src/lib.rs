@@ -41,6 +41,7 @@ pub enum FixtureStatus {
     Available,
     Staged,
     Restored,
+    PermanentlyRemoved,
     Uncertain,
     Changed,
 }
@@ -438,6 +439,10 @@ impl FixtureLifecycle {
             };
             let status = if state == "uncertain" || self.has_pending_intent(&action)? {
                 FixtureStatus::Uncertain
+            } else if state == "permanently_removed" {
+                // Terminal state: the holding file is expected to be gone,
+                // so file verification must not run.
+                FixtureStatus::PermanentlyRemoved
             } else if self.verify_fixture(&expected, dir, &location).is_err() {
                 FixtureStatus::Changed
             } else {
@@ -777,6 +782,7 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
         match fixture.status.as_str() {
             "available" if fixture.receipt_id.is_none() => {}
             "staged" | "restored" if fixture.receipt_id.is_some() => {}
+            "permanently_removed" if fixture.receipt_id.is_some() => {}
             "uncertain" => {}
             _ => return Err(LifecycleError::InvalidSession),
         }
@@ -849,6 +855,10 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
             "restore" => matches!(
                 outcome.as_str(),
                 "intent" | "restored" | "collision" | "uncertain"
+            ),
+            "purge" => matches!(
+                outcome.as_str(),
+                "intent" | "permanently_removed" | "uncertain"
             ),
             _ => false,
         };
@@ -1656,6 +1666,48 @@ mod tests {
             .join("holding")
             .join(receipt_slot(staged).unwrap())
             .exists());
+    }
+
+    #[test]
+    fn stored_permanently_removed_status_maps_to_snapshot_and_validates() {
+        // Once the purge primitive (Task 2) records the terminal state, a
+        // stored 'permanently_removed' fixture row must validate and map to
+        // FixtureStatus::PermanentlyRemoved — never to Changed, because the
+        // holding file is expected to be gone. Simulated here by direct SQL
+        // on a staged session, exactly as the terminal outcome will store it.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.db
+            .execute(
+                "UPDATE fixtures SET status='permanently_removed' WHERE status='staged'",
+                [],
+            )
+            .unwrap();
+        life.db
+            .execute(
+                "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'permanently_removed')",
+                params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[0]).unwrap(), typed_wire(&receipt).unwrap()],
+            )
+            .unwrap();
+        let snapshot = life.snapshot().unwrap();
+        assert_eq!(
+            snapshot.fixtures[0].status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        assert_eq!(snapshot.fixtures[0].receipt_id, Some(receipt));
+        // The purge operation with a non-terminal stage outcome stays rejected.
+        life.db
+            .execute(
+                "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'purge',?3,'staged')",
+                params![typed_wire(&AttemptId::new()).unwrap(), encode_action(&ids[1]).unwrap(), Option::<String>::None],
+            )
+            .unwrap();
+        assert!(matches!(
+            life.snapshot(),
+            Err(LifecycleError::InvalidSession)
+        ));
     }
 
     #[test]

@@ -1370,6 +1370,7 @@ impl FixtureStatusText for FixtureSnapshot {
             FixtureStatus::Available => "available",
             FixtureStatus::Staged => "staged",
             FixtureStatus::Restored => "restored",
+            FixtureStatus::PermanentlyRemoved => "permanently_removed",
             FixtureStatus::Uncertain => "uncertain",
             FixtureStatus::Changed => "changed",
         }
