@@ -148,3 +148,6 @@ PR6 folder metadata checkpoint4e49476 is pushed. Work starts on feat/m1c-purge-s
 
 
 M1C migration experiment verified on disposable databases: five tests pass, with real stage/restore/restage history, empty history, separately simulated uncertain and pending-intent states, four injected transaction rollback points, exact rowid/order preservation (including gaps), and independent refusal/preservation of unknown objects, future versions and malformed typed IDs/digests. Strict Clippy/fmt and frontend build/version guard pass. This is not runtime migration or process-crash/WAL durability proof, and it exposes no purge API. The last native application verification remains0.0.7; the0.0.8 changes add the isolated probe, matching version fields and developer version checks only. M1C and M1B remain In progress.
+
+
+PR7 contains the isolated migration experiment (b2a9984). A proposed fixture-purge contract now describes receipt-only low-level APIs, exact separate review/confirmation, unchanged non-executable general-editor authority, ledger/intent ordering, uncertainty/restore rules, residual unlink races and separate space observations. It is not implemented or frozen. No permanent-removal API or runtime migration is enabled.
