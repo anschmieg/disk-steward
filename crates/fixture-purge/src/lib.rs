@@ -216,7 +216,8 @@ impl FixturePurgeService {
         if !root.is_dir() {
             return Err(PurgeError::StorageFailure);
         }
-        let control = open_control_db(&root)?;
+        let mut control = open_control_db(&root)?;
+        recover_unfinished_executions(&mut control, (now)())?;
         Ok(Self {
             control,
             lifecycle,
@@ -691,6 +692,27 @@ struct StoredReview {
 
 fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Owner recovery, run once per open: a claimed-but-started execution whose
+/// child outcomes never became durable is resolved to `uncertain`, and its
+/// pending child rows become `uncertain` with it. Recovery reads only exact
+/// journal rows; it never retries the unlink, never scans directories, and
+/// never deletes. The review stays claimed — replay is refused; a fresh
+/// review is required for any new action. Idempotent: terminal executions
+/// are untouched.
+fn recover_unfinished_executions(db: &mut Connection, now: i64) -> Result<(), PurgeError> {
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "UPDATE purge_executions SET state='uncertain', finished_at_ms=COALESCE(finished_at_ms, ?1) WHERE state='started'",
+        rusqlite::params![now],
+    )?;
+    tx.execute(
+        "UPDATE purge_child_attempts SET state='uncertain' WHERE state='pending' AND execution_id IN (SELECT execution_id FROM purge_executions WHERE state='uncertain')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn wall_now_ms() -> i64 {
@@ -1344,5 +1366,131 @@ mod tests {
             .claim_and_execute(review.review_id, |_| true)
             .unwrap_err();
         assert_eq!(error.code(), "review_replayed");
+    }
+
+    #[test]
+    fn recovery_marks_claimed_unfinished_executions_uncertain() {
+        // Simulate a crash after the claim but before any item outcome:
+        // review claimed, execution started, child rows pending. On reopen,
+        // recovery must mark them uncertain — no retry, no replay, no
+        // success claim — while a fresh review for the same receipts remains
+        // possible (contract: a later fresh review is required for any new
+        // action).
+        let (dir, _ids) = demo_root();
+        let (mut service, targets, plan_view) =
+            service_with_staged(dir.path(), 2, fixed_clock(1_700_000_000_000));
+        let review = service
+            .prepare_purge_review(plan_view.revision_id, targets.clone())
+            .unwrap();
+        let review_wire = serde_json::to_string(&review.review_id).unwrap();
+        let execution_wire = serde_json::to_string(&disk_steward_core::ExecutionId::new()).unwrap();
+        {
+            // Fabricate the claimed-but-unfinished state by hand.
+            let db = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+            db.execute(
+                "UPDATE purge_reviews SET state='claimed' WHERE review_id=?1",
+                [&review_wire],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO purge_executions(execution_id,review_id,session_id,started_at_ms,state) VALUES(?1,?2,?3,?4,'started')",
+                rusqlite::params![
+                    execution_wire,
+                    review_wire,
+                    serde_json::to_string(&review.session_id).unwrap(),
+                    1_700_000_000_000_i64
+                ],
+            )
+            .unwrap();
+            for target in &targets {
+                db.execute(
+                    "INSERT INTO purge_child_attempts(execution_id,attempt_id,action_id,receipt_id,state) VALUES(?1,?2,?3,?4,'pending')",
+                    rusqlite::params![
+                        execution_wire,
+                        serde_json::to_string(&disk_steward_core::AttemptId::new()).unwrap(),
+                        serde_json::to_string(&target.action_id).unwrap(),
+                        serde_json::to_string(&target.receipt_id).unwrap()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        // Reopen: recovery must resolve the crash state.
+        let (lifecycle, _) = reopen_lifecycle(dir.path());
+        let plan = ReviewPlanStore::open(dir.path().join("review-example-v1.sqlite3")).unwrap();
+        let mut _recovered = FixturePurgeService::open(dir.path(), lifecycle, plan).unwrap();
+        let db = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let execution_state: String = db
+            .query_row(
+                "SELECT state FROM purge_executions WHERE execution_id=?1",
+                [&execution_wire],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(execution_state, "uncertain");
+        let pending: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM purge_child_attempts WHERE state='pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "recovery resolves every pending child row");
+        let child_states: String = db
+            .query_row(
+                "SELECT GROUP_CONCAT(DISTINCT state) FROM purge_child_attempts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_states, "uncertain");
+        // The files were never touched by recovery.
+        for target in &targets {
+            let receipt_wire = serde_json::to_string(&target.receipt_id).unwrap();
+            assert!(holding_slot_for(dir.path(), &receipt_wire).exists());
+        }
+        // Replay of the crashed review is refused.
+        let error = _recovered
+            .claim_and_execute(review.review_id, |_| true)
+            .unwrap_err();
+        assert_eq!(error.code(), "review_replayed");
+        // A fresh review for the same receipts is still possible.
+        let fresh = _recovered
+            .prepare_purge_review(plan_view.revision_id, targets.clone())
+            .unwrap();
+        assert_ne!(fresh.review_id, review.review_id);
+    }
+
+    #[test]
+    fn recovery_leaves_terminal_executions_untouched() {
+        // A finished execution must survive reopen exactly as it was.
+        let (dir, _ids) = demo_root();
+        let (mut service, targets, plan_view) =
+            service_with_staged(dir.path(), 1, fixed_clock(1_700_000_000_000));
+        let review = service
+            .prepare_purge_review(plan_view.revision_id, targets.clone())
+            .unwrap();
+        let result = service
+            .claim_and_execute(review.review_id, |_| true)
+            .unwrap();
+        assert_eq!(result.state, "finished");
+        let db = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        drop(db);
+        let (lifecycle, _) = reopen_lifecycle(dir.path());
+        let plan = ReviewPlanStore::open(dir.path().join("review-example-v1.sqlite3")).unwrap();
+        let mut _recovered = FixturePurgeService::open(dir.path(), lifecycle, plan).unwrap();
+        let db = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let execution_state: String = db
+            .query_row("SELECT state FROM purge_executions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(execution_state, "finished");
+        let children: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM purge_child_attempts WHERE state='permanently_removed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 1);
     }
 }
