@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-global-exclusion"
+description = "Enables the add_global_exclusion command without any pre-configured scope."
+commands.allow = ["add_global_exclusion"]
+
+[[permission]]
+identifier = "deny-add-global-exclusion"
+description = "Denies the add_global_exclusion command without any pre-configured scope."
+commands.deny = ["add_global_exclusion"]
