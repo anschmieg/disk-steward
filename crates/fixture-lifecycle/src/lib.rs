@@ -681,6 +681,11 @@ impl FixtureLifecycle {
             },
         )?)
     }
+    /// Journal an attempt intent. If the post-commit WAL checkpoint fails,
+    /// the intent is already durable but the error is returned as-is — the
+    /// stage/restore/purge callers treat this identically: any later
+    /// operation on the same action converges to `Uncertain` via the
+    /// pending-intent guard, and no purge unlink can follow an intent error.
     fn record_intent(
         &mut self,
         attempt: AttemptId,
@@ -947,6 +952,7 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
     let mut issued_receipts = std::collections::HashSet::new();
     let mut restored_receipts = std::collections::HashSet::new();
     let mut uncertain_actions = std::collections::HashSet::new();
+    let mut purged_receipts = std::collections::HashSet::new();
     let mut attempts = db.prepare(
         "SELECT attempt_id, action_id, operation, receipt_id, outcome FROM attempts ORDER BY rowid",
     )?;
@@ -1013,11 +1019,11 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
                     return Err(LifecycleError::InvalidSession);
                 }
                 if outcome == "staged" {
-                    staged_receipts.insert((action_id.clone(), receipt));
+                    staged_receipts.insert((action_id.clone(), receipt.clone()));
                 }
             }
             ("restore", "restored") => {
-                let key = (action_id.clone(), receipt);
+                let key = (action_id.clone(), receipt.clone());
                 if !staged_receipts.contains(&key) {
                     return Err(LifecycleError::InvalidSession);
                 }
@@ -1032,6 +1038,9 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
                 if issued_receipts.contains(&(action_id.clone(), receipt.clone()))
                     && staged_receipts.contains(&(action_id.clone(), receipt.clone())) => {}
             _ => return Err(LifecycleError::InvalidSession),
+        }
+        if operation == "purge" && outcome == "permanently_removed" {
+            purged_receipts.insert((action_id.clone(), receipt.clone()));
         }
     }
     for (action, (status, receipt)) in fixture_state {
@@ -1058,8 +1067,13 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
                 let Some(ref id) = receipt else {
                     return Err(LifecycleError::InvalidSession);
                 };
+                // Terminal fixture state requires the full credible history:
+                // the receipt was issued, staged, and actually purged with a
+                // durable terminal outcome — stage history alone is not a
+                // removal claim.
                 if !issued_receipts.contains(&(action.clone(), id.clone()))
                     || !staged_receipts.contains(&(action.clone(), id.clone()))
+                    || !purged_receipts.contains(&(action.clone(), id.clone()))
                 {
                     return Err(LifecycleError::InvalidSession);
                 }
@@ -2252,6 +2266,33 @@ mod tests {
             ),
             "a purge row without stage history must fail closed"
         );
+    }
+
+    #[test]
+    fn permanently_removed_fixture_requires_a_terminal_purge_row() {
+        // A terminal fixture state must be backed by its terminal journal
+        // row: stage history alone cannot make a fixture permanently
+        // removed.
+        let parent = tempfile::tempdir().unwrap();
+        let ids = bindings();
+        let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+        let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+        life.db
+            .execute(
+                "UPDATE fixtures SET status='permanently_removed' WHERE action_id=?1",
+                [encode_action(&ids[0]).unwrap()],
+            )
+            .unwrap();
+        let sid = life.session_id();
+        drop(life);
+        assert!(
+            matches!(
+                FixtureLifecycle::reopen(parent.path(), sid),
+                Err(LifecycleError::InvalidSession)
+            ),
+            "permanently_removed without a purge journal row must fail closed"
+        );
+        let _ = receipt;
     }
 
     #[test]

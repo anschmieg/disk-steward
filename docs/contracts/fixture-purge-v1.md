@@ -1,6 +1,6 @@
 # Disposable fixture purge contract v1
 
-**Status: proposed, not implemented.** This draft specifies a future backend lifecycle for permanently removing only explicitly selected, app-created fixture files from the five-file disposable session. It does not enable purge, change the current runtime, or establish M1C completion. M0 and M1B human pilot gates remain open.
+**Status: lifecycle layer (batch A) implemented; service/control-store/confirmation/accounting layers remain proposed, not implemented.** This contract specifies a backend lifecycle for permanently removing only explicitly selected, app-created fixture files from the five-file disposable session. `FixtureLifecycle::purge_receipt` now implements the per-item filesystem and journal semantics below (receipt-only addressing, double verification, intent-before-unlink, uncertain-on-unestablishable, terminal states, registry tamper-refusal). The review/claim/ledger service, the separate purge control database, native confirmation, accounting and controlled-volume measurement are not yet implemented, so purge still cannot be triggered end-to-end. M0 and M1B human pilot gates remain open.
 
 ## Scope and API boundary
 
