@@ -419,7 +419,10 @@ impl FixtureLifecycle {
         receipt: ReceiptId,
         attempt: AttemptId,
     ) -> Result<PurgeItemOutcome, LifecycleError> {
-        use rustix::fs::{unlinkat, AtFlags};
+        // Belt-and-braces for the destructive operation: no lifecycle
+        // instance can exist on unsupported hosts (create/reopen gate on
+        // this), but the purge path refuses before anything else regardless.
+        supported()?;
         validate_schema(&self.db)?;
         validate_registry(&self.db)?;
         let fixture = self
@@ -435,17 +438,32 @@ impl FixtureLifecycle {
         self.verify_fixture(&fixture, &self.holding_dir, &slot)?;
         self.verify_directories()?;
         self.record_intent(attempt, &fixture, "purge", Some(receipt))?;
+        self.complete_purge(receipt, attempt, &fixture, &slot)
+    }
+
+    /// Recheck, unlink, sync, and journal the terminal outcome. Split from
+    /// `purge_receipt` so each platform compiles exactly its own variant;
+    /// both are tail expressions, mirroring `open_regular`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn complete_purge(
+        &mut self,
+        receipt: ReceiptId,
+        attempt: AttemptId,
+        fixture: &Expected,
+        slot: &str,
+    ) -> Result<PurgeItemOutcome, LifecycleError> {
+        use rustix::fs::{unlinkat, AtFlags};
         // Contract: recheck immediately before the unlink. The intent write
         // takes time, so the verified identity is re-established here; a
         // failure means the receipt mutated between verification and unlink
         // and the outcome can no longer be established.
         if self
-            .verify_fixture(&fixture, &self.holding_dir, &slot)
+            .verify_fixture(fixture, &self.holding_dir, slot)
             .is_err()
         {
             return Err(self.uncertain_error(attempt, &fixture.action_id));
         }
-        if unlinkat(&self.holding_dir, &slot, AtFlags::empty()).is_err()
+        if unlinkat(&self.holding_dir, slot, AtFlags::empty()).is_err()
             || sync_dir(&self.holding_dir).is_err()
         {
             // The unlink may or may not have occurred; the result cannot be
@@ -467,6 +485,22 @@ impl FixtureLifecycle {
             receipt_id: receipt,
             logical_bytes: fixture.bytes,
         })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn complete_purge(
+        &mut self,
+        receipt: ReceiptId,
+        attempt: AttemptId,
+        fixture: &Expected,
+        slot: &str,
+    ) -> Result<PurgeItemOutcome, LifecycleError> {
+        // Unreachable in practice: no lifecycle instance can exist on
+        // unsupported hosts. If one ever did, the journaled intent must
+        // become uncertain — no platform may claim success it cannot
+        // establish, and none of these hosts has an unlink implementation.
+        let _ = (receipt, slot);
+        Err(self.uncertain_error(attempt, &fixture.action_id))
     }
 
     pub fn snapshot(&self) -> Result<SessionSnapshot, LifecycleError> {
