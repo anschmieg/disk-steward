@@ -1007,7 +1007,7 @@ fn validate_migration_row_bounds(db: &Connection) -> Result<(), LifecycleError> 
     }
     Ok(())
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MigrationFault {
     None,
     AfterRename,
@@ -1429,6 +1429,48 @@ mod tests {
     fn bindings() -> [ActionId; 5] {
         std::array::from_fn(|_| ActionId::new())
     }
+    /// Complete contents of one table: every rowid with every column value,
+    /// in rowid order. Used to prove migration and rollback preserve data
+    /// exactly, not merely the fields the snapshot exposes.
+    type RowDump = Vec<(i64, Vec<rusqlite::types::Value>)>;
+    type DatabaseDump = Vec<(String, RowDump)>;
+    fn dump_table(db: &Connection, table: &str) -> RowDump {
+        let columns: Vec<String> = {
+            let mut stmt = db
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+                ))
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            !columns.is_empty(),
+            "table {table} missing or has no columns after operation"
+        );
+        let list = columns.join(",");
+        let mut stmt = db
+            .prepare(&format!("SELECT rowid,{list} FROM {table} ORDER BY rowid"))
+            .unwrap_or_else(|e| panic!("table {table} unreadable after operation: {e}"));
+        let mapped = stmt
+            .query_map([], |row| {
+                let rowid: i64 = row.get(0)?;
+                let values = (0..columns.len())
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i + 1))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((rowid, values))
+            })
+            .unwrap();
+        mapped.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+    fn dump_all(db: &Connection) -> DatabaseDump {
+        ["manifest", "fixtures", "attempts"]
+            .into_iter()
+            .map(|table| (table.to_owned(), dump_table(db, table)))
+            .collect()
+    }
     #[test]
     fn legacy_v1_migrates_with_rowid_gaps_and_old_receipt_remains_restorable() {
         let parent = tempfile::tempdir().unwrap();
@@ -1437,17 +1479,26 @@ mod tests {
         let first = life.stage(ids[0], AttemptId::new()).unwrap();
         life.restore(first, AttemptId::new()).unwrap();
         let staged = life.stage(ids[0], AttemptId::new()).unwrap();
+        let staged_b = life.stage(ids[1], AttemptId::new()).unwrap();
         life.db
             .execute_batch(
                 "UPDATE fixtures SET rowid=rowid+10000; UPDATE attempts SET rowid=rowid+10000;",
             )
             .unwrap();
         downgrade_to_v1(&life.db);
+        let before = dump_all(&life.db);
         let session = life.session_id();
         drop(life);
         let (mut migrated, snapshot) = FixtureLifecycle::reopen(parent.path(), session).unwrap();
+        assert_eq!(
+            dump_all(&migrated.db),
+            before,
+            "migration must preserve every rowid and every column of manifest, fixtures and attempts"
+        );
         assert_eq!(snapshot.fixtures[0].receipt_id, Some(staged));
         assert_eq!(snapshot.fixtures[0].status, FixtureStatus::Staged);
+        assert_eq!(snapshot.fixtures[1].receipt_id, Some(staged_b));
+        assert_eq!(snapshot.fixtures[1].status, FixtureStatus::Staged);
         migrated.restore(staged, AttemptId::new()).unwrap();
         assert_eq!(
             migrated.snapshot().unwrap().fixtures[0].status,
@@ -1457,9 +1508,15 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let (life, _) = FixtureLifecycle::create(parent.path(), bindings()).unwrap();
         downgrade_to_v1(&life.db);
+        let before = dump_all(&life.db);
         let id = life.session_id();
         drop(life);
-        let (_, empty) = FixtureLifecycle::reopen(parent.path(), id).unwrap();
+        let (reopened, empty) = FixtureLifecycle::reopen(parent.path(), id).unwrap();
+        assert_eq!(
+            dump_all(&reopened.db),
+            before,
+            "empty-session migration must also preserve the exact rowids and columns"
+        );
         assert!(empty
             .fixtures
             .iter()
@@ -1473,6 +1530,7 @@ mod tests {
         let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
         let staged = life.stage(ids[0], AttemptId::new()).unwrap();
         downgrade_to_v1(&life.db);
+        let baseline = dump_all(&life.db);
         for fault in [
             MigrationFault::AfterRename,
             MigrationFault::AfterCreate,
@@ -1495,11 +1553,21 @@ mod tests {
                     .unwrap(),
                 LEGACY_SCHEMA_VERSION
             );
+            assert_eq!(
+                dump_all(&life.db),
+                baseline,
+                "fault {fault:?} must roll back every rowid and column, not just user_version"
+            );
         }
         validate_schema_version(&life.db, LEGACY_SCHEMA_VERSION, true).unwrap();
         let id = life.session_id();
         drop(life);
         let (mut migrated, view) = FixtureLifecycle::reopen(parent.path(), id).unwrap();
+        assert_eq!(
+            dump_all(&migrated.db),
+            baseline,
+            "successful migration after earlier faults must preserve every rowid and column"
+        );
         assert_eq!(view.fixtures[0].receipt_id, Some(staged));
         migrated
             .db
