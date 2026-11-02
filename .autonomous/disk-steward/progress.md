@@ -493,3 +493,20 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 lateststack: PR49 integrates486fde0f8/mainba0b9ae; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current59/localnotes preserved/automationenabled.
 
 2026-11-03 PR50green/conflict integration: d0b38ca fourbuild/testSUCCESS/noinlinefindings, parentadvanced493d846bc; mergedparent resolvingonlyappend-onlyprogress/all datedentriesretained/noimplementationchange. FreshcurrentheadCIrequired/existingwatchpersists/current60preserved/automationenabled.
+2026-11-02 PR45mergedmainba0b9ae; PR46retargetedmain/integratedbaseline afterparent45ancestor+main sourceidentical verified; retainedreviewed46source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing46watchpersists/current57localnotes preserved/automationenabled.
+
+2026-11-03 PR46mergedmainf2734c5; PR47retargetedmain/integratedbaseline afterparent46ancestor+main sourceidentical verified; retainedreviewed47source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing47watchpersists/current58localnotes preserved/automationenabled.
+
+2026-11-03 lateststack: PR48 integrates47a37d6cc/mainf2734c5; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current59/localnotes preserved/automationenabled.
+2026-11-02 PR45mergedmainba0b9ae; PR46retargetedmain/integratedbaseline afterparent45ancestor+main sourceidentical verified; retainedreviewed46source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing46watchpersists/current57localnotes preserved/automationenabled.
+
+2026-11-03 PR47green/conflict integration: 8b0e61e fourbuild/testSUCCESS/noinlinefindings, parentadvanced46361b35c/mainba0b9ae; mergedparent resolvingonlyappend-onlyprogress/all datedentriesretained/noimplementationchange. FreshcurrentheadCIrequired/existingwatchpersists/current57localnotes preserved/automationenabled.
+2026-11-02 PR45mergedmainba0b9ae; PR46retargetedmain/integratedbaseline afterparent45ancestor+main sourceidentical verified; retainedreviewed46source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing46watchpersists/current57localnotes preserved/automationenabled.
+
+2026-11-03 PR46mergedmainf2734c5; PR47retargetedmain/integratedbaseline afterparent46ancestor+main sourceidentical verified; retainedreviewed47source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing47watchpersists/current58localnotes preserved/automationenabled.
+
+2026-11-03 PR47mergedmain3dc7190; PR48retargetedmain/integratedbaseline afterparent47ancestor+main sourceidentical verified; retainedreviewed48source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing48watchpersists/current60localnotes preserved/automationenabled.
+
+2026-11-03 lateststack: PR49 integrates4889fd136/main3dc7190; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current60/localnotes preserved/automationenabled.
+
+2026-11-03 PR50 integrates updated49 head1ec109b; conflict limited to appended progress, every dated entry retained. No implementation changes; diff check required, fresh current-head CI required before merge. Existing watch persists.
