@@ -52,6 +52,9 @@ export default function DemoLifecyclePanel({
   const [purgeResult, setPurgeResult] = useState<PurgeExecutionResult | null>(
     null,
   );
+  const [purgeLabels, setPurgeLabels] = useState<Map<string, string>>(
+    () => new Map(),
+  );
   const lastError = useRef<unknown>(null);
   const previousRevision = useRef(plan.revisionId);
   const busy = pending || planBusy;
@@ -294,6 +297,14 @@ export default function DemoLifecyclePanel({
     });
     if (completed) {
       setPurgeResult(completed.purge);
+      setPurgeLabels(
+        new Map(
+          purgePrepared.targets.map((target) => [
+            target.receiptId,
+            target.label,
+          ]),
+        ),
+      );
       setPurgePrepared(null);
       if (completed.latest) setStatus(completed.latest);
       if (!completed.latest || completed.purge.state !== "finished")
@@ -552,48 +563,13 @@ export default function DemoLifecyclePanel({
                   </button>
                 </div>
               )}
-              {purgeResult && (
-                <div className="stage-row">
-                  <div>
-                    <b>
-                      {purgeResult.state === "finished"
-                        ? "Removed permanently"
-                        : purgeResult.state === "partial"
-                          ? "Removal partially completed"
-                          : "Removal needs inspection"}
-                    </b>
-                    <span>
-                      {purgeResult.durablyUnlinkedLogicalBytes} of{" "}
-                      {purgeResult.selectedLogicalBytes} logical bytes removed.
-                      Logical bytes are not a promise of free-space recovery.
-                    </span>
-                    {purgeResult.state === "finished" && (
-                      <>
-                        <span>
-                          {purgeResult.volumeObservation
-                            ? `Observed volume free-space change: ${formatSignedBytes(purgeResult.volumeObservation.observedFreeSpaceDeltaBytes)}`
-                            : "Observed volume free-space change unavailable."}
-                        </span>
-                        {purgeResult.volumeObservation && (
-                          <small className="stage-help">
-                            Volume-wide observation; other writers, snapshots
-                            and delayed reclamation may affect it. This is not
-                            space attributed to these files.
-                          </small>
-                        )}
-                      </>
-                    )}
-                    {purgeResult.state !== "finished" && (
-                      <small className="stage-help">
-                        Some items need inspection before any further demo step.
-                      </small>
-                    )}
-                  </div>
-                </div>
-              )}
             </>
           )}
         </>
+      )}
+
+      {purgeResult && (
+        <PurgeOutcome result={purgeResult} labels={purgeLabels} />
       )}
 
       {prepared && (
@@ -726,6 +702,83 @@ function ExecutionOutcome({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function PurgeOutcome({
+  result,
+  labels,
+}: {
+  result: PurgeExecutionResult;
+  labels: Map<string, string>;
+}) {
+  return (
+    <div
+      className={`execution-outcome ${result.state}`}
+      role="status"
+      aria-label="Permanent removal result"
+    >
+      <div>
+        <div className="outcome-title">
+          <b>
+            {result.state === "finished"
+              ? "Removed permanently"
+              : result.state === "partial"
+                ? "Removal partially completed"
+                : "Removal needs inspection"}
+          </b>
+        </div>
+        <p>
+          {result.durablyUnlinkedLogicalBytes} of {result.selectedLogicalBytes}{" "}
+          logical bytes removed. Logical bytes are not a promise of free-space
+          recovery.
+        </p>
+        <div className="outcome-items">
+          {result.items.map((item) => {
+            const outcome = item.outcome;
+            const receiptId =
+              "permanently_removed" in outcome
+                ? outcome.permanently_removed.receipt_id
+                : "uncertain" in outcome
+                  ? outcome.uncertain.receipt_id
+                  : outcome.not_attempted.receipt_id;
+            const state =
+              "permanently_removed" in outcome
+                ? "Permanently removed"
+                : "uncertain" in outcome
+                  ? "Needs inspection"
+                  : "Not attempted";
+            return (
+              <div key={receiptId}>
+                <span>{labels.get(receiptId) ?? "Demo file"}</span>
+                <b>{state}</b>
+              </div>
+            );
+          })}
+        </div>
+        {result.state === "finished" && (
+          <>
+            <span>
+              {result.volumeObservation
+                ? `Observed volume free-space change: ${formatSignedBytes(result.volumeObservation.observedFreeSpaceDeltaBytes)}`
+                : "Observed volume free-space change unavailable."}
+            </span>
+            {result.volumeObservation && (
+              <small className="stage-help">
+                Volume-wide observation; other writers, snapshots and delayed
+                reclamation may affect it. This is not space attributed to these
+                files.
+              </small>
+            )}
+          </>
+        )}
+        {result.state !== "finished" && (
+          <small className="stage-help">
+            Some items need inspection before any further demo step.
+          </small>
+        )}
+      </div>
     </div>
   );
 }

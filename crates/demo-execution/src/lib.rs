@@ -2172,6 +2172,203 @@ mod tests {
     }
 
     #[test]
+    fn purge_revalidates_changed_receipt_after_confirmation_before_claim_or_unlink() {
+        let (dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let stage = service
+            .prepare_stage(plan.revision_id)
+            .expect("stage review");
+        service
+            .confirm_and_execute(stage.review_id, |_| true)
+            .expect("stage fixture");
+        let fixture_root = std::fs::read_dir(dir.path())
+            .expect("fixture root entries")
+            .find_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name.starts_with(".disk-steward-fixtures-")
+                    .then(|| dir.path().join(name))
+            })
+            .expect("fixture root");
+        let (action, receipt): (String, String) =
+            Connection::open(fixture_root.join("lifecycle.sqlite3"))
+                .expect("lifecycle db")
+                .query_row(
+                    "SELECT action_id,receipt_id FROM fixtures WHERE status='staged'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("staged fixture identity");
+        let action_id = serde_json::from_str(&action).expect("typed action");
+        let receipt_id = serde_json::from_str(&receipt).expect("typed receipt");
+        let review = service
+            .prepare_purge_review(
+                plan.revision_id,
+                vec![disk_steward_fixture_purge::PurgeTarget {
+                    action_id,
+                    receipt_id,
+                }],
+            )
+            .expect("purge review");
+        let receipt_component = receipt.trim_matches('"').rsplit(':').next().unwrap();
+        let staged_file = fixture_root
+            .join("holding")
+            .join(format!("receipt-{receipt_component}"));
+        let mut modified = fs::read(&staged_file).expect("read staged fixture bytes");
+        assert!(!modified.is_empty());
+        modified[0] ^= 1;
+        let original_len = modified.len();
+        let altered_first_byte = modified[0];
+        let modified_file = staged_file.clone();
+        let approvals_before: i64 = Connection::open(dir.path().join(LEDGER_DB))
+            .expect("ledger store")
+            .query_row("SELECT COUNT(*) FROM approvals", [], |row| row.get(0))
+            .expect("approval baseline");
+        let intents_before: i64 = Connection::open(dir.path().join(LEDGER_DB))
+            .expect("ledger store")
+            .query_row("SELECT COUNT(*) FROM execution_intents", [], |row| {
+                row.get(0)
+            })
+            .expect("intent baseline");
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| count.set(0));
+
+        let refused = service.confirm_purge_execution(review.review_id, move |_| {
+            fs::write(modified_file, &modified).expect("modify staged fixture during confirmation");
+            true
+        });
+
+        assert_eq!(refused.unwrap_err(), DemoError::FixtureChanged);
+        let remaining_bytes = fs::read(&staged_file).expect("changed file remains");
+        assert_eq!(remaining_bytes.len(), original_len);
+        assert_eq!(remaining_bytes[0], altered_first_byte);
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| assert_eq!(count.get(), 0));
+        let lifecycle = Connection::open(fixture_root.join("lifecycle.sqlite3")).unwrap();
+        let lifecycle_state: String = lifecycle
+            .query_row(
+                "SELECT status FROM fixtures WHERE action_id=?1",
+                [&action],
+                |row| row.get(0),
+            )
+            .expect("lifecycle status");
+        assert_eq!(lifecycle_state, "staged");
+        let purge_intents: i64 = lifecycle
+            .query_row(
+                "SELECT COUNT(*) FROM attempts WHERE operation='purge'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("no lifecycle purge intent");
+        assert_eq!(purge_intents, 0);
+
+        let purge_db = Connection::open(dir.path().join("fixture-purge-control-v1.sqlite3"))
+            .expect("purge control store");
+        let review_state: String = purge_db
+            .query_row(
+                "SELECT state FROM purge_reviews WHERE review_id=?1",
+                [wire(&review.review_id).unwrap()],
+                |row| row.get(0),
+            )
+            .expect("review state");
+        assert_eq!(review_state, "prepared", "the review must remain unclaimed");
+        let purge_executions: i64 = purge_db
+            .query_row("SELECT COUNT(*) FROM purge_executions", [], |row| {
+                row.get(0)
+            })
+            .expect("purge execution count");
+        assert_eq!(purge_executions, 0);
+        let approvals_after: i64 = Connection::open(dir.path().join(LEDGER_DB))
+            .expect("ledger store")
+            .query_row("SELECT COUNT(*) FROM approvals", [], |row| row.get(0))
+            .expect("approval count");
+        let intents_after: i64 = Connection::open(dir.path().join(LEDGER_DB))
+            .expect("ledger store")
+            .query_row("SELECT COUNT(*) FROM execution_intents", [], |row| {
+                row.get(0)
+            })
+            .expect("intent count");
+        assert_eq!(approvals_after, approvals_before);
+        assert_eq!(intents_after, intents_before);
+    }
+
+    #[test]
+    fn purge_revalidates_plan_revision_after_confirmation_before_claim() {
+        let (dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let stage = service
+            .prepare_stage(plan.revision_id)
+            .expect("stage review");
+        service
+            .confirm_and_execute(stage.review_id, |_| true)
+            .expect("stage fixture");
+        let fixture_root = std::fs::read_dir(dir.path())
+            .expect("fixture root entries")
+            .find_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name.starts_with(".disk-steward-fixtures-")
+                    .then(|| dir.path().join(name))
+            })
+            .expect("fixture root");
+        let (action, receipt): (String, String) =
+            Connection::open(fixture_root.join("lifecycle.sqlite3"))
+                .expect("lifecycle db")
+                .query_row(
+                    "SELECT action_id,receipt_id FROM fixtures WHERE status='staged'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("staged fixture identity");
+        let review = service
+            .prepare_purge_review(
+                plan.revision_id,
+                vec![disk_steward_fixture_purge::PurgeTarget {
+                    action_id: serde_json::from_str(&action).expect("typed action"),
+                    receipt_id: serde_json::from_str(&receipt).expect("typed receipt"),
+                }],
+            )
+            .expect("purge review");
+        let plan_path = dir.path().join(PLAN_DB);
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| count.set(0));
+        let refused = service.confirm_purge_execution(review.review_id, move |_| {
+            let mut other = ReviewPlanStore::open(plan_path).expect("second plan handle");
+            let current = other.get_plan().expect("current plan");
+            other
+                .edit(
+                    current.revision_id,
+                    current.actions[1].id,
+                    disk_steward_review_plan::Decision::Include,
+                )
+                .expect("edit during confirmation");
+            true
+        });
+        assert_eq!(refused.unwrap_err(), DemoError::StaleRevision);
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| assert_eq!(count.get(), 0));
+        let purge_db = Connection::open(dir.path().join("fixture-purge-control-v1.sqlite3"))
+            .expect("purge control store");
+        let review_state: String = purge_db
+            .query_row(
+                "SELECT state FROM purge_reviews WHERE review_id=?1",
+                [wire(&review.review_id).unwrap()],
+                |row| row.get(0),
+            )
+            .expect("review state");
+        assert_eq!(review_state, "prepared");
+        let purge_executions: i64 = purge_db
+            .query_row("SELECT COUNT(*) FROM purge_executions", [], |row| {
+                row.get(0)
+            })
+            .expect("purge execution count");
+        assert_eq!(purge_executions, 0);
+        let lifecycle = Connection::open(fixture_root.join("lifecycle.sqlite3")).unwrap();
+        let purge_intents: i64 = lifecycle
+            .query_row(
+                "SELECT COUNT(*) FROM attempts WHERE operation='purge'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("no lifecycle purge intent");
+        assert_eq!(purge_intents, 0);
+    }
+
+    #[test]
     fn self_consistent_manifest_tampering_cannot_select_a_kept_action() {
         let (_dir, mut service, plan) = fixture_service();
         let plan = include_one(&mut service, &plan);
