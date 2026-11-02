@@ -52,6 +52,17 @@ pub enum StoreState {
     NeedsReconciliation,
 }
 
+/// Read-only identities captured from a completed, dead creator process.
+#[derive(Clone, Debug)]
+pub struct AbandonedSnapshot {
+    pub token: String,
+    pub parent_id: (u64, u64),
+    pub root_id: (u64, u64),
+    pub journal_id: (u64, u64),
+    pub bound_pid: u32,
+    pub version: u32,
+}
+
 /// Process-local handle for one newly created private store.
 pub struct OwnedStore {
     parent_path: PathBuf,
@@ -142,6 +153,37 @@ impl OwnedStore {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub(crate) fn abandon_record(&self, pid: u32) -> Result<String, StoreError> {
+        if self.phase != Phase::Bound(pid) || pid == 0 {
+            return Err(StoreError::InvalidJournal);
+        }
+        let (journal_dev, journal_ino) = self.journal_id.ok_or(StoreError::InvalidJournal)?;
+        Ok(format!(
+            "v1\n{}\n{}:{}\n{}:{}\n{}:{}\n{}\nend\n",
+            self.token,
+            self.parent_id.0,
+            self.parent_id.1,
+            self.root_id.0,
+            self.root_id.1,
+            journal_dev,
+            journal_ino,
+            pid
+        ))
+    }
+
+    /// Reopen and inspect only a canonical fixture identified by a closed token.
+    pub fn inspect_abandoned(snapshot: &AbandonedSnapshot) -> Result<StoreState, StoreError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            inspect_abandoned_supported(snapshot)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = snapshot;
+            Err(StoreError::UnsupportedPlatform)
+        }
     }
 
     fn journal_contents(&self) -> String {
@@ -517,6 +559,84 @@ fn identity(fd: &impl std::os::fd::AsFd) -> Result<(u64, u64), StoreError> {
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
+pub(crate) fn valid_token(token: &str) -> bool {
+    if token.len() > 128 {
+        return false;
+    }
+    let parts: Vec<_> = token.split('-').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn inspect_abandoned_supported(snapshot: &AbandonedSnapshot) -> Result<StoreState, StoreError> {
+    use rustix::fs::{openat, OFlags};
+    use std::os::unix::fs::MetadataExt;
+    if snapshot.version != 1 || snapshot.bound_pid == 0 || !valid_token(&snapshot.token) {
+        return Err(StoreError::InvalidIdentity);
+    }
+    let temp = std::env::temp_dir().canonicalize()?;
+    let temp_fd = open_parent(&temp)?;
+    let dirname = format!("disk-steward-worker-{}", snapshot.token);
+    let parent = openat(
+        &temp_fd,
+        &dirname,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    validate_private_directory(&parent)?;
+    if identity(&parent)? != snapshot.parent_id {
+        return Err(StoreError::InvalidIdentity);
+    }
+    let root = openat(
+        &parent,
+        "store",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    validate_private_directory(&root)?;
+    if identity(&root)? != snapshot.root_id {
+        return Err(StoreError::InvalidIdentity);
+    }
+    let marker = openat(
+        &root,
+        "owner.journal",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )?;
+    let marker = File::from(marker);
+    let metadata = marker.metadata()?;
+    let marker_id = (metadata.dev(), metadata.ino());
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || marker_id != snapshot.journal_id
+    {
+        return Err(StoreError::InvalidJournal);
+    }
+    let expected = format!(
+        "disk-steward-worker-store-v1\n{}\n{}:{}\n{}:{}\nbound:{}\n",
+        snapshot.token,
+        snapshot.parent_id.0,
+        snapshot.parent_id.1,
+        snapshot.root_id.0,
+        snapshot.root_id.1,
+        snapshot.bound_pid
+    );
+    let mut bytes = Vec::new();
+    marker.take(512).read_to_end(&mut bytes)?;
+    if bytes != expected.as_bytes() {
+        return Err(StoreError::InvalidJournal);
+    }
+    Ok(StoreState::NeedsReconciliation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +894,24 @@ mod tests {
         assert!(store.cleanup_after_stopped(&receipt).is_err());
         assert_eq!(std::fs::read(path).unwrap(), pending);
         assert!(store.parent_path.join("store").is_dir());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fresh_descriptors_inspect_without_mutation_and_refuse_changed_marker() {
+        let mut store = OwnedStore::create().unwrap();
+        store.bind_worker(41).unwrap();
+        let snapshot =
+            crate::parse_abandoned_record(store.abandon_record(41).unwrap().as_bytes()).unwrap();
+        let marker = store.parent_path.join("store/owner.journal");
+        let before = std::fs::read(&marker).unwrap();
+        drop(store);
+        assert_eq!(
+            OwnedStore::inspect_abandoned(&snapshot).unwrap(),
+            StoreState::NeedsReconciliation
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), before);
+        std::fs::write(&marker, b"altered fixture journal\n").unwrap();
+        assert!(OwnedStore::inspect_abandoned(&snapshot).is_err());
+        assert_eq!(std::fs::read(marker).unwrap(), b"altered fixture journal\n");
     }
 }

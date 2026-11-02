@@ -60,6 +60,31 @@ fn store_worker_records_stopped_only_after_joined_child_shutdown() {
 }
 
 #[test]
+fn creator_process_death_allows_read_only_store_reinspection() {
+    let output = probe()
+        .arg("--run-store-reinspect")
+        .output()
+        .expect("reinspect fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("store_state=NeedsReconciliation"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("creator_stopped=true"), "{stdout}");
+    assert!(stdout.contains("reader_joined=true"), "{stdout}");
+    assert!(stdout.contains("cleanup=not_authorized"), "{stdout}");
+    assert!(
+        stdout.contains("process_death_not_power_loss=true"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn arbitrary_parent_arguments_are_rejected() {
     let output = probe()
         .arg("/bin/sh")
@@ -77,6 +102,8 @@ fn private_dispatcher_rejects_unknown_modes_and_extra_arguments() {
         vec!["--child", "stall", "unexpected"],
         vec!["--run", "unexpected"],
         vec!["--run-store-worker", "unexpected"],
+        vec!["--run-store-reinspect", "unexpected"],
+        vec!["--child", "store-abandon", "unexpected"],
         vec!["--run-store-cleanup"],
     ] {
         let output = probe()

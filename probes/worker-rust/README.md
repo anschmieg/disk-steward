@@ -53,6 +53,18 @@ there is no retry, reopen adoption, recursive deletion, or parent deletion.
 The command reports that the root was removed and names the retained journal;
 it does not estimate recovered bytes.
 
+`--run-store-reinspect` starts one copy of its own executable in the fixed
+`store-abandon` child mode. The child creates its own private fixture, binds its
+actual PID, emits a versioned path-free record capped at 1024 bytes, flushes,
+and exits without dropping the store handle. The parent captures only that
+bounded record within a one-second capture deadline, stops/reaps the creator,
+joins the reader, checks the child PID
+and record shape, then reopens only the canonical token-derived fixture using
+no-follow private-directory and journal identity checks. It reports
+`NeedsReconciliation` with `creator_stopped=true` and
+`cleanup=not_authorized`. This is ordinary process death, not power-loss or
+crash-durability evidence. It does not adopt the store or create a stop receipt.
+
 Descriptor-relative checks constrain the operation to this fixture, but they
 cannot eliminate races from a hostile process running as the same user between
 validation and unlink. Directory and file synchronization requests also do not
@@ -72,6 +84,7 @@ Run from the repository root:
 cargo run -p disk-steward-worker-probe
 cargo run -p disk-steward-worker-probe -- --run
 cargo run -p disk-steward-worker-probe -- --run-store-worker
+cargo run -p disk-steward-worker-probe -- --run-store-reinspect
 cargo run -p disk-steward-worker-probe -- --run-store-cleanup --confirm-own-store-cleanup
 cargo test -p disk-steward-worker-probe --locked
 ```
