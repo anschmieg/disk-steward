@@ -15,11 +15,21 @@ const READ_CHUNK: usize = 8192;
 enum Case {
     Flood,
     Stall,
+    Cancel,
 }
 
 impl Case {
     fn name(self) -> &'static str {
         match self {
+            Self::Flood => "flood",
+            Self::Stall => "stall",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    fn child_mode(self) -> &'static str {
+        match self {
+            Self::Cancel => "stall",
             Self::Flood => "flood",
             Self::Stall => "stall",
         }
@@ -30,6 +40,7 @@ impl Case {
 enum StopReason {
     OutputLimit,
     Deadline,
+    Canceled,
     ChildExited,
     ReaderError,
 }
@@ -67,12 +78,27 @@ fn run_parent(args: &[String]) -> Result<(), String> {
     match args {
         [] => {
             println!("Rust subprocess supervision probe (dry run; use --run to start fixed synthetic children)");
-            println!("Cases: bounded stdout flood and one-second stall deadline.");
+            println!("Cases: bounded stdout flood, one-second stall deadline, and explicit parent cancellation.");
             Ok(())
         }
         [flag] if flag == "--run" => {
-            for case in [Case::Flood, Case::Stall] {
+            for case in [Case::Flood, Case::Stall, Case::Cancel] {
                 let report = supervise(case)?;
+                let expected = match case {
+                    Case::Flood => (StopReason::OutputLimit, OUTPUT_LIMIT + 1),
+                    Case::Stall => (StopReason::Deadline, 1),
+                    Case::Cancel => (StopReason::Canceled, 1),
+                };
+                if (report.stop_reason, report.bytes_read) != expected {
+                    return Err(format!(
+                        "case={} produced stop={:?} bytes={}, expected stop={:?} bytes={}",
+                        report.case.name(),
+                        report.stop_reason,
+                        report.bytes_read,
+                        expected.0,
+                        expected.1
+                    ));
+                }
                 println!(
                     "case={} stop={:?} bytes={} elapsed_ms={} child_exit={} reader_joined={}",
                     report.case.name(),
@@ -125,7 +151,7 @@ fn supervise(case: Case) -> Result<Report, String> {
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
         .arg("--child")
-        .arg(case.name())
+        .arg(case.child_mode())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -159,7 +185,11 @@ fn supervise(case: Case) -> Result<Report, String> {
             };
         }
     };
-    let supervision = await_stop_reason(&mut child, &receiver, deadline);
+    let supervision = if case == Case::Cancel {
+        await_readiness(&receiver, deadline).map(|()| (StopReason::Canceled, None))
+    } else {
+        await_stop_reason(&mut child, &receiver, deadline)
+    };
     let (stop_reason, completed_reader) = match supervision {
         Ok(result) => result,
         Err(error) => {
@@ -197,6 +227,28 @@ fn supervise(case: Case) -> Result<Report, String> {
         child_exit,
         reader_joined,
     })
+}
+
+fn await_readiness(receiver: &Receiver<ReaderEvent>, deadline: Instant) -> Result<(), String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("outer deadline expired before fixed child signaled readiness".into());
+    }
+    match receiver.recv_timeout(remaining) {
+        Ok(ReaderEvent::Ready) => Ok(()),
+        Ok(ReaderEvent::Finished { failed: true, .. }) => {
+            Err("stdout reader failed before fixed child signaled readiness".into())
+        }
+        Ok(ReaderEvent::Finished { .. }) => {
+            Err("stdout closed before fixed child signaled readiness".into())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("outer deadline expired before fixed child signaled readiness".into())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("stdout reader stopped without a result".into())
+        }
+    }
 }
 
 fn await_stop_reason(
