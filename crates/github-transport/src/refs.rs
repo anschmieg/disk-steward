@@ -20,6 +20,49 @@ pub struct AdvertisedRef {
     /// Optional symref target, retained as raw bytes.
     symref_target: Option<Vec<u8>>,
 }
+
+/// Combined Git protocol and HTTP framing evidence for one `ls-refs` attempt.
+/// Advertised refs are available only when both layers completed successfully.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefObservationReport {
+    refs: Option<Vec<AdvertisedRef>>,
+    operation_error_kind: Option<io::ErrorKind>,
+    finalization: crate::HttpFinalizationReport,
+}
+
+impl RefObservationReport {
+    pub fn refs(&self) -> Option<&[AdvertisedRef]> {
+        self.refs.as_deref()
+    }
+    pub fn finalization(&self) -> &crate::HttpFinalizationReport {
+        &self.finalization
+    }
+    pub fn operation_error_kind(&self) -> Option<io::ErrorKind> {
+        self.operation_error_kind
+    }
+    pub fn is_complete(&self) -> bool {
+        self.refs.is_some()
+            && self.operation_error_kind.is_none()
+            && self.finalization.is_complete()
+    }
+}
+
+pub(super) fn observe_refs(t: GitHubTransport) -> io::Result<RefObservationReport> {
+    let mut t = t;
+    let result = read_advertised_refs(&mut t);
+    let finalization = t.finalize_http_framing()?;
+    let operation_error_kind = result.as_ref().err().map(io::Error::kind);
+    let refs = match result {
+        Ok(refs) if finalization.is_complete() => Some(refs),
+        _ => None,
+    };
+    Ok(RefObservationReport {
+        refs,
+        operation_error_kind,
+        finalization,
+    })
+}
+
 impl AdvertisedRef {
     pub fn name(&self) -> &[u8] {
         &self.name

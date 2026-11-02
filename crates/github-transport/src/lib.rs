@@ -5,7 +5,7 @@
 //! deadline. See the crate README for the current scope and limits.
 
 mod refs;
-pub use refs::AdvertisedRef;
+pub use refs::{AdvertisedRef, RefObservationReport};
 
 #[cfg(not(test))]
 use std::net::ToSocketAddrs;
@@ -465,8 +465,17 @@ pub struct GitHubTransport {
 }
 
 impl GitHubTransport {
-    /// Observe references advertised by Git protocol v2 `ls-refs`.
-    /// This is metadata only; HTTP response framing must still be finalized.
+    /// Observe references advertised by Git protocol v2 `ls-refs` and finalize
+    /// HTTP framing in the same consuming operation. Returned refs are present
+    /// only when both Git protocol parsing and HTTP framing completed. This is
+    /// backend metadata only; it does not validate Git objects or imply remote
+    /// retention. Prefer this API over the separate low-level stages.
+    pub fn observe_refs(self) -> io::Result<RefObservationReport> {
+        refs::observe_refs(self)
+    }
+
+    /// Low-level Git v2 `ls-refs` stage. Call `finalize_http_framing` afterward
+    /// and trust the advertised refs only when both stages succeed.
     pub fn read_advertised_refs(&mut self) -> io::Result<Vec<AdvertisedRef>> {
         refs::read_advertised_refs(self)
     }
@@ -3682,10 +3691,10 @@ mod tests {
         bytes
     }
 
-    fn observe_ref_fixture(
+    fn ref_transport_fixture(
         caps: Vec<u8>,
         response: Option<Vec<u8>>,
-    ) -> (io::Result<Vec<AdvertisedRef>>, HttpFinalizationReport) {
+    ) -> (GitHubTransport, thread::JoinHandle<()>) {
         let tls = fixture_tls();
         let (listener, address) = listener();
         let server = thread::spawn(move || {
@@ -3721,7 +3730,15 @@ mod tests {
                 .unwrap();
             }
         });
-        let mut transport = transport_at(address, tls.trusted, AttemptLimits::default());
+        let transport = transport_at(address, tls.trusted, AttemptLimits::default());
+        (transport, server)
+    }
+
+    fn observe_ref_fixture(
+        caps: Vec<u8>,
+        response: Option<Vec<u8>>,
+    ) -> (io::Result<Vec<AdvertisedRef>>, HttpFinalizationReport) {
+        let (mut transport, server) = ref_transport_fixture(caps, response);
         let result = transport.read_advertised_refs();
         let finalized = transport.finalize_http_framing().unwrap();
         server.join().unwrap();
@@ -3751,6 +3768,130 @@ mod tests {
         assert_eq!(refs[2].peeled(), Some(refs[2].oid()));
         assert!(finalized.is_complete());
         assert_eq!(finalized.framing().completed(), 2);
+    }
+
+    #[test]
+    fn combined_observation_exposes_refs_only_after_both_layers_complete() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let mut response = ref_packet(format!("{oid} refs/heads/main\n").as_bytes());
+        response.extend_from_slice(b"0000");
+        let (transport, server) = ref_transport_fixture(
+            ref_caps(&[b"ls-refs\n", b"object-format=sha1\n"]),
+            Some(response),
+        );
+        let report = transport.observe_refs().unwrap();
+        server.join().unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.refs().unwrap().len(), 1);
+        assert_eq!(report.refs().unwrap()[0].name(), b"refs/heads/main");
+        assert!(report.finalization().is_complete());
+    }
+
+    #[test]
+    fn combined_observation_keeps_protocol_failure_even_when_http_completes() {
+        let line = b"0123456789abcdef0123456789abcdef01234567 refs/heads/main\n";
+        let response = ref_packet(line);
+        // A data packet without the Git flush terminator is a truncated response.
+        let (transport, server) = ref_transport_fixture(ref_caps(&[b"ls-refs\n"]), Some(response));
+        let report = transport.observe_refs().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            report.operation_error_kind(),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
+        assert!(report.refs().is_none());
+        assert!(report.finalization().is_complete());
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn combined_observation_discards_refs_when_chunked_http_tail_is_invalid() {
+        for tail in [
+            b"\r\n".as_slice(),
+            b"\r\n0\r\nAuthorization: fixture\r\n\r\n".as_slice(),
+        ] {
+            let tls = fixture_tls();
+            let (listener, address) = listener();
+            let server = thread::spawn(move || {
+                let socket = accept_until(&listener).unwrap();
+                let mut stream = tls_stream(socket, Arc::clone(&tls.server)).unwrap();
+                let (method, target, _, _) = read_request(&mut stream).unwrap();
+                assert_eq!(method, "GET");
+                assert_eq!(
+                    target,
+                    "/example/repo.git/info/refs?service=git-upload-pack"
+                );
+                write_response(
+                    &mut stream,
+                    "application/x-git-upload-pack-advertisement",
+                    &ref_caps(&[b"ls-refs\n"]),
+                )
+                .unwrap();
+                let socket = accept_until(&listener).unwrap();
+                let mut stream = tls_stream(socket, tls.server).unwrap();
+                let (method, target, _, _) = read_request(&mut stream).unwrap();
+                assert_eq!(method, "POST");
+                assert_eq!(target, "/example/repo.git/git-upload-pack");
+                let mut body =
+                    ref_packet(b"0123456789abcdef0123456789abcdef01234567 refs/heads/main\n");
+                body.extend_from_slice(b"0000");
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-result\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+                stream.write_all(tail).unwrap();
+                stream.flush().unwrap();
+            });
+            let transport = transport_at(address, tls.trusted, AttemptLimits::default());
+            let report = transport.observe_refs().unwrap();
+            server.join().unwrap();
+            assert!(report.operation_error_kind().is_none());
+            assert!(report.refs().is_none());
+            assert!(!report.finalization().is_complete());
+            assert!(!report.is_complete());
+        }
+    }
+
+    #[test]
+    fn combined_observation_distinguishes_valid_empty_refs_from_no_refs() {
+        let (transport, server) =
+            ref_transport_fixture(ref_caps(&[b"ls-refs\n"]), Some(b"0000".to_vec()));
+        let report = transport.observe_refs().unwrap();
+        server.join().unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.refs(), Some(&[][..]));
+    }
+
+    #[test]
+    fn combined_observation_preserves_pre_cancel_without_ingress() {
+        let transport = crate::connect(
+            crate::RepositoryUrl::parse("https://github.com/a/b").unwrap(),
+            crate::AttemptLimits::default(),
+            None,
+        )
+        .unwrap();
+        transport.cancellation_handle().cancel();
+        let report = transport.observe_refs().unwrap();
+        assert_eq!(
+            report.operation_error_kind(),
+            Some(io::ErrorKind::ConnectionAborted)
+        );
+        assert_eq!(report.finalization().observed_ingress_bytes(), 0);
+        assert!(report.refs().is_none());
+    }
+
+    #[test]
+    fn combined_observation_propagates_poisoned_finalization_state() {
+        let transport = unconnected_finalizer_fixture();
+        let retained = transport.retained.clone();
+        assert!(thread::spawn(move || {
+            let _guard = retained.0.lock().unwrap();
+            panic!("poison private queue fixture");
+        })
+        .join()
+        .is_err());
+        assert_eq!(
+            transport.observe_refs().unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
     }
 
     #[test]
