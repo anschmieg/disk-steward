@@ -252,8 +252,9 @@ mod tests {
         // so the purge control store's private-parent check passes.
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut permissions =
-                std::fs::metadata(directory.path()).expect("root metadata").permissions();
+            let mut permissions = std::fs::metadata(directory.path())
+                .expect("root metadata")
+                .permissions();
             permissions.set_mode(0o700);
             std::fs::set_permissions(directory.path(), permissions).expect("root permissions");
         }
