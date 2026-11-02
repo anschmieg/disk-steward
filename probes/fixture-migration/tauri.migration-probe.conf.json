@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Disk Steward Migration Probe",
+  "identifier": "com.disksteward.migration-probe",
+  "app": {
+    "windows": [
+      {
+        "title": "Disk Steward Migration Probe",
+        "width": 1180,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 680,
+        "resizable": true
+      }
+    ]
+  }
+}

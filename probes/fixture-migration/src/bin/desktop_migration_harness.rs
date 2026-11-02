@@ -33,9 +33,13 @@ fn app_root() -> PathBuf {
             .expect("disposable probe marker"),
         b"disk-steward-migration-v1\n"
     );
-    let root = canonical.join("Library/Application Support/com.disksteward.desktop");
+    let root = canonical.join("Library/Application Support/com.disksteward.migration-probe");
     let mut component = canonical.clone();
-    for part in ["Library", "Application Support", "com.disksteward.desktop"] {
+    for part in [
+        "Library",
+        "Application Support",
+        "com.disksteward.migration-probe",
+    ] {
         component.push(part);
         if let Ok(metadata) = fs::symlink_metadata(&component) {
             assert!(
@@ -294,7 +298,12 @@ fn service_status() {
 }
 
 fn main() {
-    match env::args().nth(1).as_deref() {
+    let mut args = env::args().skip(1);
+    let command = args.next();
+    if args.next().is_some() {
+        panic!("usage: desktop_migration_harness seed|status|verify");
+    }
+    match command.as_deref() {
         Some("seed") => seed(),
         Some("status") => service_status(),
         Some("verify") => verify(),
