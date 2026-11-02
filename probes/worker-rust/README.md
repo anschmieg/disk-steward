@@ -19,7 +19,8 @@ fixed modes. These stdout cases have no data-file, network, credential, shell, o
 operations, and their children create no descendants.
 
 `--run-store` is a separate development-only store ownership probe. It creates
-a fresh private directory under the system temporary directory using
+a fresh exclusive 0700 parent under the canonical temporary directory, then
+a fixed-name 0700 `store` root inside that parent, using
 directory-relative exclusive creation, writes a small versioned owner journal,
 then reacquires directory handles and validates their identities and journal.
 Inspection always returns `NeedsReconciliation`; there is no cleanup or retry operation.
@@ -62,3 +63,8 @@ The live probe prints one result per case. The expected flood result is
 `reader_joined=true`. A missing readiness signal, reader failure or unconfirmed
 cleanup returns an error instead. Elapsed time includes shutdown and may exceed
 the one-second detection deadline; it is not an OS scheduling guarantee.
+
+Both private levels retain pinned identities and require the current UID and
+0700 mode before inspection or journal updates. The temporary anchor, parent,
+root and journal are synchronized during creation. No automatic cleanup or
+restart adoption is introduced.
