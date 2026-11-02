@@ -283,6 +283,15 @@ impl FixtureLifecycle {
         self.id
     }
 
+    /// Whether an attempt intent is journaled for this action but its
+    /// terminal outcome is not yet durable. The purge coordinator consults
+    /// this when mapping errors: an intent-bearing failure is uncertainty,
+    /// not a clean refusal.
+    pub fn pending_intent_for(&self, action: ActionId) -> Result<bool, LifecycleError> {
+        let encoded = encode_action(&action)?;
+        self.has_pending_intent(&encoded)
+    }
+
     /// Stage an internally registered fixture by ActionId. No path is accepted.
     pub fn stage(
         &mut self,

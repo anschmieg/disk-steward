@@ -1,10 +1,10 @@
 [workspace]
-members = ["crates/disk-steward-core", "crates/verification-budget", "crates/approval-ledger", "crates/review-plan", "crates/fixture-lifecycle", "crates/demo-execution", "crates/plan-model", "crates/plan-store", "crates/exclusion-store", "probes/git-transport", "probes/atomic-rename"]
+members = ["crates/disk-steward-core", "crates/verification-budget", "crates/approval-ledger", "crates/review-plan", "crates/fixture-lifecycle", "crates/fixture-purge", "crates/demo-execution", "crates/plan-model", "crates/plan-store", "crates/exclusion-store", "probes/git-transport", "probes/atomic-rename"]
 exclude = ["src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.10"
+version = "0.0.11"
 edition = "2021"
 license = "UNLICENSED"
 
