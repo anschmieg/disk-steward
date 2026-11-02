@@ -1,0 +1,11 @@
+# Best-effort volume observation — 2026-11-02
+
+Purpose: complete honest accounting for the disposable removal lifecycle without expanding cleanup eligibility. Branch feat/m1c-volume-observation starts from PR18 head265bba1; main baseline105895a, PR18 checks pending at start. Version0.0.16; no minor release or publication.
+
+Sampling belongs to the already-open holding-directory handle, never a renderer-supplied path. Use macOS rustix fstatvfs available blocks times fragment size with checked arithmetic and fstat volume identity, after directory revalidation. Unsupported hosts return no observation. The existing coordinator samples after confirmation/revalidation/authority checks, immediately before execution, then after durable finished work. No sleeps, delayed retry or user-file access.
+
+Result extension: optional volumeObservation with observedFreeSpaceDeltaBytes (AFTER minus BEFORE, signed JS-safe integer), method fstatvfs_bavail_v1 and per-execution volumeBindingSha256. Bindings must match internally; expose no raw device/path identifiers. Unavailable/mismatched/overflowed samples or partial/uncertain results yield no observation. Failure must never change purge state or accounting, introduce retry, or turn uncertainty into success. Observations are ephemeral immediate-response evidence, not persisted journal facts or per-file attribution. Renderer continues to show selected and durably-unlinked logical totals independently, explains volume-wide confounders and shows unavailable when absent.
+
+Verification: deterministic signed/no-observation tests and actual opened-handle sampling; confirmation cancellation must take no measurements. Real owned-volume product-path observation is separate from the prior Python filesystem calibration and must be recorded honestly. The fixed5 demo fixtures and their6MiB per-item maximum remain unchanged. M0/M1B human/credential gates and external-volume validation remain open. No generic renderer filesystem/shell/SQL/credentials/execution surface.
+
+Final integration baseline: PR18 merged into main61b934b. The native method and actual coordinator path passed the owned-image run; supporting normalized evidence is in probes/volume/evidence. This does not validate external volumes, human review or hardware power loss. No new destructive production scope is introduced.

@@ -567,6 +567,22 @@ export default function DemoLifecyclePanel({
                       {purgeResult.selectedLogicalBytes} logical bytes removed.
                       Logical bytes are not a promise of free-space recovery.
                     </span>
+                    {purgeResult.state === "finished" && (
+                      <>
+                        <span>
+                          {purgeResult.volumeObservation
+                            ? `Observed volume free-space change: ${formatSignedBytes(purgeResult.volumeObservation.observedFreeSpaceDeltaBytes)}`
+                            : "Observed volume free-space change unavailable."}
+                        </span>
+                        {purgeResult.volumeObservation && (
+                          <small className="stage-help">
+                            Volume-wide observation; other writers, snapshots
+                            and delayed reclamation may affect it. This is not
+                            space attributed to these files.
+                          </small>
+                        )}
+                      </>
+                    )}
                     {purgeResult.state !== "finished" && (
                       <small className="stage-help">
                         Some items need inspection before any further demo step.
@@ -719,6 +735,10 @@ function formatBytes(bytes: number): string {
   return bytes >= 1_048_576
     ? `${(bytes / 1_048_576).toFixed(3).replace(/0+$/, "").replace(/\.$/, "")} MiB`
     : `${Math.round(bytes / 1024)} KiB`;
+}
+function formatSignedBytes(bytes: number): string {
+  if (bytes === 0) return "0 bytes";
+  return `${bytes > 0 ? "+" : "−"}${formatBytes(Math.abs(bytes))}`;
 }
 function humanStatus(status: string): string {
   return status.replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());

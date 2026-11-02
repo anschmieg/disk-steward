@@ -164,3 +164,8 @@ Batches A–E implement selective receipt-based purge, backend-owned approval an
 ## M1C verification probes — 0.0.15, 2026-11-02
 
 PR16 is merged to main. The seeded migration gap is now verified through a uniquely identified real debug app: exact bundle/PID/open-store checks preceded the fixture-panel status request, schema advanced 1→2, and complete row/rowid/fixture-byte/receipt verification passed after that process exited. A standalone controlled APFS measurement run also passed on its own fully allocated 256 MiB fixture; ten probe tests and Ruff cover approval, space-margin, noisy-result and cleanup refusal paths. Evidence and remaining limitations are in docs/M1C-VALIDATION.md. Product-adapter observed-space reporting and human gates remain open. Recurring autonomous continuation is active; no release or user-file cleanup is enabled.
+
+
+## M1C observed-volume accounting — 0.0.16
+
+PR18 merged into main61b934b after current-head build/test jobs passed. The disposable macOS purge result now has an optional signed volume-wide observation, measured through the verified opened holding-directory handle after confirmation/authority checks and after durable completion. Missing or unreliable readings do not change execution. UI and tests keep that value separate from logical bytes. The actual native method and real coordinator path passed an owned-volume run; normalized evidence and limits are in docs/M1C-VALIDATION.md. M0/M1B human and credential gates remain open, and no user-file cleanup or release is enabled.

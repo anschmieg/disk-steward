@@ -147,6 +147,16 @@ pub struct PurgeExecutionResult {
     pub items: Vec<PurgeItemBatchOutcome>,
     pub selected_logical_bytes: u64,
     pub durably_unlinked_logical_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_observation: Option<VolumeObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeObservation {
+    pub observed_free_space_delta_bytes: i64,
+    pub method: String,
+    pub volume_binding_sha256: String,
 }
 
 /// The private manifest: canonical typed JSON covering the complete frozen
@@ -710,6 +720,7 @@ impl FixturePurgeService {
             items,
             selected_logical_bytes: prepared.selected_logical_bytes,
             durably_unlinked_logical_bytes,
+            volume_observation: None,
         })
     }
 }
@@ -885,6 +896,43 @@ fn initialize_control(db: &Connection) -> Result<(), PurgeError> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+
+    #[test]
+    fn optional_volume_observation_preserves_legacy_wire_and_outcome_names() {
+        let receipt = disk_steward_core::ReceiptId::new();
+        let mut result = PurgeExecutionResult {
+            execution_id: disk_steward_core::ExecutionId::new(),
+            review_id: ReviewId::new(),
+            state: "finished".into(),
+            items: vec![PurgeItemBatchOutcome {
+                attempt_id: disk_steward_core::AttemptId::new(),
+                outcome: PurgeItemOutcome::PermanentlyRemoved {
+                    receipt_id: receipt,
+                    logical_bytes: 42,
+                },
+            }],
+            selected_logical_bytes: 42,
+            durably_unlinked_logical_bytes: 42,
+            volume_observation: None,
+        };
+        let legacy = serde_json::to_value(&result).unwrap();
+        assert!(legacy.get("volumeObservation").is_none());
+        assert_eq!(
+            legacy["items"][0]["outcome"]["permanently_removed"]["logical_bytes"],
+            42
+        );
+        let read: PurgeExecutionResult = serde_json::from_value(legacy).unwrap();
+        assert!(read.volume_observation.is_none());
+        result.volume_observation = Some(VolumeObservation {
+            observed_free_space_delta_bytes: -7,
+            method: "fstatvfs_bavail_v1".into(),
+            volume_binding_sha256: "a".repeat(64),
+        });
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["volumeObservation"]["observedFreeSpaceDeltaBytes"], -7);
+        assert_eq!(wire["selectedLogicalBytes"], 42);
+        assert_eq!(wire["durablyUnlinkedLogicalBytes"], 42);
+    }
     use super::*;
     use disk_steward_review_plan::PlanView;
     use tempfile::tempdir;

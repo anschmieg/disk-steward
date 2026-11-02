@@ -1,0 +1,48 @@
+{
+  "status": "complete",
+  "platform": "darwin",
+  "macos_version": "27.0",
+  "machine": "arm64",
+  "device": "/dev/disk5s1",
+  "method": "fstatvfs_bavail_v1",
+  "calibration": {
+    "allocatedBytes": 268435456,
+    "elapsedMs": 0,
+    "fixtureBytes": 268435456,
+    "method": "fstatvfs_bavail_v1",
+    "observedFreeSpaceDeltaBytes": 268435456,
+    "scope": "native sampler calibration on owned volume; no per-file attribution on ordinary volumes",
+    "toleranceBytes": 26843545
+  },
+  "product": {
+    "executionId": "disk-steward:execution:v1:eb87d556-cefd-4dc3-a1b6-8f4d6269a110",
+    "reviewId": "disk-steward:review:v1:e94c49d0-bc81-47b7-a29b-7d75e6db5e19",
+    "state": "finished",
+    "items": [
+      {
+        "attemptId": "disk-steward:attempt:v1:02f572f6-dd73-4d66-a931-7c1c8d4169e0",
+        "outcome": {
+          "permanently_removed": {
+            "receipt_id": "disk-steward:receipt:v1:fd561d8e-d980-4592-bf77-d4f60b9abb4c",
+            "logical_bytes": 3145728
+          }
+        }
+      }
+    ],
+    "selectedLogicalBytes": 3145728,
+    "durablyUnlinkedLogicalBytes": 3145728,
+    "volumeObservation": {
+      "observedFreeSpaceDeltaBytes": 3137536,
+      "method": "fstatvfs_bavail_v1",
+      "volumeBindingSha256": "157c527b51e935348aeb2c2017b55b0d19aaabe6834210d5ff70801775e97268"
+    }
+  },
+  "evidence_scope": "controlled owned volume; observed delta is not attributed to this purge",
+  "date": "2026-11-02",
+  "app_version": "0.0.16",
+  "image_detached": true,
+  "temporary_root_removed": true,
+  "cleanup_verification": "separate hdiutil info and exact owned-root existence checks",
+  "sampler": "rustix fstatvfs on verified opened holding directory",
+  "observation_persistence": "ephemeral response only"
+}

@@ -71,9 +71,9 @@ export type PreparedPurgeReview = {
 export type PurgeItemBatchOutcome = {
   attemptId: string;
   outcome:
-    | { permanentlyRemoved: { receiptId: string; logicalBytes: number } }
-    | { uncertain: { receiptId: string } }
-    | { notAttempted: { receiptId: string } };
+    | { permanently_removed: { receipt_id: string; logical_bytes: number } }
+    | { uncertain: { receipt_id: string } }
+    | { not_attempted: { receipt_id: string } };
 };
 
 export type PurgeExecutionResult = {
@@ -83,6 +83,11 @@ export type PurgeExecutionResult = {
   items: PurgeItemBatchOutcome[];
   selectedLogicalBytes: number;
   durablyUnlinkedLogicalBytes: number;
+  volumeObservation?: {
+    observedFreeSpaceDeltaBytes: number;
+    method: string;
+    volumeBindingSha256: string;
+  };
 };
 
 export type DemoPlanProjection = {
