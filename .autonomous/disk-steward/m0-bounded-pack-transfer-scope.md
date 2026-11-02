@@ -1,0 +1,7 @@
+# M0 bounded pack transfer candidate
+
+Inactive backend candidate only: consuming download_advertised_pack to a caller-owned Write sink. Freshly read refs on same attempt, reject empty or >64 distinct advertised tips rather than subset, issue strict SHA1 v2 fetch of exactly those tips. Reuse bounded transport raw-ingress/cancellation/deadline and HTTP finalization; report accepted sink-byte count and operation error metadata, completed transfer only if Git flush and all HTTP bodies complete. Transfer evidence is NOT pack integrity/object completeness/reachability/removal authority. No app/renderer/filesystem/credentials/cleanup wiring.
+
+Max2GiB decoded pack, <=65536 sideband packets, bounded progress packets/bytes, no shallow/filter/thin/URI requests, malformed/fatal/unsupportedsections fail closed. Sink partial writes/errors/zero/invalidcounts must fail safely; partial bytes may remain and caller owns retention. Caller must apply owned-store growth/reserve/aggregate budgets; arbitrary blocking Write cannot guarantee cancellation latency, needs outer worker. Exact advertised-tip fetch does not promise ref snapshot atomicity or ref retention.
+
+Luna owns new pack.rs only; root owns API wiring, realGit fixture use, failure tests/docs/progress/integration. Review code before execution, CARGO_INCREMENTAL=0/no overlappingbuilds/2GiBreserve. Branch atop PR52 132f8e3, main9823535 baseline, existing43–52 watches notpolled. Version0.0.17/no releases. M0/M4/privateGitHub/Keychain/human/fullstore gates remain open.

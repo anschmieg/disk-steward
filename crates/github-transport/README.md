@@ -168,7 +168,7 @@ matrix, real GitHub/private authentication, or cleanup eligibility.
 The closed Unix interoperability fixture also requests a real v2 `fetch` for
 its advertised commit and annotated tag. It accepts only the expected packfile
 section and bounded sideband packets, retains at most 512 pack bytes, and
-requires both HTTP responses to finalize. In a separate fresh bare receiver,
+requires all three discovery/ls-refs/fetch HTTP responses to finalize. In a separate fresh bare receiver,
 fixed Git commands run `index-pack --strict`, `fsck --strict --full`, and check
 that the expected blob, tree, commit and tag exist. Separate fresh receivers
 must reject a damaged checksum and a truncated pack. The subprocess input
@@ -177,3 +177,25 @@ system Git, not a production fetch API or durable budgeted verification store;
 it does not establish source-state reachability, real private GitHub access,
 large-pack behavior, or removal eligibility. The request and sideband layout
 follow the [Git v2 protocol](https://git-scm.com/docs/gitprotocol-v2).
+
+`download_advertised_pack(&mut sink)` is an inactive backend streaming candidate.
+It reads fresh refs, refuses empty advertisements or more than 64 distinct tips,
+and requests all those SHA-1 tips without shallow, filter, thin-pack or URI
+options. It accepts only the expected v2 packfile section and sideband channels,
+checks the `PACK` signature, bounds decoded pack/progress/packet counts, and
+finalizes HTTP even after an operation error. `PackTransferReport` records
+accepted sink bytes and sanitized error kinds. `is_complete_transfer()` means
+only that the transfer framing completed; even malformed object data with a
+`PACK` prefix can pass this predicate. Object integrity and completeness still
+require an independent verifier in an isolated store.
+
+Partial bytes remain in the caller's sink on failure. The caller must enforce
+owned-store allocation, aggregate use and free-space admission before writes,
+and supervise blocking sink operations in an outer worker; this API provides
+neither filesystem authority nor a bound on arbitrary sink latency. It does not
+flush or sync the sink, promise a remote ref snapshot, or authorize cleanup.
+The app and renderer do not call this candidate.
+An operation failure cancels the attempt before HTTP finalization, so a sink's
+space refusal cannot trigger a download of the remaining pack merely to drain
+its response. Finalization still records incomplete/failed framing metadata;
+it cannot turn the operation failure into success.
