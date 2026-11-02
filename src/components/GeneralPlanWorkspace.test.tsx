@@ -313,6 +313,13 @@ describe("GeneralPlanWorkspace revision and review boundaries", () => {
       target: { value: "P1" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
+    fireEvent.keyDown(screen.getByText("Review pilot recording"), {
+      key: "Enter",
+    });
+    fireEvent.click(screen.getByText("Review pilot recording"));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Edit" }), {
+      key: "Tab",
+    });
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     await screen.findByText("Choice saved.");
     fireEvent.click(screen.getByRole("button", { name: "Finish recording" }));
@@ -333,7 +340,8 @@ describe("GeneralPlanWorkspace revision and review boundaries", () => {
       final: { revisionNumber: 1, itemCount: 1, confirmed: true },
       counts: {
         item_choice: 1,
-        pointer_activation: expect.any(Number),
+        pointer_activation: 1,
+        key_press: 1,
         refresh: expect.any(Number),
       },
       humanAssessment: "not_recorded",

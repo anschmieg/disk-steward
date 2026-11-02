@@ -258,8 +258,12 @@ export default function GeneralPlanWorkspace({
   return (
     <section
       className="general-workspace"
-      onClickCapture={() => record("pointer_activation")}
-      onKeyDownCapture={() => record("key_press")}
+      onClickCapture={(event) => {
+        if (!isPilotControl(event.target)) record("pointer_activation");
+      }}
+      onKeyDownCapture={(event) => {
+        if (!isPilotControl(event.target)) record("key_press");
+      }}
     >
       <div className="general-toolbar">
         <label>
@@ -403,6 +407,13 @@ export default function GeneralPlanWorkspace({
         />
       )}
     </section>
+  );
+}
+
+function isPilotControl(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    !!target.closest("[data-review-pilot-controls]")
   );
 }
 

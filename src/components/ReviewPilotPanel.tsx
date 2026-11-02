@@ -41,7 +41,7 @@ export default function ReviewPilotPanel({
         : "Load the current editor and enter a valid anonymous participant code.",
     );
   return (
-    <details className="review-pilot-panel">
+    <details className="review-pilot-panel" data-review-pilot-controls>
       <summary>Review pilot recording</summary>
       <p>
         This tab only; no report is sent or saved automatically. A moderator
