@@ -485,6 +485,7 @@ dependencies = [
  "gix-error",
  "gix-transport",
  "gix-url",
+ "gix-validate",
  "rcgen",
  "rustls",
  "webpki-roots",
