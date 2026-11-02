@@ -509,6 +509,17 @@ impl Budget {
         deadline: Instant,
         out: &mut [u8],
     ) -> io::Result<usize> {
+        self.reserve_read_with(deadline, out, |slice| {
+            read_until(stream, deadline, &self.cancellation, slice)
+        })
+    }
+
+    fn reserve_read_with(
+        &self,
+        deadline: Instant,
+        out: &mut [u8],
+        read: impl FnOnce(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
@@ -525,7 +536,14 @@ impl Budget {
         }
         let n = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
         self.cancellation.check()?;
-        let count = read_until(stream, deadline, &self.cancellation, &mut out[..n])?;
+        check_deadline(deadline)?;
+        let count = read(&mut out[..n])?;
+        if count > n {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "invalid ingress read count",
+            ));
+        }
         *used = used.saturating_add(count as u64);
         self.cancellation.check()?;
         check_deadline(deadline)?;
@@ -3263,5 +3281,143 @@ mod tests {
         };
         assert!(server.join().is_ok());
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+}
+
+#[cfg(test)]
+mod budget_read_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn budget(max: u64) -> Budget {
+        Budget {
+            max,
+            used: Arc::new(Mutex::new(0)),
+            cancellation: CancellationHandle::new(),
+        }
+    }
+
+    fn used(budget: &Budget) -> u64 {
+        *budget.used.lock().unwrap()
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    #[test]
+    fn cancellation_after_positive_read_charges_bytes_and_shared_budget_refuses_more() {
+        let budget = budget(8);
+        let clone = budget.clone();
+        let cancellation = budget.cancellation.clone();
+        let mut out = [0; 8];
+        let result = budget.reserve_read_with(deadline(), &mut out, |slice| {
+            slice[..3].copy_from_slice(b"abc");
+            cancellation.cancel();
+            Ok(3)
+        });
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(&out[..3], b"abc");
+        assert_eq!(used(&budget), 3);
+
+        let called = AtomicUsize::new(0);
+        let result = clone.reserve_read_with(deadline(), &mut out, |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Ok(1)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(used(&budget), 3);
+    }
+
+    #[test]
+    fn callback_is_limited_to_remaining_headroom_and_exact_cap_refuses_next_read() {
+        let budget = budget(5);
+        *budget.used.lock().unwrap() = 2;
+        let mut out = [0; 8];
+        let result = budget
+            .reserve_read_with(deadline(), &mut out, |slice| {
+                assert_eq!(slice.len(), 3);
+                slice.copy_from_slice(b"xyz");
+                Ok(slice.len())
+            })
+            .unwrap();
+        assert_eq!(result, 3);
+        assert_eq!(used(&budget), 5);
+
+        let called = AtomicUsize::new(0);
+        let result = budget.reserve_read_with(deadline(), &mut out, |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Ok(0)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(used(&budget), 5);
+    }
+
+    #[test]
+    fn pre_cancelled_attempt_does_not_invoke_callback() {
+        let budget = budget(4);
+        budget.cancellation.cancel();
+        let called = AtomicUsize::new(0);
+        let result = budget.reserve_read_with(deadline(), &mut [0; 4], |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Ok(1)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(used(&budget), 0);
+    }
+
+    #[test]
+    fn callback_error_does_not_charge_bytes() {
+        let budget = budget(4);
+        let result = budget.reserve_read_with(deadline(), &mut [0; 4], |slice| {
+            slice[..2].copy_from_slice(b"ab");
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "fixture read"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(used(&budget), 0);
+    }
+
+    #[test]
+    fn clones_share_the_ingress_cap() {
+        let budget = budget(4);
+        let clone = budget.clone();
+        let mut out = [0; 4];
+        budget
+            .reserve_read_with(deadline(), &mut out, |slice| Ok(slice.len()))
+            .unwrap();
+
+        let called = AtomicUsize::new(0);
+        let result = clone.reserve_read_with(deadline(), &mut out, |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Ok(1)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(used(&budget), 4);
+    }
+
+    #[test]
+    fn impossible_callback_count_fails_closed_without_charging() {
+        let budget = budget(4);
+        let result = budget.reserve_read_with(deadline(), &mut [0; 4], |_| Ok(5));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(used(&budget), 0);
+    }
+
+    #[test]
+    fn expired_deadline_does_not_invoke_callback() {
+        let budget = budget(4);
+        let called = AtomicUsize::new(0);
+        let result = budget.reserve_read_with(Instant::now(), &mut [0; 4], |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Ok(1)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(used(&budget), 0);
     }
 }

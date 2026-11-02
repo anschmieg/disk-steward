@@ -54,6 +54,14 @@ claimed. The per-request buffered upload cap is 1 MiB, and framing restrictions
 may reject otherwise legitimate GitHub responses. Such outcomes are incomplete
 verification, never grounds to relax an approval or removal check.
 
+The ingress count measures bytes returned by socket reads beneath TLS; it does
+not measure NIC traffic, bytes buffered by the operating system, or bytes that
+arrive after a read returns. Deterministic unit coverage of the shared budget
+admission and charging path can establish how returned bytes interact with
+cancellation and the configured cap. It cannot establish operating-system
+read latency or a hard cancellation-latency bound. That evidence alone is not
+a full M0 validation claim.
+
 `GitHubTransport::http_framing_snapshot()` returns bounded per-attempt response
 counts: pending, completed, failed, and abandoned. At most 64 responses are
 tracked per transport; an over-limit attempt fails before connecting and
