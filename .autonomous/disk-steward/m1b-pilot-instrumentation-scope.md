@@ -1,0 +1,11 @@
+# Opt-in local review pilot instrumentation — 2026-11-02
+
+Purpose: implement the time/interaction instrumentation explicitly required by M1B task1.3 before progressing beyond the human review gate. M2 remains planned. Branch feat/m1b-pilot-instrumentation starts from PR21head53f37d8; integrated main now d1ec3df (PR21 merged after current-head green checks). Version0.0.17 is a patch-only development version; no release.
+
+Recording is explicit and confined to the synthetic pilot profile. An anonymous participant code, starting/final aggregate snapshot counts/revision numbers, monotonic elapsed time and bounded aggregate counters are held in renderer memory. No paths, names, contents, raw item/review IDs, key values, network, storage, automatic clipboard or export command is accepted or added. The local readonly report can be manually copied by the moderator. Reports are ephemeral and do not survive tab/app closure.
+
+Input click/key counts and completed native metadata/review command counts are distinct, not unique decisions or correctness scores. Rejected/canceled interactions are reported separately. No correctness, confusion, assistance, preservation success or pilot-pass judgment is inferred. Finish stops recording rather than certifying completion; humanAssessment remains not_recorded and executionAvailable false. Human observations and three representative participants remain mandatory. The fifteen-minute target is not used to auto-pass or stop a participant.
+
+The recorder must ignore events before start/after finish, preserve start context, compute duration independently of delayed timer ticks, report unreliable clocks as unavailable, keep callbacks stable, and clean up timers on unmount. Profile changes are locked while recording. Existing saved-review flags, revision guards, native command contracts and non-executable editor authority remain unchanged.
+
+Acceptance: deterministic hook/component tests plus real workspace orchestration tests prove opt-in timing/counter privacy, cancellation/error behavior, readonly frozen report and no extra IPC/file/network actions. Scope says nothing about real human-pilot outcomes, native accessibility/performance or release readiness.
