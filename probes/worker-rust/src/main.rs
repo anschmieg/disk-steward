@@ -117,6 +117,8 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [flag] if flag == "--run-store-worker" => run_store_worker(),
+        [flag, confirm] if flag == "--run-store-cleanup" && confirm == "--confirm-own-store-cleanup" => run_store_worker_with_cleanup(true),
+        [flag] if flag == "--run-store-cleanup" => Err("refusing store cleanup without --confirm-own-store-cleanup".into()),
         [flag] if flag == "--run" => {
             for case in [Case::Flood, Case::Stall, Case::Cancel] {
                 let report = supervise(case)?;
@@ -147,11 +149,15 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, or --run-store-worker".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-worker, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
 }
 
 fn run_store_worker() -> Result<(), String> {
+    run_store_worker_with_cleanup(false)
+}
+
+fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
     let mut store = store::OwnedStore::create().map_err(|e| format!("create owned store: {e}"))?;
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
@@ -221,6 +227,13 @@ fn run_store_worker() -> Result<(), String> {
     store
         .record_stopped(&receipt)
         .map_err(|e| format!("record stopped transition: {e}"))?;
+    if cleanup {
+        store
+            .cleanup_after_stopped(&receipt)
+            .map_err(|e| format!("cleanup stopped store: {e}"))?;
+        println!("store_removed=true retained_parent_journal=cleanup.journal worker_pid={pid}");
+        return Ok(());
+    }
     let state = store
         .inspect_state()
         .map_err(|e| format!("inspect stopped store: {e}"))?;

@@ -23,7 +23,7 @@ a fresh exclusive 0700 parent under the canonical temporary directory, then
 a fixed-name 0700 `store` root inside that parent, using
 directory-relative exclusive creation, writes a small versioned owner journal,
 then reacquires directory handles and validates their identities and journal.
-Inspection always returns `NeedsReconciliation`; there is no cleanup or retry operation.
+Inspection always returns `NeedsReconciliation`; the ordinary store commands leave the fixture in place.
 This is live-handle validation, not a process-restart journal registry.
 The probe intentionally leaves the created directory in place, including on
 failure. It does not bind a worker, contain output, measure disk growth, or
@@ -35,10 +35,29 @@ waits for readiness, then cancels, waits for child exit, and joins the bounded
 stdout reader. Only after those shutdown checks does the supervisor issue a
 private stop receipt and record `stopped` for the same store token and PID.
 Inspection still returns `NeedsReconciliation`; the journal is not adopted
-after restart and stopped state grants no cleanup authority. Journal updates
+after restart. Journal updates
 validate the prior contents and inode/mode, use the fixed descriptor-relative
 marker, and poison the live handle after any update error. An interrupted
 in-place update may leave a malformed journal requiring manual reconciliation.
+
+`--run-store-cleanup --confirm-own-store-cleanup` runs that same fixed child
+supervision and stop receipt path, then removes the recorded `owner.journal`
+through the opened root descriptor and the fixed `store` directory through the
+opened private parent descriptor. It requires a live matching token/PID receipt,
+the stopped phase, exact marker and directory identities, and directory listings
+containing only the expected entries. Before unlinking, it exclusively creates
+and synchronizes `cleanup.journal` in the parent with a pending record. After
+the root is removed and the parent synchronized, it records completion and
+retains that parent journal permanently. Once the receipt gate passes, any cleanup failure poisons the live handle;
+there is no retry, reopen adoption, recursive deletion, or parent deletion.
+The command reports that the root was removed and names the retained journal;
+it does not estimate recovered bytes.
+
+Descriptor-relative checks constrain the operation to this fixture, but they
+cannot eliminate races from a hostile process running as the same user between
+validation and unlink. Directory and file synchronization requests also do not
+prove power-loss durability across every filesystem or operating system. This
+probe grants no generic cleanup authority and never accepts user paths.
 
 This demonstrates bounded stdout reading and ordinary local child
 kill/reap/thread-join behavior. It does not demonstrate Git ingress or store
@@ -53,6 +72,7 @@ Run from the repository root:
 cargo run -p disk-steward-worker-probe
 cargo run -p disk-steward-worker-probe -- --run
 cargo run -p disk-steward-worker-probe -- --run-store-worker
+cargo run -p disk-steward-worker-probe -- --run-store-cleanup --confirm-own-store-cleanup
 cargo test -p disk-steward-worker-probe --locked
 ```
 
