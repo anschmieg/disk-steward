@@ -35,3 +35,7 @@ These are coordinator-observed development experiments, not production adapter c
 The native experiments support continuing with receipt-based recovery feasibility, a shared typed core and OS-specific adapters. They do not close all M0 gates. Human evaluation, production broker/resource integration, detector scope/version freeze, durable storage approach, native confirmation/permission probes and the forecast must remain explicit.
 
 The live evaluation's cost threshold is a post-response stop, not a hard provider-side billing cap. Request counts/input size were bounded and only four small synthetic requests were made. Never present these provisional labels or rule-matched baseline scores as an independent safety benchmark.
+
+## Rust subprocess supervision follow-up — 2026-11-02
+
+The std-only [Rust worker probe](worker-rust/README.md) now exercises two fixed copies of its own executable. Integration tests observe the flood stopping at 65,537 bytes read and the stalled child emitting one readiness byte before deadline shutdown. Reports require child exit and reader-thread join. Default invocation starts no child; unknown parent/private arguments are refused. All four integration tests and the complete workspace tests, formatting and strict Clippy pass locally on macOS arm64. This advances Rust lifecycle evidence only: stdout bounds are not network ingress bounds, there are no stores or credentials, and process-tree isolation, real Git enforcement and OS shutdown latency remain unproved.
