@@ -350,8 +350,8 @@ fn native_summary_at(review: &PreparedDemoReview, now_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::native_summary_at;
-    use disk_steward_core::{PlanId, ReviewId, RevisionId, SessionId};
+    use super::{native_summary_at, purge_summary};
+    use disk_steward_core::{PlanId, ReviewId, RevisionId, SessionId, SupportedOperation};
     use disk_steward_demo_execution::{PreparedDemoReview, PreparedItem};
 
     #[cfg(unix)]
@@ -421,6 +421,63 @@ mod tests {
             "Restore requires the original filename to be unoccupied in its original location."
         ));
         assert!(summary.contains("their original demo locations"));
+    }
+
+    #[test]
+    fn purge_summary_shows_exact_targets_consequences_and_logical_byte_limit() {
+        let review = disk_steward_fixture_purge::PreparedPurgeReview {
+            schema_version: 1,
+            kind: "disposable_fixture_purge_review".into(),
+            review_id: ReviewId::new(),
+            plan_id: PlanId::new(),
+            revision_id: RevisionId::new(),
+            session_id: SessionId::new(),
+            operation: SupportedOperation::PermanentlyRemoveStaged,
+            created_at_ms: 1_800_000_000_000,
+            expires_at_ms: 1_800_000_300_000,
+            manifest_sha256: "a".repeat(64),
+            targets: vec![
+                disk_steward_fixture_purge::PurgeReviewTarget {
+                    action_id: disk_steward_core::ActionId::new(),
+                    receipt_id: disk_steward_core::ReceiptId::new(),
+                    label: "Compiler output".into(),
+                    logical_bytes: 4096,
+                    status: disk_steward_fixture_purge::PurgeReceiptState::Staged,
+                },
+                disk_steward_fixture_purge::PurgeReviewTarget {
+                    action_id: disk_steward_core::ActionId::new(),
+                    receipt_id: disk_steward_core::ReceiptId::new(),
+                    label: "Package cache".into(),
+                    logical_bytes: 2048,
+                    status: disk_steward_fixture_purge::PurgeReceiptState::Staged,
+                },
+            ],
+            selected_logical_bytes: 6144,
+        };
+        let private_ids = [
+            serde_json::to_string(&review.review_id).unwrap(),
+            serde_json::to_string(&review.plan_id).unwrap(),
+            serde_json::to_string(&review.revision_id).unwrap(),
+            serde_json::to_string(&review.session_id).unwrap(),
+            serde_json::to_string(&review.targets[0].action_id).unwrap(),
+            serde_json::to_string(&review.targets[0].receipt_id).unwrap(),
+            serde_json::to_string(&review.targets[1].action_id).unwrap(),
+            serde_json::to_string(&review.targets[1].receipt_id).unwrap(),
+        ];
+        let summary = purge_summary(&review);
+        assert!(summary.contains("The selected staged demo files will be permanently removed."));
+        assert!(summary.contains("This cannot be undone through the app."));
+        assert!(summary.contains("Compiler output — 4096 bytes"));
+        assert!(summary.contains("Package cache — 2048 bytes"));
+        assert!(summary.contains("Total: 6144 logical bytes."));
+        assert!(summary.contains("Logical bytes are not a promise of free-space recovery."));
+        assert!(!summary.contains("/"), "the summary must not expose paths");
+        for id in private_ids {
+            assert!(
+                !summary.contains(id.trim_matches('"')),
+                "the summary must not expose identifiers"
+            );
+        }
     }
 
     #[test]

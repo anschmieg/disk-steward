@@ -149,12 +149,89 @@ describe("DemoLifecyclePanel purge safety", () => {
     expect(mockedInvoke).toHaveBeenCalledTimes(3);
   });
 
-  it("blocks operations when purge succeeds but status refresh fails", async () => {
+  it("keeps the purge result visible when refreshed status needs inspection", async () => {
     const result: PurgeExecutionResult = {
       executionId: "execution-1",
       reviewId: "review-1",
       state: "finished",
-      items: [],
+      items: [
+        {
+          attemptId: "attempt-secret",
+          outcome: {
+            permanently_removed: {
+              receipt_id: "receipt-1",
+              logical_bytes: 2048,
+            },
+          },
+        },
+      ],
+      selectedLogicalBytes: 2048,
+      durablyUnlinkedLogicalBytes: 2048,
+      volumeObservation: {
+        observedFreeSpaceDeltaBytes: 17,
+        method: "fstatvfs_bavail_v1",
+        volumeBindingSha256: "a".repeat(64),
+      },
+    };
+    const needsInspection: DemoStatus = {
+      ...readyStatus,
+      state: "needs_inspection",
+      fixtures: readyStatus.fixtures.map((fixture) =>
+        fixture.actionId === "a1"
+          ? { ...fixture, status: "permanently_removed" }
+          : fixture,
+      ),
+    };
+    let statusCalls = 0;
+    mockedInvoke.mockImplementation(async (command) => {
+      if (command === "get_fixture_demo_status") {
+        statusCalls += 1;
+        return (statusCalls === 1 ? readyStatus : needsInspection) as never;
+      }
+      if (command === "prepare_purge_review") return prepared as never;
+      if (command === "confirm_purge_execution") return result as never;
+      throw new Error(String(command));
+    });
+    mount();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Prepare permanent removal" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm permanent removal" }),
+    );
+    expect(await screen.findByText("Removed permanently")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Permanent removal result" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Observed volume free-space change: +17 bytes"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Cargo build cache")[0]).toBeInTheDocument();
+    expect(screen.queryByText("attempt-secret")).not.toBeInTheDocument();
+    expect(screen.queryByText("receipt-1")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Logical bytes are not a promise of free-space recovery/i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a recorded result visible when status refresh fails", async () => {
+    const result: PurgeExecutionResult = {
+      executionId: "execution-1",
+      reviewId: "review-1",
+      state: "finished",
+      items: [
+        {
+          attemptId: "attempt-secret",
+          outcome: {
+            permanently_removed: {
+              receipt_id: "receipt-1",
+              logical_bytes: 2048,
+            },
+          },
+        },
+      ],
       selectedLogicalBytes: 2048,
       durablyUnlinkedLogicalBytes: 2048,
     };
@@ -176,17 +253,11 @@ describe("DemoLifecyclePanel purge safety", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "Confirm permanent removal" }),
     );
-    expect(
-      await screen.findByText(
-        /removal result was recorded, but demo status could not be refreshed/i,
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Prepare permanent removal" }),
-    ).toBeDisabled();
+    expect(await screen.findByText("Removed permanently")).toBeInTheDocument();
+    expect(screen.getAllByText("Cargo build cache").length).toBeGreaterThan(1);
     expect(
       screen.getByText(
-        /Logical bytes are not a promise of free-space recovery/i,
+        /removal result was recorded, but demo status could not be refreshed/i,
       ),
     ).toBeInTheDocument();
   });
@@ -285,7 +356,7 @@ describe("DemoLifecyclePanel purge safety", () => {
           screen.queryByText(/Volume-wide observation; other writers/i),
         ).not.toBeInTheDocument();
       }
-      expect(screen.getAllByText("Permanently removed")).toHaveLength(2);
+      expect(screen.getAllByText("Permanently removed")).toHaveLength(3);
       expect(mockedInvoke).toHaveBeenCalledWith("confirm_purge_execution", {
         request: { reviewId: "review-1" },
       });
@@ -390,4 +461,107 @@ describe("DemoLifecyclePanel purge safety", () => {
       ).not.toBeInTheDocument();
     },
   );
+
+  it("shows each snake_case item outcome with labels frozen at confirmation", async () => {
+    const mixedPrepared: PreparedPurgeReview = {
+      ...prepared,
+      targets: [
+        ...prepared.targets,
+        {
+          actionId: "a2",
+          receiptId: "receipt-2",
+          label: "Reviewed Python cache",
+          logicalBytes: 1024,
+          status: "staged",
+        },
+        {
+          actionId: "a3",
+          receiptId: "receipt-3",
+          label: "Reviewed shader cache",
+          logicalBytes: 512,
+          status: "staged",
+        },
+      ],
+    };
+    const mixedResult: PurgeExecutionResult = {
+      executionId: "execution-secret",
+      reviewId: "review-1",
+      state: "partial",
+      items: [
+        {
+          attemptId: "attempt-secret-1",
+          outcome: {
+            permanently_removed: {
+              receipt_id: "receipt-1",
+              logical_bytes: 2048,
+            },
+          },
+        },
+        {
+          attemptId: "attempt-secret-2",
+          outcome: { uncertain: { receipt_id: "receipt-2" } },
+        },
+        {
+          attemptId: "attempt-secret-3",
+          outcome: { not_attempted: { receipt_id: "receipt-3" } },
+        },
+      ],
+      selectedLogicalBytes: 3584,
+      durablyUnlinkedLogicalBytes: 2048,
+    };
+    mockedInvoke.mockImplementation(async (command) => {
+      if (command === "get_fixture_demo_status") return readyStatus as never;
+      if (command === "prepare_purge_review") return mixedPrepared as never;
+      if (command === "confirm_purge_execution") return mixedResult as never;
+      throw new Error(String(command));
+    });
+    const view = mount();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Prepare permanent removal" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm permanent removal" }),
+    );
+    expect(
+      await screen.findByText("Reviewed Python cache"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Permanently removed")).toBeInTheDocument();
+    expect(screen.getByText("Needs inspection")).toBeInTheDocument();
+    expect(screen.getByText("Not attempted")).toBeInTheDocument();
+
+    view.rerender(
+      <DemoLifecyclePanel
+        plan={{
+          ...plan("revision-1"),
+          actions: [
+            {
+              id: "a1",
+              label: "Changed current label",
+              bytes: 2048,
+              decision: "include",
+            },
+          ],
+        }}
+        native
+        planBusy={false}
+        planConfirmed
+        onPlanRefresh={vi.fn().mockResolvedValue(undefined)}
+        onBusyChange={vi.fn()}
+        onModeChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Reviewed Python cache")).toBeInTheDocument();
+    expect(screen.getAllByText("Changed current label")).toHaveLength(1);
+    expect(
+      screen.queryByText(/attempt-secret|execution-secret|receipt-[123]/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Observed volume free-space change/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Logical bytes are not a promise of free-space recovery/i,
+      ),
+    ).toBeInTheDocument();
+  });
 });
