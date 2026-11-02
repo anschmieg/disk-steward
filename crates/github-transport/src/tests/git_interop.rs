@@ -10,6 +10,8 @@ use std::{
 const GIT: &str = "/usr/bin/git";
 const MAX_GIT_IN: usize = 512;
 const MAX_GIT_OUT: usize = 65_536;
+const MAX_PACK: usize = 512;
+const MAX_PACKETS: usize = 128;
 const GIT_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 
@@ -250,7 +252,7 @@ fn object_id(bytes: &[u8]) -> io::Result<String> {
     Ok(std::str::from_utf8(&bytes[..40]).unwrap().to_owned())
 }
 
-fn make_repository(root: &PrivateRoot) -> io::Result<(String, String, String, String)> {
+fn make_repository(root: &PrivateRoot) -> io::Result<(String, String, String, String, String)> {
     let path = root.repo();
     let path_arg = path
         .to_str()
@@ -267,7 +269,16 @@ fn make_repository(root: &PrivateRoot) -> io::Result<(String, String, String, St
         ],
         b"",
     )?;
-    let tree = object_id(&checked_git(root, &["-C", path_arg, "mktree"], b"")?)?;
+    let blob = object_id(&checked_git(
+        root,
+        &["-C", path_arg, "hash-object", "-w", "--stdin"],
+        b"fetch fixture payload\n",
+    )?)?;
+    let tree = object_id(&checked_git(
+        root,
+        &["-C", path_arg, "mktree"],
+        format!("100644 blob {blob}\tfixture.txt\n").as_bytes(),
+    )?)?;
     let commit = object_id(&checked_git(
         root,
         &["-C", path_arg, "commit-tree", &tree, "-m", "fixture commit"],
@@ -290,7 +301,193 @@ fn make_repository(root: &PrivateRoot) -> io::Result<(String, String, String, St
         ],
         b"",
     )?;
-    Ok((path_arg.to_owned(), tree, commit, tag_object))
+    Ok((path_arg.to_owned(), blob, tree, commit, tag_object))
+}
+
+fn fetch_pack(
+    mut transport: GitHubTransport,
+    commit: &str,
+    tag: &str,
+) -> io::Result<(Vec<u8>, HttpFinalizationReport)> {
+    use gix_transport::client::blocking_io::{
+        ExtendedBufRead as _, ReadlineBufRead as _, TransportV2Ext as _,
+    };
+
+    let handshake = gix_transport::client::blocking_io::Transport::handshake(
+        &mut transport,
+        gix_transport::Service::UploadPack,
+        &[],
+    )
+    .map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch handshake failed"))?;
+    let protocol = handshake.actual_protocol;
+    let capabilities = handshake.capabilities.clone();
+    drop(handshake);
+    let fetch_count = capabilities
+        .iter()
+        .filter(|capability| capability.name() == "fetch")
+        .count();
+    let format_count = capabilities
+        .iter()
+        .filter(|capability| capability.name() == "object-format")
+        .count();
+    let sha1 = format_count == 0
+        || (format_count == 1
+            && capabilities
+                .capability("object-format")
+                .and_then(|capability| capability.value())
+                .map(|value| value == "sha1")
+                .unwrap_or(false));
+    if protocol != gix_transport::Protocol::V2 || fetch_count != 1 || !sha1 {
+        return Err(safe_error(
+            io::ErrorKind::InvalidData,
+            "unsupported fetch capabilities",
+        ));
+    }
+    let args: Vec<gix_transport::bstr::BString> = vec![
+        format!("want {commit}").into(),
+        format!("want {tag}").into(),
+        "ofs-delta".into(),
+        "no-progress".into(),
+        "done".into(),
+    ];
+    let mut reader = transport
+        .invoke(
+            "fetch",
+            std::iter::empty::<(&str, Option<&str>)>(),
+            Some(args.into_iter()),
+            false,
+        )
+        .map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch request failed"))?;
+    let first = reader
+        .readline()
+        .ok_or_else(|| safe_error(io::ErrorKind::UnexpectedEof, "fetch response missing"))?
+        .map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch response malformed"))?;
+    if !matches!(
+        first,
+        Ok(gix_transport::packetline::PacketLineRef::Data(
+            b"packfile\n"
+        ))
+    ) {
+        return Err(safe_error(
+            io::ErrorKind::InvalidData,
+            "fetch packfile section missing",
+        ));
+    }
+    let mut pack = Vec::new();
+    let mut packets = 0usize;
+    loop {
+        let Some(line) = reader.readline() else {
+            if reader.stopped_at() == Some(gix_transport::client::MessageKind::Flush) {
+                break;
+            }
+            return Err(safe_error(
+                io::ErrorKind::UnexpectedEof,
+                "fetch pack truncated",
+            ));
+        };
+        packets += 1;
+        if packets > MAX_PACKETS {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "fetch packet limit exceeded",
+            ));
+        }
+        let line =
+            line.map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch packet malformed"))?;
+        match line {
+            Ok(gix_transport::packetline::PacketLineRef::Data(data)) if !data.is_empty() => {
+                match data[0] {
+                    1 => {
+                        let payload = &data[1..];
+                        if payload.len() > MAX_PACK.saturating_sub(pack.len()) {
+                            return Err(safe_error(
+                                io::ErrorKind::InvalidData,
+                                "fetch pack limit exceeded",
+                            ));
+                        }
+                        pack.extend_from_slice(payload);
+                    }
+                    2 => {}
+                    3 => {
+                        return Err(safe_error(
+                            io::ErrorKind::InvalidData,
+                            "fetch server reported failure",
+                        ))
+                    }
+                    _ => {
+                        return Err(safe_error(
+                            io::ErrorKind::InvalidData,
+                            "fetch sideband channel invalid",
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "fetch response terminator invalid",
+                ))
+            }
+        }
+    }
+    debug_assert_eq!(
+        reader.stopped_at(),
+        Some(gix_transport::client::MessageKind::Flush)
+    );
+    drop(reader);
+    let finalization = transport.finalize_http_framing()?;
+    if !finalization.is_complete() || pack.is_empty() {
+        return Err(safe_error(
+            io::ErrorKind::UnexpectedEof,
+            "fetch HTTP framing incomplete",
+        ));
+    }
+    Ok((pack, finalization))
+}
+
+fn create_receiver(root: &PrivateRoot, name: &str) -> io::Result<PathBuf> {
+    let path = root.path.join(name);
+    let path_arg = path
+        .to_str()
+        .ok_or_else(|| safe_error(io::ErrorKind::InvalidInput, "receiver path encoding"))?;
+    checked_git(
+        root,
+        &[
+            "init",
+            "--bare",
+            "--template=",
+            "--object-format=sha1",
+            path_arg,
+        ],
+        b"",
+    )?;
+    Ok(path)
+}
+
+fn receiver_path_arg(path: &std::path::Path) -> io::Result<&str> {
+    path.to_str()
+        .ok_or_else(|| safe_error(io::ErrorKind::InvalidInput, "receiver path encoding"))
+}
+
+fn packet_line(data: &str) -> String {
+    format!("{:04x}{data}\n", data.len() + 1 + 4)
+}
+
+fn candidate_transport(
+    repository: RepositoryUrl,
+    tls: &FixtureTls,
+    address: std::net::SocketAddr,
+) -> GitHubTransport {
+    let limits = AttemptLimits::new(16 * 1024 * 1024, Duration::from_secs(10)).unwrap();
+    let raw = RawHttp::for_test(
+        repository.clone(),
+        limits,
+        Arc::clone(&tls.trusted),
+        address,
+        "localhost",
+    )
+    .unwrap();
+    assemble(repository, raw, None).unwrap()
 }
 
 fn read_v2_request(stream: &mut FixtureStream) -> io::Result<(String, String, Vec<u8>)> {
@@ -367,9 +564,9 @@ fn git_upload_pack(root: &PrivateRoot, args: &[&str], input: &[u8]) -> io::Resul
 }
 
 #[test]
-fn observe_refs_interoperates_with_real_git_upload_pack() {
+fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let root = PrivateRoot::create().unwrap();
-    let (repo, _tree, commit, tag_object) = make_repository(&root).unwrap();
+    let (repo, blob, tree, commit, tag_object) = make_repository(&root).unwrap();
     let peeled = object_id(
         &checked_git(
             &root,
@@ -382,68 +579,131 @@ fn observe_refs_interoperates_with_real_git_upload_pack() {
     let tls = fixture_tls();
     let (listener, address) = listener();
     let server_tls = tls.server.clone();
-    let server = thread::spawn(move || -> io::Result<(bool, bool)> {
-        let socket = accept_until(&listener)?;
-        let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
-        stream.sock.deadline = Instant::now() + Duration::from_secs(10);
-        let (method, target, _) = read_v2_request(&mut stream)?;
-        if method != "GET" || target != "/example/repo.git/info/refs?service=git-upload-pack" {
-            return Err(safe_error(
-                io::ErrorKind::InvalidData,
-                "unexpected Git advertisement request",
-            ));
-        }
-        let advertisement = git_upload_pack(
-            &root,
-            &["upload-pack", "--stateless-rpc", "--advertise-refs", &repo],
-            b"",
-        )?;
-        write_response(
-            &mut stream,
-            "application/x-git-upload-pack-advertisement",
-            &advertisement,
-        )?;
-        drop(stream);
+    let expected_commit = commit.clone();
+    let expected_tag = tag_object.clone();
+    let server = thread::spawn(
+        move || -> io::Result<(PrivateRoot, (bool, bool, bool, bool))> {
+            let socket = accept_until(&listener)?;
+            let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
+            stream.sock.deadline = Instant::now() + Duration::from_secs(10);
+            let (method, target, _) = read_v2_request(&mut stream)?;
+            if method != "GET" || target != "/example/repo.git/info/refs?service=git-upload-pack" {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "unexpected Git advertisement request",
+                ));
+            }
+            let advertisement = git_upload_pack(
+                &root,
+                &["upload-pack", "--stateless-rpc", "--advertise-refs", &repo],
+                b"",
+            )?;
+            write_response(
+                &mut stream,
+                "application/x-git-upload-pack-advertisement",
+                &advertisement,
+            )?;
+            drop(stream);
 
-        let socket = accept_until(&listener)?;
-        let mut stream = tls_stream(socket, server_tls)?;
-        stream.sock.deadline = Instant::now() + Duration::from_secs(10);
-        let (method, target, body) = read_v2_request(&mut stream)?;
-        if method != "POST" || target != "/example/repo.git/git-upload-pack" {
-            return Err(safe_error(
-                io::ErrorKind::InvalidData,
-                "unexpected Git upload-pack request",
-            ));
-        }
-        if body != b"0014command=ls-refs\n00010009peel\n000csymrefs\n0000" {
-            return Err(safe_error(
-                io::ErrorKind::InvalidData,
-                "unexpected fixture Git command",
-            ));
-        }
-        let response = git_upload_pack(&root, &["upload-pack", "--stateless-rpc", &repo], &body)?;
-        write_response(
-            &mut stream,
-            "application/x-git-upload-pack-result",
-            &response,
-        )?;
-        Ok((true, true))
-    });
+            let socket = accept_until(&listener)?;
+            let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
+            stream.sock.deadline = Instant::now() + Duration::from_secs(10);
+            let (method, target, body) = read_v2_request(&mut stream)?;
+            if method != "POST" || target != "/example/repo.git/git-upload-pack" {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "unexpected Git upload-pack request",
+                ));
+            }
+            if body != b"0014command=ls-refs\n00010009peel\n000csymrefs\n0000" {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "unexpected fixture Git command",
+                ));
+            }
+            let response =
+                git_upload_pack(&root, &["upload-pack", "--stateless-rpc", &repo], &body)?;
+            write_response(
+                &mut stream,
+                "application/x-git-upload-pack-result",
+                &response,
+            )?;
+            drop(stream);
+
+            let socket = accept_until(&listener)?;
+            let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
+            stream.sock.deadline = Instant::now() + Duration::from_secs(10);
+            let (method, target, _) = read_v2_request(&mut stream)?;
+            if method != "GET" || target != "/example/repo.git/info/refs?service=git-upload-pack" {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "unexpected Git fetch advertisement request",
+                ));
+            }
+            let advertisement = git_upload_pack(
+                &root,
+                &["upload-pack", "--stateless-rpc", "--advertise-refs", &repo],
+                b"",
+            )?;
+            write_response(
+                &mut stream,
+                "application/x-git-upload-pack-advertisement",
+                &advertisement,
+            )?;
+            drop(stream);
+
+            let socket = accept_until(&listener)?;
+            let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
+            stream.sock.deadline = Instant::now() + Duration::from_secs(10);
+            let (method, target, body) = read_v2_request(&mut stream)?;
+            if method != "POST" || target != "/example/repo.git/git-upload-pack" {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "unexpected Git fetch request",
+                ));
+            }
+            let want = format!("want {expected_commit}\n");
+            let tag_want = format!("want {expected_tag}\n");
+            let expected_fetch = [
+                packet_line("command=fetch"),
+                "0001".to_owned(),
+                packet_line(want.trim_end()),
+                packet_line(tag_want.trim_end()),
+                packet_line("ofs-delta"),
+                packet_line("no-progress"),
+                packet_line("done"),
+                "0000".to_owned(),
+            ]
+            .concat();
+            if body != expected_fetch.as_bytes() {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "unexpected fetch request body",
+                ));
+            }
+            let response =
+                git_upload_pack(&root, &["upload-pack", "--stateless-rpc", &repo], &body)?;
+            write_response(
+                &mut stream,
+                "application/x-git-upload-pack-result",
+                &response,
+            )?;
+            Ok((root, (true, true, true, true)))
+        },
+    );
     let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
-    let limits = AttemptLimits::new(16 * 1024 * 1024, Duration::from_secs(10)).unwrap();
-    let raw = RawHttp::for_test(
-        repository.clone(),
-        limits,
-        tls.trusted,
-        address,
-        "localhost",
-    )
-    .unwrap();
-    let report_result = assemble(repository, raw, None).unwrap().observe_refs();
+    let report_result = candidate_transport(repository.clone(), &tls, address).observe_refs();
+    let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let fetch_result = fetch_pack(
+        candidate_transport(fetch_repository, &tls, address),
+        &commit,
+        &tag_object,
+    );
     let server_result = server.join();
+    let (root, server_observations) = server_result.expect("fixture server panicked").unwrap();
+    assert_eq!(server_observations, (true, true, true, true));
     let report = report_result.unwrap();
-    assert!(server_result.is_ok(), "fixture server panicked");
-    assert_eq!(server_result.unwrap().unwrap(), (true, true));
+    let (pack, fetch_finalization) = fetch_result.unwrap();
     assert!(
         report.is_complete(),
         "real Git v2 refs exchange did not complete: {report:?}"
@@ -464,6 +724,92 @@ fn observe_refs_interoperates_with_real_git_upload_pack() {
     assert_eq!(tag.oid(), &hex_oid(&tag_object));
     assert_eq!(tag.peeled(), Some(&hex_oid(&peeled)));
     assert_eq!(report.finalization().framing().completed(), 2);
+
+    assert!(
+        pack.len() <= MAX_PACK && pack.len() <= MAX_GIT_IN,
+        "fixture pack exceeds bounded Git input"
+    );
+    assert!(fetch_finalization.is_complete());
+    assert_eq!(fetch_finalization.framing().completed(), 2);
+
+    let receiver = create_receiver(&root, "receiver.git").unwrap();
+    let receiver_arg = receiver_path_arg(&receiver).unwrap();
+    checked_git(
+        &root,
+        &[
+            "--git-dir",
+            receiver_arg,
+            "index-pack",
+            "--strict",
+            "--stdin",
+        ],
+        &pack,
+    )
+    .unwrap();
+    checked_git(
+        &root,
+        &[
+            "--git-dir",
+            receiver_arg,
+            "fsck",
+            "--strict",
+            "--full",
+            "--no-reflogs",
+        ],
+        b"",
+    )
+    .unwrap();
+    for object in [&blob, &tree, &commit, &tag_object] {
+        checked_git(
+            &root,
+            &["--git-dir", receiver_arg, "cat-file", "-e", object],
+            b"",
+        )
+        .unwrap();
+    }
+
+    let corrupt_receiver = create_receiver(&root, "corrupt-receiver.git").unwrap();
+    let corrupt_arg = receiver_path_arg(&corrupt_receiver).unwrap();
+    let mut corrupted = pack.clone();
+    let checksum = corrupted.last_mut().expect("valid pack has a checksum");
+    *checksum ^= 1;
+    let corrupted_result = run_git(
+        &root,
+        &[
+            "--git-dir",
+            corrupt_arg,
+            "index-pack",
+            "--strict",
+            "--stdin",
+        ],
+        &corrupted,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !corrupted_result.status.success(),
+        "corrupt pack was accepted"
+    );
+
+    let truncated_receiver = create_receiver(&root, "truncated-receiver.git").unwrap();
+    let truncated_arg = receiver_path_arg(&truncated_receiver).unwrap();
+    let truncated_result = run_git(
+        &root,
+        &[
+            "--git-dir",
+            truncated_arg,
+            "index-pack",
+            "--strict",
+            "--stdin",
+        ],
+        &pack[..pack.len() - 1],
+        None,
+    )
+    .unwrap();
+    assert!(
+        !truncated_result.status.success(),
+        "truncated pack was accepted"
+    );
 }
 
 fn hex_oid(value: &str) -> [u8; 20] {
