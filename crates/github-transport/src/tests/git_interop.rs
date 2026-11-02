@@ -1,6 +1,6 @@
 mod budget_file;
 use super::*;
-use budget_file::BudgetFileSink;
+use budget_file::{BudgetFileSink, REGISTRY_NAME, RESERVATION, STORE_ID};
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, MetadataExt},
@@ -517,6 +517,7 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let fetch_report = fetch_result.unwrap();
     pack_sink.sync_and_observe().unwrap();
     let pack = pack_sink.contents().unwrap();
+    assert_eq!(pack_sink.reservation_bytes().unwrap(), RESERVATION);
     let pack_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
     assert!(
         pack_sink.bytes_charged()
@@ -553,6 +554,8 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     );
     assert!(fetch_report.finalization().is_complete());
     assert_eq!(fetch_report.finalization().framing().completed(), 3);
+    drop(pack_sink);
+    assert_durable_reservation_blocks_reopen(&root);
 
     let receiver = create_receiver(&root, "receiver.git").unwrap();
     let receiver_arg = receiver_path_arg(&receiver).unwrap();
@@ -664,4 +667,42 @@ fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
                 .max(partial_metadata.blocks().checked_mul(512).unwrap())
     );
     assert!(report.operation_error_kind().is_some());
+    assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+    drop(sink);
+    assert_durable_reservation_blocks_reopen(&root);
+}
+
+fn assert_durable_reservation_blocks_reopen(root: &PrivateRoot) {
+    use verification_store_registry::{RegistryError, StoreState, VerificationStoreRegistry};
+    let mut registry = VerificationStoreRegistry::open(root.path.join(REGISTRY_NAME)).unwrap();
+    let row = registry.get(STORE_ID).unwrap().unwrap();
+    assert_eq!(row.reserved_bytes, RESERVATION);
+    assert_eq!(row.state, StoreState::NeedsReconciliation);
+    assert_eq!(row.prior_state, Some(StoreState::Registered));
+    assert!(matches!(
+        registry.reserve(STORE_ID, RESERVATION, RESERVATION * 2),
+        Err(RegistryError::ReconciliationRequired)
+    ));
+    assert_eq!(
+        registry.get(STORE_ID).unwrap().unwrap().reserved_bytes,
+        RESERVATION
+    );
+}
+
+#[test]
+fn unreconciled_registry_refuses_payload_creation() {
+    use verification_store_registry::VerificationStoreRegistry;
+    let root = PrivateRoot::create().unwrap();
+    let parent = fs::metadata(root.path.parent().unwrap()).unwrap();
+    let mut registry = VerificationStoreRegistry::open(root.path.join(REGISTRY_NAME)).unwrap();
+    registry
+        .register(STORE_ID, parent.dev(), parent.ino(), root.dev, root.ino)
+        .unwrap();
+    registry.reserve(STORE_ID, 0, RESERVATION).unwrap();
+    drop(registry);
+    let signal = CancellationHandle::new();
+    assert!(BudgetFileSink::new(&root, signal.clone()).is_err());
+    assert!(signal.is_cancelled());
+    assert!(!root.path.join("pack.download").exists());
+    assert_durable_reservation_blocks_reopen(&root);
 }

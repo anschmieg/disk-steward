@@ -226,3 +226,20 @@ reader before asserting evidence. This uses an in-memory sink and no files or
 child subprocesses. It demonstrates why arbitrary blocking `Write` calls still
 need an outer worker; it does not establish production worker/store integration,
 OS kill latency, flush durability or a milestone acceptance gate.
+
+On Linux/macOS, the closed file sink also holds a leased store registry and
+commits a fixed 128 KiB reservation before exclusively creating its payload.
+It samples volume reserve again after registry creation and checks the stored
+reservation/identity binding during sink operations. Observed payload usage
+above that admission cancels the attempt while retaining its actual charge.
+Both the real-Git success case and five-byte refusal then close the sink and
+registry, reopen the record, and require exact reservation retention plus
+reconciliation-based refusal of further admission. A pre-existing unreconciled
+registry must refuse before any payload file is created.
+
+This is a one-store test integration with in-process close/reopen. The fixed
+reservation is not a measured whole-store footprint or reserved filesystem
+capacity; registry/control overhead, shared app-wide admission, process death,
+power loss and production worker lifecycle remain separate gates. The fixture
+is gated to the registry adapter's Linux/macOS targets. No application or
+renderer calls this test sink.
