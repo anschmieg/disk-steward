@@ -1,0 +1,7 @@
+# M0 bounded TLS request-body fixture
+
+Purpose: replace the TLS fixture's POST io::Sink with actual bounded upload bytes and Content-Length framing. The real gix RequestWriter must write its fixed synthetic packet command and flush marker, drop its upload handle, then lazily open/read the response without deadlock. Local server validates and consumes the full bounded body before responding. All raw TLS response ingress remains charged under the existing cap/deadline.
+
+Memory-capped fixture body only; no production streaming or complete repository fetch claim. Oversize upload poisons the pending body, including if a caller ignores a write error. Drop sends a single completion/failure record into a one-slot channel, with no network or blocking work; deferred headers/body expose setup failures normally. Bounded waits/server I/O use the same monotonic attempt deadline. Test negative oversize and missing/unfinished body behavior without external requests or user data.
+
+No production HTTP adapter, credentials, Keychain, remote/DNS, storage, renderer or cleanup. Branch from PR36 head0e9a206, final baseline main. Existing34/35/36 watches remain untouched. Root owns scope/docs/progress; bounded Luna agent owns only TLS test module; concrete root review before tests. Version0.0.17, targeted behavior/Clippy/fmt/version/diff and current-head CI before merge. Free9.3GiB observed; no user-cache cleanup.
