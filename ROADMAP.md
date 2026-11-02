@@ -1,6 +1,6 @@
 # Disk Steward implementation roadmap
 
-Status: **M0 In progress; M1A Complete (five-file disposable macOS debug slice)**; M1B In progress; M1C In progress (bounded migration preparation); M2–M6 and post-MVP tracks remain Planned. Work proceeds on stacked feature branches; see [PROGRESS.md](PROGRESS.md). General review plans use synthetic examples and optional blocked selected-item metadata. File operations remain limited to app-created disposable fixtures. This roadmap authorizes no cleanup, repository changes, remote access, or model requests.
+Status: **M0 In progress; M1A Complete (five-file disposable macOS debug slice)**; M1B In progress; M1C In progress (disposable purge lifecycle implemented; controlled-volume measurement remains open); M2–M6 and post-MVP tracks remain Planned. Work proceeds on stacked feature branches; see [PROGRESS.md](PROGRESS.md). General review plans use synthetic examples and optional blocked selected-item metadata. File operations remain limited to app-created disposable fixtures. This roadmap authorizes no cleanup, repository changes, remote access, or model requests.
 
 ## Delivery approach and forecasting
 
