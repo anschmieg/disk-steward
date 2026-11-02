@@ -414,3 +414,5 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-02 PR45mainintegrationdetail: automaticmerge duplicatedbudget_read_testsmodule frommovedstack/squashcontext, compileE0428caughtbeforepush. Parent44/main sourceidentical andallparentfunctionnames presentin45HEAD; retainedreviewed45HEADsource removingonlyautomergeaddition, stageddiffnowprogress-only. Final39candidate testsPASS+1ignoredchildentry invokedbyparent/fmt/diffPASS, no sourcechange from reviewed45head.
 
 2026-11-02 lateststack: PR46 integrates457f28c87/mainb51a2df; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, currentheadCIrequired/existingwatchpersists. Current55/localnotes preserved/automationenabled.
+
+2026-11-02 PR45mergedmainba0b9ae; PR46retargetedmain/integratedbaseline afterparent45ancestor+main sourceidentical verified; retainedreviewed46source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing46watchpersists/current57localnotes preserved/automationenabled.
