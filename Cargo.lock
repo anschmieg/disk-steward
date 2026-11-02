@@ -277,6 +277,9 @@ dependencies = [
 [[package]]
 name = "disk-steward-worker-probe"
 version = "0.0.17"
+dependencies = [
+ "rustix",
+]
 
 [[package]]
 name = "errno"

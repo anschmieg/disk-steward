@@ -14,10 +14,19 @@ reading after 64 KiB plus one byte, and applies a one-second monotonic deadline.
 On either limit it kills the child, waits for its exit, and joins the reader
 before reporting success.
 
-The executable path comes only from `current_exe()`. Parent arguments are
-limited to none or `--run`; the private child dispatcher accepts only the two
-fixed modes. There are no filesystem, network, credential, shell, or renderer
-operations, and these children create no descendants.
+The executable path comes only from `current_exe()`. The stdout parent cases accept none or `--run`; the private child dispatcher accepts only the two
+fixed modes. These stdout cases have no data-file, network, credential, shell, or renderer
+operations, and their children create no descendants.
+
+`--run-store` is a separate development-only store ownership probe. It creates
+a fresh private directory under the system temporary directory using
+directory-relative exclusive creation, writes a small versioned owner journal,
+then reacquires directory handles and validates their identities and journal.
+Inspection always returns `NeedsReconciliation`; there is no cleanup or retry operation.
+This is live-handle validation, not a process-restart journal registry.
+The probe intentionally leaves the created directory in place, including on
+failure. It does not bind a worker, contain output, measure disk growth, or
+prove crash durability. The command does not grant cleanup authority.
 
 This demonstrates bounded stdout reading and ordinary local child
 kill/reap/thread-join behavior. It does not demonstrate Git ingress or store

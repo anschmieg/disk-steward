@@ -5,6 +5,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod store;
+
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const OUTER_DEADLINE: Duration = Duration::from_secs(1);
 const FLOOD_BYTES: usize = 1024 * 1024;
@@ -81,6 +83,18 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             println!("Cases: bounded stdout flood, one-second stall deadline, and explicit parent cancellation.");
             Ok(())
         }
+        [flag] if flag == "--run-store" => {
+            let store = store::OwnedStore::create()
+                .map_err(|error| format!("create owned store: {error:?}"))?;
+            let state = store
+                .inspect_state()
+                .map_err(|error| format!("inspect owned store: {error:?}"))?;
+            println!(
+                "store_state={state:?} token={} cleanup=not_authorized",
+                store.token()
+            );
+            Ok(())
+        }
         [flag] if flag == "--run" => {
             for case in [Case::Flood, Case::Stall, Case::Cancel] {
                 let report = supervise(case)?;
@@ -111,7 +125,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none or --run".into()),
+        _ => Err("accepted arguments: none, --run, or --run-store".into()),
     }
 }
 
