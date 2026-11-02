@@ -97,6 +97,7 @@ impl OwnedStore {
             if identity(&parent)? != self.parent_id {
                 return Err(StoreError::InvalidIdentity);
             }
+            validate_private_directory(&parent)?;
             let root = openat(
                 &parent,
                 &self.name,
@@ -182,6 +183,7 @@ impl OwnedStore {
             if identity(&parent)? != self.parent_id {
                 return Err(StoreError::InvalidIdentity);
             }
+            validate_private_directory(&parent)?;
             let root = openat(
                 &parent,
                 &self.name,
@@ -245,16 +247,31 @@ impl OwnedStore {
 fn create_supported() -> Result<OwnedStore, StoreError> {
     use rustix::fs::{mkdirat, openat, Mode, OFlags};
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    let parent_path = std::env::temp_dir().canonicalize()?;
-    let parent = open_parent(&parent_path)?;
-    let parent_id = identity(&parent)?;
+    let temp_path = std::env::temp_dir().canonicalize()?;
+    let temp_anchor = open_parent(&temp_path)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| StoreError::InvalidIdentity)?
         .as_nanos();
     let serial = NEXT.fetch_add(1, Ordering::Relaxed);
     let token = format!("{:x}-{:x}-{:x}", std::process::id(), nonce, serial);
-    let name = format!("disk-steward-worker-{token}");
+    let parent_name = format!("disk-steward-worker-{token}");
+    mkdirat(
+        &temp_anchor,
+        &parent_name,
+        Mode::RUSR | Mode::WUSR | Mode::XUSR,
+    )?;
+    let parent = openat(
+        &temp_anchor,
+        &parent_name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    validate_private_directory(&parent)?;
+    let parent_id = identity(&parent)?;
+    let parent_path = temp_path.join(&parent_name);
+    File::from(temp_anchor.try_clone()?).sync_all()?;
+    let name = "store".to_string();
     mkdirat(&parent, &name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
     let root = openat(
         &parent,
@@ -263,6 +280,7 @@ fn create_supported() -> Result<OwnedStore, StoreError> {
         Mode::empty(),
     )?;
     validate_private_directory(&root)?;
+    File::from(parent.try_clone()?).sync_all()?;
     let root_id = identity(&root)?;
     let marker = openat(
         &root,
@@ -364,7 +382,7 @@ mod tests {
     fn another_created_root_cannot_satisfy_recorded_identity() {
         let mut first = OwnedStore::create().unwrap();
         let mut second = OwnedStore::create().unwrap();
-        std::mem::swap(&mut first.name, &mut second.name);
+        std::mem::swap(&mut first.parent_path, &mut second.parent_path);
         assert!(matches!(
             first.inspect_state(),
             Err(StoreError::InvalidIdentity)
@@ -386,6 +404,32 @@ mod tests {
             store.inspect_state(),
             Err(StoreError::InvalidJournal)
         ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn changed_private_parent_mode_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut store = OwnedStore::create().unwrap();
+        let journal = store.parent_path.join(&store.name).join("owner.journal");
+        let original = std::fs::read(&journal).unwrap();
+        assert_eq!(
+            store.parent.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            store.root.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::set_permissions(&store.parent_path, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(matches!(
+            store.inspect_state(),
+            Err(StoreError::InvalidIdentity)
+        ));
+        assert!(store.bind_worker(41).is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), original);
+        std::fs::set_permissions(&store.parent_path, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
