@@ -4,6 +4,9 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod refs;
+pub use refs::AdvertisedRef;
+
 #[cfg(not(test))]
 use std::net::ToSocketAddrs;
 use std::{
@@ -32,6 +35,7 @@ use rustls::pki_types::ServerName;
 
 const HOST: &str = "github.com";
 const MAX_POST: usize = 1024 * 1024;
+const MAX_ADVERTISEMENT: u64 = 64 * 1024;
 const MAX_HEADERS: usize = 8192;
 const MAX_CONTROL_LINE: usize = 8192;
 const MAX_TRAILER_BYTES: usize = 8192;
@@ -262,7 +266,7 @@ impl CancellationHandle {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
-    fn check(&self) -> io::Result<()> {
+    pub(crate) fn check(&self) -> io::Result<()> {
         if self.is_cancelled() {
             Err(safe_error(
                 io::ErrorKind::ConnectionAborted,
@@ -461,6 +465,11 @@ pub struct GitHubTransport {
 }
 
 impl GitHubTransport {
+    /// Observe references advertised by Git protocol v2 `ls-refs`.
+    /// This is metadata only; HTTP response framing must still be finalized.
+    pub fn read_advertised_refs(&mut self) -> io::Result<Vec<AdvertisedRef>> {
+        refs::read_advertised_refs(self)
+    }
     /// Return a cloneable, attempt-scoped cancellation handle.
     pub fn cancellation_handle(&self) -> CancellationHandle {
         self.cancellation.clone()
@@ -774,6 +783,7 @@ struct Body<R> {
     deadline: Instant,
     cancellation: CancellationHandle,
     framing: BodyFraming,
+    decoded_remaining: Option<u64>,
     payload: [u8; BODY_BUFFER],
     payload_start: usize,
     payload_end: usize,
@@ -962,10 +972,23 @@ impl<R: Read> Body<R> {
     fn read_payload(&mut self, limit: usize) -> io::Result<usize> {
         self.cancellation.check()?;
         check_deadline(self.deadline)?;
+        let limit = match self.decoded_remaining {
+            Some(0) => {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "advertisement exceeds limit",
+                ))
+            }
+            Some(left) => limit.min(usize::try_from(left).unwrap_or(usize::MAX)),
+            None => limit,
+        };
         let count = self
             .stream
             .read(&mut self.payload[..limit])
             .map_err(|error| safe_error(error.kind(), "response read failed"))?;
+        if let Some(left) = &mut self.decoded_remaining {
+            *left -= count as u64;
+        }
         check_deadline(self.deadline)?;
         self.cancellation.check()?;
         if count == 0 {
@@ -1214,6 +1237,12 @@ impl RawHttp {
             return Err(safe_error(io::ErrorKind::Other, "HTTP response rejected"));
         }
         let length = parsed.length.unwrap_or(0);
+        if method == "GET" && (length as u64) > MAX_ADVERTISEMENT {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "advertisement exceeds limit",
+            ));
+        }
         let content_type = parsed
             .content_type
             .ok_or_else(|| safe_error(io::ErrorKind::InvalidData, "missing response type"))?;
@@ -1232,6 +1261,7 @@ impl RawHttp {
                 stream: tls,
                 deadline: self.deadline,
                 cancellation: self.cancellation.clone(),
+                decoded_remaining: (method == "GET").then_some(MAX_ADVERTISEMENT),
                 framing: if parsed.chunked {
                     BodyFraming::Chunked(ChunkState::Size)
                 } else {
@@ -2325,6 +2355,7 @@ mod tests {
             stream: Cursor::new(bytes.to_vec()),
             deadline,
             cancellation: CancellationHandle::new(),
+            decoded_remaining: None,
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -2342,6 +2373,7 @@ mod tests {
             stream: Cursor::new(b"cached".to_vec()),
             deadline: Instant::now() + Duration::from_secs(1),
             cancellation: token.clone(),
+            decoded_remaining: None,
             framing: BodyFraming::Fixed(6),
             payload: {
                 let mut payload = [0; BODY_BUFFER];
@@ -2464,6 +2496,7 @@ mod tests {
             stream: Cursor::new(bytes.to_vec()),
             deadline: Instant::now() + Duration::from_secs(1),
             cancellation: CancellationHandle::new(),
+            decoded_remaining: None,
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -2525,6 +2558,7 @@ mod tests {
             stream: NoRead,
             deadline: Instant::now() + Duration::from_secs(1),
             cancellation: CancellationHandle::new(),
+            decoded_remaining: None,
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -2673,6 +2707,7 @@ mod tests {
             stream: SlowByte { sent: false },
             deadline: Instant::now() + Duration::from_millis(1),
             cancellation: CancellationHandle::new(),
+            decoded_remaining: None,
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -3632,6 +3667,170 @@ mod tests {
         assert!(server.join().is_ok());
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
+    fn ref_packet(line: &[u8]) -> Vec<u8> {
+        let mut packet = format!("{:04x}", line.len() + 4).into_bytes();
+        packet.extend_from_slice(line);
+        packet
+    }
+
+    fn ref_caps(lines: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = ref_packet(b"version 2\n");
+        for line in lines {
+            bytes.extend(ref_packet(line));
+        }
+        bytes.extend_from_slice(b"0000");
+        bytes
+    }
+
+    fn observe_ref_fixture(
+        caps: Vec<u8>,
+        response: Option<Vec<u8>>,
+    ) -> (io::Result<Vec<AdvertisedRef>>, HttpFinalizationReport) {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, Arc::clone(&tls.server)).unwrap();
+            let (method, target, _, _) = read_request(&mut stream).unwrap();
+            assert_eq!(method, "GET");
+            assert_eq!(
+                target,
+                "/example/repo.git/info/refs?service=git-upload-pack"
+            );
+            write_response(
+                &mut stream,
+                "application/x-git-upload-pack-advertisement",
+                &caps,
+            )
+            .unwrap();
+            if let Some(response) = response {
+                let socket = accept_until(&listener).unwrap();
+                let mut stream = tls_stream(socket, tls.server).unwrap();
+                let (method, target, body, _) = read_request(&mut stream).unwrap();
+                assert_eq!(method, "POST");
+                assert_eq!(target, "/example/repo.git/git-upload-pack");
+                assert_eq!(
+                    body,
+                    b"0014command=ls-refs\n00010009peel\n000csymrefs\n0000"
+                );
+                write_response(
+                    &mut stream,
+                    "application/x-git-upload-pack-result",
+                    &response,
+                )
+                .unwrap();
+            }
+        });
+        let mut transport = transport_at(address, tls.trusted, AttemptLimits::default());
+        let result = transport.read_advertised_refs();
+        let finalized = transport.finalize_http_framing().unwrap();
+        server.join().unwrap();
+        (result, finalized)
+    }
+
+    #[test]
+    fn actual_ls_refs_observes_metadata_and_finalizes_http_separately() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let mut response = Vec::new();
+        for line in [
+            format!("{oid} HEAD symref-target:refs/heads/main\n"),
+            format!("{oid} refs/heads/main\n"),
+            format!("{oid} refs/tags/v1 peeled:{oid}\n"),
+        ] {
+            response.extend(ref_packet(line.as_bytes()));
+        }
+        response.extend_from_slice(b"0000");
+        let (result, finalized) = observe_ref_fixture(
+            ref_caps(&[b"ls-refs\n", b"object-format=sha1\n"]),
+            Some(response),
+        );
+        let refs = result.unwrap();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].name(), b"HEAD");
+        assert_eq!(refs[0].symref_target(), Some(b"refs/heads/main".as_slice()));
+        assert_eq!(refs[2].peeled(), Some(refs[2].oid()));
+        assert!(finalized.is_complete());
+        assert_eq!(finalized.framing().completed(), 2);
+    }
+
+    #[test]
+    fn ls_refs_rejects_unsupported_capabilities_before_post() {
+        for caps in [
+            ref_caps(&[]),
+            ref_caps(&[b"ls-refs\n", b"object-format=sha256\n"]),
+            ref_caps(&[b"ls-refs\n", b"ls-refs\n"]),
+            ref_caps(&[
+                b"ls-refs\n",
+                b"object-format=sha1\n",
+                b"object-format=sha1\n",
+            ]),
+        ] {
+            let (result, _) = observe_ref_fixture(caps, None);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn ls_refs_rejects_duplicates_truncation_and_excess_results_without_partial_success() {
+        let line = b"0123456789abcdef0123456789abcdef01234567 refs/heads/main\n";
+        let mut duplicate = ref_packet(line);
+        duplicate.extend(ref_packet(line));
+        duplicate.extend_from_slice(b"0000");
+        let mut excess = Vec::new();
+        for n in 0..1025 {
+            excess.extend(ref_packet(
+                format!("0123456789abcdef0123456789abcdef01234567 refs/heads/b{n}\n").as_bytes(),
+            ));
+        }
+        excess.extend_from_slice(b"0000");
+        for (response, expected_error) in [
+            (duplicate, Some("advertised reference limit or duplicate")),
+            (ref_packet(line), None),
+            (excess, Some("advertised reference limit or duplicate")),
+            (b"0001".to_vec(), None),
+        ] {
+            let (result, finalized) =
+                observe_ref_fixture(ref_caps(&[b"ls-refs\n"]), Some(response));
+            let error = result.unwrap_err();
+            if let Some(expected) = expected_error {
+                assert_eq!(error.to_string(), expected);
+            }
+            // HTTP completion alone cannot establish Git protocol completion.
+            assert!(finalized.is_complete());
+        }
+    }
+
+    #[test]
+    fn decoded_get_limit_allows_exact_termination_and_rejects_extra_data() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exact = chunk_body(b"3\r\nabc\r\n0\r\n\r\n", deadline);
+        exact.decoded_remaining = Some(3);
+        let mut bytes = Vec::new();
+        exact.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abc");
+        let mut excess = chunk_body(b"4\r\nabcd\r\n0\r\n\r\n", deadline);
+        excess.decoded_remaining = Some(3);
+        assert!(excess.read_to_end(&mut Vec::new()).is_err());
+        assert!(excess.read(&mut [0]).is_err());
+    }
+
+    #[test]
+    fn oversized_fixed_advertisement_is_rejected_before_git_parsing() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, tls.server).unwrap();
+            read_request(&mut stream).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: 65537\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+        });
+        let mut transport = transport_at(address, tls.trusted, AttemptLimits::default());
+        assert!(transport.read_advertised_refs().is_err());
+        assert!(!transport.finalize_http_framing().unwrap().is_complete());
+        server.join().unwrap();
+    }
+
     const OUTER_CHILD_READY: &[u8] = b"CANDIDATE_TLS_GET_VALIDATED\n";
 
     /// Exact child entry point for the outer-worker deadline proof.

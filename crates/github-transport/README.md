@@ -45,6 +45,18 @@ This crate is an implementation candidate, not a completed Git fetch, M0
 validation, or production-readiness claim. Its fixture endpoint and trust roots
 are private test-only seams.
 
+`GitHubTransport::read_advertised_refs()` performs an upload-pack handshake and
+issues protocol v2 `ls-refs` only when the server actually selected v2,
+advertised exactly one `ls-refs` capability, and advertised absent (default
+SHA-1) or exactly one `object-format=sha1`. It requests `peel` and `symrefs` and
+returns at most 1,024 parsed refs. The v2 GET advertisement is capped at 64 KiB
+of decoded body data before gix parses capabilities. Each ls-refs packet line is limited to 4 KiB and
+each refname/target to 1 KiB. It preserves refname and symref target bytes and
+returns fixed-width SHA-1 IDs. This operation observes remote claims only: it
+does not fetch objects, prove object existence, or authorize removal. Call
+`finalize_http_framing()` separately; the ls-refs flush is not an HTTP framing
+receipt.
+
 An ignored exact-child unit test can be launched by
 `tests::outer_deadline_stops_actual_candidate_tls_handshake`. Its child runs the
 actual candidate transport against the private loopback TLS fixture, which

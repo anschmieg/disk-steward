@@ -9,6 +9,7 @@ publish = false
 gix-transport = { version = "=0.60.0", default-features = false, features = ["blocking-client", "http-client"] }
 gix-error = "=0.4.0"
 gix-url = "=0.39.0"
+gix-validate = "=0.12.0"
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "=1.0.9"
 
