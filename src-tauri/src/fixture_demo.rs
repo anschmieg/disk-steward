@@ -248,6 +248,15 @@ mod tests {
     #[test]
     fn second_live_instance_cannot_edit_the_shared_plan() {
         let directory = tempfile::tempdir().expect("isolated app data");
+        // The app-owned root is private (0700) in production; mirror it here
+        // so the purge control store's private-parent check passes.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions =
+                std::fs::metadata(directory.path()).expect("root metadata").permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(directory.path(), permissions).expect("root permissions");
+        }
         let owner = super::DemoExecutionService::open(directory.path()).expect("first owner");
         let second = super::FixtureDemoState::from_result(
             super::DemoExecutionService::open(directory.path()).map_err(super::public_error),

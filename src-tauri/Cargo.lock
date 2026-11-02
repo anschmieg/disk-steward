@@ -613,6 +613,7 @@ dependencies = [
  "approval-ledger",
  "disk-steward-core",
  "disk-steward-fixture-lifecycle",
+ "disk-steward-fixture-purge",
  "disk-steward-review-plan",
  "rusqlite",
  "rustix",
@@ -661,6 +662,19 @@ dependencies = [
  "disk-steward-core",
  "rusqlite",
  "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "disk-steward-fixture-purge"
+version = "0.0.12"
+dependencies = [
+ "disk-steward-core",
+ "disk-steward-fixture-lifecycle",
+ "disk-steward-review-plan",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
