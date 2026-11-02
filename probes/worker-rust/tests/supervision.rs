@@ -85,6 +85,45 @@ fn creator_process_death_allows_read_only_store_reinspection() {
 }
 
 #[test]
+fn indexed_store_worker_reopens_as_reconciliation_without_cleanup_authority() {
+    let output = probe()
+        .arg("--run-indexed-store-worker")
+        .output()
+        .expect("run indexed worker");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    for evidence in [
+        "worker_joined=true",
+        "registered_stopped=true",
+        "reopened_reconciliation=true",
+        "prior_stopped=true",
+        "cleanup=not_authorized",
+    ] {
+        assert!(report.contains(evidence), "{report}");
+    }
+    let refused = probe()
+        .args(["--run-indexed-store-worker", "extra"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    let combined = probe()
+        .args([
+            "--run-indexed-store-worker",
+            "--run-store-cleanup",
+            "--confirm-own-store-cleanup",
+        ])
+        .output()
+        .unwrap();
+    assert!(!combined.status.success());
+    assert!(combined.stdout.is_empty());
+}
+
+#[test]
 fn arbitrary_parent_arguments_are_rejected() {
     let output = probe()
         .arg("/bin/sh")

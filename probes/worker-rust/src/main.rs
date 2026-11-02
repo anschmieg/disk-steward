@@ -118,6 +118,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
         }
         [flag] if flag == "--run-store-worker" => run_store_worker(),
         [flag] if flag == "--run-store-reinspect" => run_store_reinspect(),
+        [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(),
         [flag, confirm] if flag == "--run-store-cleanup" && confirm == "--confirm-own-store-cleanup" => run_store_worker_with_cleanup(true),
         [flag] if flag == "--run-store-cleanup" => Err("refusing store cleanup without --confirm-own-store-cleanup".into()),
         [flag] if flag == "--run" => {
@@ -150,8 +151,126 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, --run-store-worker, --run-store-reinspect, or --run-store-cleanup --confirm-own-store-cleanup".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
+}
+
+fn run_indexed_store_worker() -> Result<(), String> {
+    use verification_store_registry::{
+        RegistryError, StoreState as RState, VerificationStoreRegistry,
+    };
+    const FIXTURE_ID: &str = "0123456789abcdef0123456789abcdef";
+    let mut store = store::OwnedStore::create().map_err(|e| format!("create store: {e}"))?;
+    let registry_path = store
+        .control_registry_path()
+        .map_err(|e| format!("validate generated store parent: {e}"))?;
+    let (parent, root) = store
+        .control_identity()
+        .map_err(|e| format!("validate store identity: {e}"))?;
+    let mut registry = VerificationStoreRegistry::open(&registry_path)
+        .map_err(|e| format!("open private registry: {e}"))?;
+    registry
+        .register(FIXTURE_ID, parent.0, parent.1, root.0, root.1)
+        .map_err(|e| format!("register store: {e}"))?;
+    let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
+    let mut child = Command::new(exe)
+        .arg("--child")
+        .arg("stall")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("start fixed child: {e}"))?;
+    let pid = child.id();
+    if let Err(e) = store.bind_worker(pid) {
+        return match stop_and_reap(&mut child) {
+            Ok(()) => Err(format!("bind worker: {e}")),
+            Err(s) => Err(format!("bind worker: {e}; cleanup failed: {s}")),
+        };
+    }
+    let stdout = match child.stdout.take() {
+        Some(v) => v,
+        None => {
+            return match stop_and_reap(&mut child) {
+                Ok(()) => Err("child stdout unavailable".into()),
+                Err(e) => Err(format!("child stdout unavailable; cleanup failed: {e}")),
+            }
+        }
+    };
+    let (tx, rx) = mpsc::sync_channel(2);
+    let reader = match thread::Builder::new()
+        .name("indexed-store-stdout".into())
+        .spawn(move || read_bounded(stdout, tx))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return match stop_and_reap(&mut child) {
+                Ok(()) => Err(format!("start reader: {e}")),
+                Err(s) => Err(format!("start reader: {e}; cleanup failed: {s}")),
+            }
+        }
+    };
+    if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
+        return finish_after_error(child, reader, rx, e);
+    }
+    if let Err(e) = registry.transition(FIXTURE_ID, RState::Registered, RState::Active) {
+        return finish_after_error(child, reader, rx, format!("activate store: {e}"));
+    }
+    if let Err(e) = stop_and_reap(&mut child) {
+        let _ = reader.join();
+        return Err(format!("child shutdown unconfirmed: {e}"));
+    }
+    if reader.join().is_err() {
+        return Err("reader join failed; stop receipt withheld".into());
+    }
+    let status = child
+        .try_wait()
+        .map_err(|e| format!("confirm child exit: {e}"))?
+        .ok_or("child exit missing")?;
+    let (bytes, failed) = drain_reader_result(&rx)?;
+    if failed || bytes != 1 {
+        return Err("unexpected worker output; stop receipt withheld".into());
+    }
+    let receipt = StopReceipt::confirmed(store.token(), pid);
+    store
+        .record_stopped(&receipt)
+        .map_err(|e| format!("record stopped: {e}"))?;
+    registry
+        .transition(FIXTURE_ID, RState::Active, RState::Stopped)
+        .map_err(|e| format!("record registry stop: {e}"))?;
+    let live_state = store
+        .inspect_state()
+        .map_err(|e| format!("inspect store: {e}"))?;
+    drop(registry);
+    drop(store);
+    let mut reopened = VerificationStoreRegistry::open(&registry_path)
+        .map_err(|e| format!("reopen private registry: {e}"))?;
+    let record = reopened
+        .get(FIXTURE_ID)
+        .map_err(|e| format!("read reopened registry: {e}"))?
+        .ok_or("registry row disappeared")?;
+    if record.state != RState::NeedsReconciliation
+        || record.prior_state != Some(RState::Stopped)
+        || (
+            record.parent_dev,
+            record.parent_ino,
+            record.root_dev,
+            record.root_ino,
+        ) != (parent.0, parent.1, root.0, root.1)
+    {
+        return Err("reopened registry identity/state mismatch".into());
+    }
+    match reopened.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
+        Err(RegistryError::InvalidTransition) => {}
+        Err(other) => {
+            return Err(format!(
+                "retry refusal was not the expected lifecycle gate: {other}"
+            ))
+        }
+        Ok(_) => return Err("reopened reconciliation row unexpectedly became active".into()),
+    }
+    println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+    Ok(())
 }
 
 fn run_store_worker() -> Result<(), String> {

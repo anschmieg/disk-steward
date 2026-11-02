@@ -87,7 +87,19 @@ enum Phase {
     Stopped(u32),
 }
 
+pub(crate) type ControlIdentity = ((u64, u64), (u64, u64));
+
 impl OwnedStore {
+    pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {
+        self.inspect_state()?;
+        Ok(self.parent_path.join("verification-registry.sqlite3"))
+    }
+
+    pub(crate) fn control_identity(&self) -> Result<ControlIdentity, StoreError> {
+        self.inspect_state()?;
+        Ok((self.parent_id, self.root_id))
+    }
+
     /// Creates a fresh private parent and store. There is intentionally no
     /// caller-supplied path and no TempDir/drop cleanup behavior.
     pub fn create() -> Result<Self, StoreError> {
