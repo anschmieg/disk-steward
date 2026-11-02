@@ -30,6 +30,7 @@ pub struct PackTransferReport {
     bytes_written: u64,
     operation_error_kind: Option<io::ErrorKind>,
     finalization: HttpFinalizationReport,
+    advertised_refs: Option<Vec<AdvertisedRef>>,
 }
 
 impl PackTransferReport {
@@ -49,21 +50,32 @@ impl PackTransferReport {
         &self.finalization
     }
 
+    /// Syntax-validated ref claims from this transfer's own advertisement, available only
+    /// when the pack operation and tracked HTTP framing both completed.
+    /// These remain unverified server claims, not proof of object integrity.
+    pub fn advertised_refs(&self) -> Option<&[AdvertisedRef]> {
+        self.advertised_refs.as_deref()
+    }
+
     /// True only when the Git pack section completed and all tracked HTTP
     /// response bodies finalized successfully. This is not object verification.
     pub fn is_complete_transfer(&self) -> bool {
         self.operation_error_kind.is_none()
             && self.bytes_written > 0
             && self.finalization.is_complete()
+            && self.advertised_refs.is_some()
     }
 }
 
 /// Stream the pack for every distinct freshly advertised SHA-1 ref tip into a
 /// caller-owned sink, then finalize all tracked HTTP response bodies.
 ///
-/// This operation never exposes refs or claims that transferred bytes form a
-/// complete or valid Git object graph. Any bytes accepted before an error remain
-/// in the caller's sink and are the caller's responsibility to retain or remove.
+/// The report exposes refs only when both this pack operation and the HTTP
+/// finalization complete. Those are unverified server-advertised claims bound
+/// to the same attempt. They do not establish object integrity, completeness,
+/// reachability, retention, an atomic ref snapshot, recoverability, or cleanup
+/// eligibility. Any bytes accepted before an error remain in the caller's sink
+/// and are the caller's responsibility to retain or remove.
 pub(super) fn download_advertised_pack(
     mut transport: GitHubTransport,
     sink: &mut impl Write,
@@ -84,11 +96,17 @@ pub(super) fn download_advertised_pack(
     if operation.is_err() {
         cancellation.cancel();
     }
+    let operation_error_kind = operation.as_ref().err().map(io::Error::kind);
     let finalization = transport.finalize_http_framing()?;
+    let advertised_refs = match operation {
+        Ok(refs) if finalization.is_complete() => Some(refs),
+        _ => None,
+    };
     Ok(PackTransferReport {
         bytes_written,
-        operation_error_kind: operation.err().map(|error| error.kind()),
+        operation_error_kind,
         finalization,
+        advertised_refs,
     })
 }
 
@@ -98,7 +116,7 @@ fn transfer_pack(
     cancellation: &CancellationHandle,
     deadline: Instant,
     bytes_written: &mut u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<AdvertisedRef>> {
     check_attempt(cancellation, deadline)?;
     let refs = crate::refs::read_advertised_refs_for_fetch(transport)?;
     let tips = distinct_tips(&refs)?;
@@ -237,7 +255,7 @@ fn transfer_pack(
             "fetch pack stream incomplete",
         ));
     }
-    Ok(())
+    Ok(refs)
 }
 
 fn distinct_tips(refs: &[AdvertisedRef]) -> io::Result<Vec<[u8; 20]>> {
