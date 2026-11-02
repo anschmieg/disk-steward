@@ -1,0 +1,38 @@
+# GitHub HTTPS transport
+
+An isolated candidate gix HTTP transport adapter for GitHub smart HTTP. The
+factory validates a repository URL and returns an unconnected gix transport;
+network activity begins only when the caller starts its handshake. It accepts
+only `https://github.com/{owner}/{repo}` or the same path ending in `.git`,
+with no userinfo, port, query, fragment, escapes, or additional path segments.
+The exact accepted path is preserved.
+
+The adapter has a shared raw socket ingress ceiling and monotonic attempt
+deadline across the gix GET and POST. It uses rustls with the bundled WebPKI
+root set and hostname verification. The root set is compiled into the binary;
+updating Mozilla roots and matching packaged-app trust policy remain release
+gates, and this is not the operating system trust store. Redirects, non-2xx responses, compression,
+chunked framing, malformed/ambiguous headers, and oversized POST requests fail
+closed. POST request data is buffered only up to its fixed cap and sent after
+gix closes the request writer.
+
+Credentials are optional and explicit. This crate does not access Keychain,
+credential helpers, environment variables, proxies, or renderer APIs. Callers
+must supply credentials through their own app-owned broker. Errors are
+sanitized and do not include input URLs, headers, bodies, or credentials.
+
+The synchronous system DNS lookup happens outside a cancellable socket read;
+checking the deadline before and after it does not make DNS itself bounded. A
+production caller must run the attempt in an outer worker with a hard deadline.
+This crate is an implementation candidate, not a completed Git fetch, M0
+validation, or production-readiness claim. Its fixture endpoint and trust roots
+are private test-only seams.
+
+`observed_ingress_bytes()` reports socket bytes charged beneath TLS, including
+failed attempts, without exposing the socket or credentials. The public gix
+wrapper forces request tracing off and rejects later identity changes and
+transport configuration. Tokens, Basic Authorization strings and gix's internal
+copies are not proven zeroized; no secure-memory or credential-broker gate is
+claimed. The per-request buffered upload cap is 1 MiB, and framing restrictions
+may reject otherwise legitimate GitHub responses. Such outcomes are incomplete
+verification, never grounds to relax an approval or removal check.

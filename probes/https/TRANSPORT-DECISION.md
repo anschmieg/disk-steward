@@ -21,3 +21,32 @@ libgit2 provides connect and server read/write timeouts through `git_libgit2_opt
 - Demonstrate cancellation overshoot, temporary-store cleanup, and correct fail-closed behavior with local adversarial tests and an explicitly consented private GitHub fixture.
 
 The current Python probe demonstrates bounded reading of a single `info/refs` response only. It neither selects libgit2/gix for production nor proves full fetch/object ingress limits, credential storage behavior, or repository verification.
+
+## 2026-11-02 implementation direction
+
+The pinned local Rust experiments now cover gix HTTP GET and POST response
+connections, an actual bounded POST packet body, and raw socket reads beneath
+rustls. Their byte counter includes encrypted handshake records and HTTP
+traffic returned from reads. It excludes traffic waiting in OS buffers and
+NIC-level ingress. Generated localhost certificates use normal trust and
+hostname verification. An exact subprocess helper separately proves outer
+termination of a blocked local gix read; it does not exercise production DNS.
+
+The next candidate is a custom gix HTTP backend using the tested raw-socket
+boundary beneath rustls, rather than a response-body wrapper around reqwest or
+curl. Its public endpoint boundary is restricted to GitHub HTTPS and does not
+expose a connector or trust-store override. It is not activated in the app.
+Construction must perform no network I/O; explicit operations still require
+an outer worker and app-mediated approval/credentials before app integration.
+The compiled Mozilla root set is a candidate trust policy; packaged-app root
+updates and platform trust behavior remain unvalidated.
+
+| Gate | Remaining evidence |
+| --- | --- |
+| Total attempt deadline | Supervise production DNS/connect/TLS/read in an isolated worker; local socket deadlines alone do not bound synchronous system DNS or OS kill latency |
+| Full Git protocol | Validate actual refs/objects and bounded temporary stores; a capped synthetic POST is not a complete fetch |
+| Response compatibility | Establish behavior when a legitimate remote uses unsupported framing, compression or large request negotiation; refusal leaves verification incomplete |
+| Private authentication | Integrate the app credential broker and Keychain, then test an explicitly consented private GitHub fixture and denied/revoked credentials |
+| Storage/concurrency | Connect durable ownership, observed metadata/payload growth, aggregate accounting, reserve sampling, cancellation and cleanup; local fixture accounting is not a global quota |
+
+No complete M0 gate or M4 delivery estimate follows from these local results.
