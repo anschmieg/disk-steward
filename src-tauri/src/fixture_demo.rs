@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use disk_steward_core::{ReceiptId, ReviewId, RevisionId};
+use disk_steward_core::{ActionId, ReceiptId, ReviewId, RevisionId};
 use disk_steward_demo_execution::{
     DemoError, DemoExecutionResult, DemoExecutionService, DemoStatus, PreparedDemoReview,
 };
@@ -22,9 +22,29 @@ impl FixtureDemoState {
         let service = (|| {
             let directory = app.path().app_data_dir().map_err(|_| unavailable())?;
             std::fs::create_dir_all(&directory).map_err(|_| unavailable())?;
-            let metadata = std::fs::symlink_metadata(&directory).map_err(|_| unavailable())?;
-            if !metadata.file_type().is_dir() {
-                return Err(unavailable());
+            // The app-owned root must be private to the app's user: tighten
+            // it (never widen) so the control stores' private-parent checks
+            // hold (contract fixture-purge-v1).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let metadata = std::fs::symlink_metadata(&directory).map_err(|_| unavailable())?;
+                if !metadata.file_type().is_dir() {
+                    return Err(unavailable());
+                }
+                let mode = metadata.permissions().mode();
+                if mode & 0o077 != 0 {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(mode & !0o077);
+                    std::fs::set_permissions(&directory, permissions).map_err(|_| unavailable())?;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let metadata = std::fs::symlink_metadata(&directory).map_err(|_| unavailable())?;
+                if !metadata.file_type().is_dir() {
+                    return Err(unavailable());
+                }
             }
             DemoExecutionService::open(&directory).map_err(public_error)
         })();
@@ -61,6 +81,20 @@ pub(crate) struct RestoreRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ExecutionRequest {
     review_id: ReviewId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PurgeTargetRequest {
+    action_id: ActionId,
+    receipt_id: ReceiptId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PreparePurgeRequest {
+    expected_revision_id: RevisionId,
+    targets: Vec<PurgeTargetRequest>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -195,6 +229,82 @@ pub(crate) async fn request_fixture_execution(
     })
     .await
     .map_err(|_| unavailable())?
+}
+
+#[tauri::command]
+pub(crate) async fn prepare_purge_review(
+    request: PreparePurgeRequest,
+    state: tauri::State<'_, FixtureDemoState>,
+) -> Result<disk_steward_fixture_purge::PreparedPurgeReview, FixtureDemoError> {
+    with_service(&state, move |service| {
+        let targets = request
+            .targets
+            .into_iter()
+            .map(|target| disk_steward_fixture_purge::PurgeTarget {
+                action_id: target.action_id,
+                receipt_id: target.receipt_id,
+            })
+            .collect();
+        service.prepare_purge_review(request.expected_revision_id, targets)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn confirm_purge_execution(
+    request: ExecutionRequest,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, FixtureDemoState>,
+) -> Result<disk_steward_fixture_purge::PurgeExecutionResult, FixtureDemoError> {
+    let guard = crate::NativeCheckGuard::acquire().map_err(|_| FixtureDemoError {
+        code: "native_check_busy",
+        message: "Finish the open native review before starting another.",
+    })?;
+    let window = app.get_webview_window("main").ok_or_else(unavailable)?;
+    let service = Arc::clone(&state.service);
+    tauri::async_runtime::spawn_blocking(move || {
+        // Keep the process-wide guard alive across the native callback and
+        // the service's mandatory post-dialog revalidation and execution.
+        let _native_guard = guard;
+        let mut guard = service.lock().map_err(|_| unavailable())?;
+        let service = guard.as_mut().map_err(|error| *error)?;
+        service
+            .confirm_purge_execution(request.review_id, |prepared| {
+                let summary = purge_summary(prepared);
+                app.dialog()
+                    .message(summary)
+                    .title("Permanently remove staged demo files")
+                    .parent(&window)
+                    .buttons(MessageDialogButtons::OkCancelCustom(
+                        "Remove permanently".into(),
+                        "Cancel".into(),
+                    ))
+                    .blocking_show()
+            })
+            .map_err(public_error)
+    })
+    .await
+    .map_err(|_| unavailable())?
+}
+
+/// The purge dialog states that the selected staged examples will be
+/// permanently removed, lists each exact label and logical size, states this
+/// cannot be undone through the app, and explains that logical bytes are not
+/// a promise of free-space recovery (contract fixture-purge-v1).
+fn purge_summary(prepared: &disk_steward_fixture_purge::PreparedPurgeReview) -> String {
+    use std::fmt::Write as _;
+    let mut summary = String::from(
+        "The selected staged demo files will be permanently removed. This cannot be undone through the app.\n\n",
+    );
+    for target in &prepared.targets {
+        let _ = writeln!(summary, "{} — {} bytes", target.label, target.logical_bytes);
+    }
+    let _ = write!(
+        summary,
+        "\nTotal: {} logical bytes. Logical bytes are not a promise of free-space recovery.",
+        prepared.selected_logical_bytes
+    );
+    summary
 }
 
 fn native_summary(review: &PreparedDemoReview) -> String {

@@ -1,6 +1,6 @@
 [package]
 name = "disk-steward-desktop"
-version = "0.0.12"
+version = "0.0.13"
 description = "Disk Steward desktop application"
 authors = ["Disk Steward"]
 edition = "2021"
@@ -19,6 +19,7 @@ disk-steward-plan-store = { path = "../crates/plan-store" }
 disk-steward-core = { path = "../crates/disk-steward-core" }
 disk-steward-review-plan = { path = "../crates/review-plan" }
 disk-steward-demo-execution = { path = "../crates/demo-execution" }
+disk-steward-fixture-purge = { path = "../crates/fixture-purge" }
 serde = { version = "1.0.229", features = ["derive"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.8.4"
