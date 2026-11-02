@@ -4,7 +4,7 @@
 //! It has no filesystem authority beyond opening its caller-supplied database path.
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use disk_steward_core::{ReviewId, RevisionId};
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 const APP_ID: i64 = 0x4453_5053; // DSPS
 const SCHEMA_VERSION: i64 = 1;
 const MAX_REVIEWS: i64 = 16;
+const OPEN_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REVIEW_CONTRACT: &str = "disk-steward-general-review-v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +116,31 @@ pub struct ReviewSummary {
     pub logical_selected_bytes: u64,
 }
 
+/// Journal-mode conversion can report BUSY without calling SQLite's busy
+/// handler when another opener is validating the initialized database. Retry
+/// only this idempotent setup pragma, with one shared deadline. Keep it after
+/// schema validation; do not change journal mode on an unknown database.
+fn enable_wal(connection: &Connection, timeout: Duration) -> rusqlite::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let result = loop {
+        connection.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
+        match connection.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => break Ok(()),
+            Err(error) => {
+                let busy = matches!(&error, rusqlite::Error::SqliteFailure(code, _)
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !busy || remaining.is_zero() {
+                    break Err(error);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+    };
+    connection.busy_timeout(OPEN_BUSY_TIMEOUT)?;
+    result
+}
+
 impl GeneralPlanStore {
     /// Opens a trusted application-owned database path and seeds an empty database once.
     pub fn open(path: impl AsRef<Path>, scale: FixtureScale) -> StoreResult<Self> {
@@ -127,10 +153,10 @@ impl GeneralPlanStore {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(OPEN_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         initialize(&mut connection, scale)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        enable_wal(&connection, OPEN_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self { connection })
     }
@@ -789,6 +815,39 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn wal_conversion_is_bounded_by_a_reader_and_succeeds_after_release() {
+        let (_directory, path) = db();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("CREATE TABLE fixture (value INTEGER); INSERT INTO fixture VALUES (1);")
+            .unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT * FROM fixture;")
+            .unwrap();
+        let converter = Connection::open(&path).unwrap();
+        let started = Instant::now();
+        let error = enable_wal(&converter, Duration::from_millis(40)).unwrap_err();
+        assert!(matches!(error, rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::DatabaseBusy));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mode: String = converter
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            reader.execute_batch("ROLLBACK").unwrap();
+        });
+        let conversion = enable_wal(&converter, Duration::from_secs(1));
+        release.join().unwrap();
+        conversion.unwrap();
+        let mode: String = converter
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
     }
 
     #[test]
