@@ -184,3 +184,33 @@ fn explicitly_confirmed_cleanup_uses_real_child_shutdown() {
     );
     assert!(report.contains("worker_pid="), "{report}");
 }
+
+#[test]
+fn fixed_payload_command_caps_writes_and_rejects_extra_authority() {
+    for args in [
+        vec!["--run-store-payload-fixture", "/tmp/caller-path"],
+        vec![
+            "--run-store-payload-fixture",
+            "--run-store-cleanup",
+            "--confirm-own-store-cleanup",
+        ],
+    ] {
+        let output = probe()
+            .args(args)
+            .output()
+            .expect("reject extra payload arguments");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    let output = probe()
+        .arg("--run-store-payload-fixture")
+        .output()
+        .expect("run owned payload fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(),
+        "payload_written=32768 payload_limit=32768 cap_reached=true state=NeedsReconciliation cleanup=not_authorized\n");
+}

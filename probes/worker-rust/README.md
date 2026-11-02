@@ -113,3 +113,21 @@ Both private levels retain pinned identities and require the current UID and
 0700 mode before inspection or journal updates. The temporary anchor, parent,
 root and journal are synchronized during creation. No automatic cleanup or
 restart adoption is introduced.
+
+`--run-store-payload-fixture` creates one fresh private store and exclusively
+creates its fixed `payload.bin`. It attempts 64 KiB of deterministic nonzero
+fixture data in chunks no larger than 4 KiB, stopping at a 32 KiB logical cap.
+Before payload creation and each chunk it samples free space on the root FD,
+requiring the 2 GiB minimum reserve plus probe-specific 1 MiB headroom and the
+pending bytes. It checks the named/held file identity, regular-file metadata,
+private ownership and current length before writing. There are no caller path,
+size or filename parameters. Extra arguments and cleanup combinations refuse
+before work begins.
+
+This command retains all artifacts, including partial or uncertain outcomes on
+write/sync failure, and returns no store handle or cleanup receipt. The owner
+journal format and existing cleanup logic are unchanged: that cleanup refuses
+the added payload entry before mutation. The result measures bounded logical
+writes and sampled reserve gating only, not allocated disk growth, an aggregate
+quota, Git object writes, a continuously maintained reserve against other
+writers, calibrated production headroom or power-loss durability.

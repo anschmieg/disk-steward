@@ -116,6 +116,15 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        [flag] if flag == "--run-store-payload-fixture" => {
+            let store = store::OwnedStore::create()
+                .map_err(|_| "create payload fixture store failed".to_owned())?;
+            let report = store.write_payload_fixture()
+                .map_err(|_| "payload fixture incomplete; retain store for reconciliation".to_owned())?;
+            println!("payload_written={} payload_limit={} cap_reached={} state=NeedsReconciliation cleanup=not_authorized",
+                report.written_bytes, report.limit_bytes, report.cap_reached);
+            Ok(())
+        }
         [flag] if flag == "--run-store-worker" => run_store_worker(),
         [flag] if flag == "--run-store-reinspect" => run_store_reinspect(),
         [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(),
@@ -151,7 +160,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, or --run-store-cleanup --confirm-own-store-cleanup".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
 }
 
