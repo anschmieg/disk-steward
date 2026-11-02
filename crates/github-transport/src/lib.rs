@@ -12,7 +12,10 @@ use std::{
     fmt,
     io::{self, BufRead, Cursor, Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -195,6 +198,34 @@ pub struct AttemptLimits {
     timeout: Duration,
 }
 
+/// Cloneable, one-way cancellation signal for one transport attempt.
+#[derive(Clone)]
+pub struct CancellationHandle(Arc<AtomicBool>);
+
+impl CancellationHandle {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+    /// Cancel the associated attempt. Cancellation cannot be reset.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    fn check(&self) -> io::Result<()> {
+        if self.is_cancelled() {
+            Err(safe_error(
+                io::ErrorKind::ConnectionAborted,
+                "attempt cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl Default for AttemptLimits {
     fn default() -> Self {
         Self {
@@ -312,11 +343,20 @@ pub fn connect(
     limits: AttemptLimits,
     credential: Option<AppCredential>,
 ) -> io::Result<GitHubTransport> {
+    connect_with_cancellation(repository, limits, credential, CancellationHandle::new())
+}
+
+fn connect_with_cancellation(
+    repository: RepositoryUrl,
+    limits: AttemptLimits,
+    credential: Option<AppCredential>,
+    cancellation: CancellationHandle,
+) -> io::Result<GitHubTransport> {
     let config = Arc::new(client_config()?);
     #[cfg(test)]
-    let http = RawHttp::new(repository.clone(), limits, config, None);
+    let http = RawHttp::new(repository.clone(), limits, config, cancellation, None);
     #[cfg(not(test))]
-    let http = RawHttp::new(repository.clone(), limits, config);
+    let http = RawHttp::new(repository.clone(), limits, config, cancellation);
     assemble(repository, http, credential)
 }
 
@@ -327,6 +367,7 @@ fn assemble(
 ) -> io::Result<GitHubTransport> {
     let budget = http.budget.clone();
     let framing = http.framing.clone();
+    let cancellation = http.cancellation.clone();
     let url = gix_url::parse(repository.base())
         .map_err(|_| safe_error(io::ErrorKind::InvalidInput, "invalid repository URL"))?;
     let mut inner = gix_transport::client::blocking_io::http::Transport::new_http(
@@ -353,6 +394,7 @@ fn assemble(
         inner,
         budget,
         framing,
+        cancellation,
     })
 }
 
@@ -361,9 +403,14 @@ pub struct GitHubTransport {
     inner: gix_transport::client::blocking_io::http::Transport<RawHttp>,
     budget: Budget,
     framing: ResponseLedger,
+    cancellation: CancellationHandle,
 }
 
 impl GitHubTransport {
+    /// Return a cloneable, attempt-scoped cancellation handle.
+    pub fn cancellation_handle(&self) -> CancellationHandle {
+        self.cancellation.clone()
+    }
     /// Read-only response-framing counts. A poisoned ledger returns an error.
     pub fn http_framing_snapshot(&self) -> io::Result<HttpFramingSnapshot> {
         self.framing.snapshot()
@@ -429,6 +476,14 @@ fn safe_error(kind: io::ErrorKind, message: &'static str) -> io::Error {
     io::Error::new(kind, message)
 }
 
+fn request_io_error(cancellation: &CancellationHandle, message: &'static str) -> io::Error {
+    if cancellation.is_cancelled() {
+        safe_error(io::ErrorKind::ConnectionAborted, "attempt cancelled")
+    } else {
+        safe_error(io::ErrorKind::Other, message)
+    }
+}
+
 fn client_config() -> io::Result<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -445,6 +500,7 @@ fn client_config() -> io::Result<rustls::ClientConfig> {
 struct Budget {
     max: u64,
     used: Arc<Mutex<u64>>,
+    cancellation: CancellationHandle,
 }
 impl Budget {
     fn reserve_read(
@@ -468,8 +524,10 @@ impl Budget {
             ));
         }
         let n = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
-        let count = read_until(stream, deadline, &mut out[..n])?;
+        self.cancellation.check()?;
+        let count = read_until(stream, deadline, &self.cancellation, &mut out[..n])?;
         *used = used.saturating_add(count as u64);
+        self.cancellation.check()?;
         check_deadline(deadline)?;
         Ok(count)
     }
@@ -479,6 +537,7 @@ struct CountedSocket {
     stream: TcpStream,
     budget: Budget,
     deadline: Instant,
+    cancellation: CancellationHandle,
 }
 fn check_deadline(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
@@ -490,8 +549,14 @@ fn check_deadline(deadline: Instant) -> io::Result<()> {
         Ok(())
     }
 }
-fn read_until(stream: &mut TcpStream, deadline: Instant, out: &mut [u8]) -> io::Result<usize> {
+fn read_until(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    cancellation: &CancellationHandle,
+    out: &mut [u8],
+) -> io::Result<usize> {
     loop {
+        cancellation.check()?;
         check_deadline(deadline)?;
         stream.set_read_timeout(Some(
             deadline
@@ -509,12 +574,22 @@ fn read_until(stream: &mut TcpStream, deadline: Instant, out: &mut [u8]) -> io::
             {
                 continue
             }
-            result => return result,
+            Ok(count) => return Ok(count),
+            Err(error) => {
+                cancellation.check()?;
+                return Err(error);
+            }
         }
     }
 }
-fn write_until(stream: &mut TcpStream, deadline: Instant, mut data: &[u8]) -> io::Result<()> {
+fn write_until(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    cancellation: &CancellationHandle,
+    mut data: &[u8],
+) -> io::Result<()> {
     while !data.is_empty() {
+        cancellation.check()?;
         check_deadline(deadline)?;
         stream.set_write_timeout(Some(
             deadline
@@ -528,7 +603,10 @@ fn write_until(stream: &mut TcpStream, deadline: Instant, mut data: &[u8]) -> io
                     "transport write failed",
                 ))
             }
-            Ok(n) => data = &data[n..],
+            Ok(n) => {
+                cancellation.check()?;
+                data = &data[n..]
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -551,14 +629,16 @@ impl Read for CountedSocket {
 }
 impl Write for CountedSocket {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        write_until(&mut self.stream, self.deadline, b)?;
+        write_until(&mut self.stream, self.deadline, &self.cancellation, b)?;
         Ok(b.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         check_deadline(self.deadline)?;
+        self.cancellation.check()?;
         self.stream
             .flush()
-            .map_err(|_| safe_error(io::ErrorKind::Other, "transport write failed"))
+            .map_err(|_| safe_error(io::ErrorKind::Other, "transport write failed"))?;
+        self.cancellation.check()
     }
 }
 
@@ -567,6 +647,7 @@ type NetworkBody = rustls::StreamOwned<rustls::ClientConnection, CountedSocket>;
 struct Body<R> {
     stream: R,
     deadline: Instant,
+    cancellation: CancellationHandle,
     framing: BodyFraming,
     payload: [u8; BODY_BUFFER],
     payload_start: usize,
@@ -591,6 +672,9 @@ impl<R: Read> BufRead for Body<R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if let Some(kind) = self.failed {
             return Err(body_error(kind));
+        }
+        if let Err(error) = self.cancellation.check() {
+            return Err(self.fail(error));
         }
         if let Err(error) = check_deadline(self.deadline) {
             return Err(self.fail(error));
@@ -631,6 +715,7 @@ impl<R: Read> Body<R> {
     }
 
     fn read_byte(&mut self) -> io::Result<u8> {
+        self.cancellation.check()?;
         check_deadline(self.deadline)?;
         let mut byte = [0];
         let count = self
@@ -638,6 +723,7 @@ impl<R: Read> Body<R> {
             .read(&mut byte)
             .map_err(|error| safe_error(error.kind(), "response read failed"))?;
         check_deadline(self.deadline)?;
+        self.cancellation.check()?;
         if count == 0 {
             return Err(safe_error(
                 io::ErrorKind::UnexpectedEof,
@@ -677,6 +763,7 @@ impl<R: Read> Body<R> {
     }
 
     fn advance(&mut self) -> io::Result<bool> {
+        self.cancellation.check()?;
         check_deadline(self.deadline)?;
         loop {
             match self.framing {
@@ -748,12 +835,14 @@ impl<R: Read> Body<R> {
     }
 
     fn read_payload(&mut self, limit: usize) -> io::Result<usize> {
+        self.cancellation.check()?;
         check_deadline(self.deadline)?;
         let count = self
             .stream
             .read(&mut self.payload[..limit])
             .map_err(|error| safe_error(error.kind(), "response read failed"))?;
         check_deadline(self.deadline)?;
+        self.cancellation.check()?;
         if count == 0 {
             return Err(safe_error(
                 io::ErrorKind::UnexpectedEof,
@@ -790,6 +879,7 @@ struct RawHttp {
     deadline: Instant,
     budget: Budget,
     framing: ResponseLedger,
+    cancellation: CancellationHandle,
     config: Arc<rustls::ClientConfig>,
     #[cfg(test)]
     fixture: Option<(SocketAddr, Arc<str>)>,
@@ -804,6 +894,7 @@ impl RawHttp {
         repository: RepositoryUrl,
         limits: AttemptLimits,
         config: Arc<rustls::ClientConfig>,
+        cancellation: CancellationHandle,
         #[cfg(test)] fixture: Option<(SocketAddr, Arc<str>)>,
     ) -> Self {
         Self {
@@ -813,8 +904,10 @@ impl RawHttp {
             budget: Budget {
                 max: limits.ingress_bytes,
                 used: Arc::new(Mutex::new(0)),
+                cancellation: cancellation.clone(),
             },
             framing: ResponseLedger::default(),
+            cancellation,
             config,
             #[cfg(test)]
             fixture,
@@ -838,10 +931,12 @@ impl RawHttp {
             repository,
             limits,
             config,
+            CancellationHandle::new(),
             Some((endpoint, Arc::from(server_name))),
         ))
     }
     fn connect_socket(&self) -> io::Result<CountedSocket> {
+        self.cancellation.check()?;
         check_deadline(self.deadline)?;
         #[cfg(test)]
         let endpoint = match self.fixture {
@@ -859,21 +954,28 @@ impl RawHttp {
             .map_err(|_| safe_error(io::ErrorKind::Other, "name resolution failed"))?
             .collect();
         check_deadline(self.deadline)?;
+        self.cancellation.check()?;
         let mut last = None;
         for addr in endpoint {
+            self.cancellation.check()?;
             check_deadline(self.deadline)?;
             match TcpStream::connect_timeout(
                 &addr,
                 self.deadline.saturating_duration_since(Instant::now()),
             ) {
                 Ok(stream) => {
+                    self.cancellation.check()?;
                     return Ok(CountedSocket {
                         stream,
                         budget: self.budget.clone(),
                         deadline: self.deadline,
-                    })
+                        cancellation: self.cancellation.clone(),
+                    });
                 }
-                Err(_) => last = Some(()),
+                Err(_) => {
+                    self.cancellation.check()?;
+                    last = Some(());
+                }
             }
         }
         let _ = last;
@@ -951,15 +1053,15 @@ impl RawHttp {
         }
         req.push_str("\r\n");
         tls.write_all(req.as_bytes())
-            .map_err(|_| safe_error(io::ErrorKind::Other, "request write failed"))?;
+            .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
         if let Some(b) = body {
             tls.write_all(&b)
-                .map_err(|_| safe_error(io::ErrorKind::Other, "request write failed"))?;
+                .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
             tls.flush()
-                .map_err(|_| safe_error(io::ErrorKind::Other, "request write failed"))?;
+                .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
         }
         tls.flush()
-            .map_err(|_| safe_error(io::ErrorKind::Other, "request write failed"))?;
+            .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
         let mut raw = Vec::new();
         let mut byte = [0];
         while !raw.ends_with(b"\r\n\r\n") {
@@ -969,8 +1071,9 @@ impl RawHttp {
                     "response headers exceed limit",
                 ));
             }
-            tls.read_exact(&mut byte)
-                .map_err(|_| safe_error(io::ErrorKind::Other, "response headers unavailable"))?;
+            tls.read_exact(&mut byte).map_err(|_| {
+                request_io_error(&self.cancellation, "response headers unavailable")
+            })?;
             raw.push(byte[0]);
         }
         let parsed = parse_headers(&raw)?;
@@ -1001,6 +1104,7 @@ impl RawHttp {
             Body {
                 stream: tls,
                 deadline: self.deadline,
+                cancellation: self.cancellation.clone(),
                 framing: if parsed.chunked {
                     BodyFraming::Chunked(ChunkState::Size)
                 } else {
@@ -1040,9 +1144,14 @@ struct LazyPost {
     sender: mpsc::SyncSender<Option<Vec<u8>>>,
     data: Vec<u8>,
     failed: bool,
+    cancellation: CancellationHandle,
 }
 impl Write for LazyPost {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self.cancellation.check() {
+            self.failed = true;
+            return Err(error);
+        }
         if self.failed || self.data.len().saturating_add(b.len()) > MAX_POST {
             self.failed = true;
             return Err(safe_error(
@@ -1054,6 +1163,10 @@ impl Write for LazyPost {
         Ok(b.len())
     }
     fn flush(&mut self) -> io::Result<()> {
+        if let Err(error) = self.cancellation.check() {
+            self.failed = true;
+            return Err(error);
+        }
         if self.failed {
             Err(safe_error(io::ErrorKind::InvalidData, "POST body failed"))
         } else {
@@ -1091,6 +1204,9 @@ struct PostState {
 }
 impl PostState {
     fn fail_response(&mut self, kind: io::ErrorKind) -> io::Error {
+        if let Some(first) = self.failed {
+            return safe_error(first, "POST failed");
+        }
         self.failed = Some(kind);
         if let Some(mut evidence) = self.evidence.take() {
             if let Err(error) = evidence.fail() {
@@ -1101,24 +1217,36 @@ impl PostState {
     }
 
     fn init(&mut self) -> io::Result<()> {
-        if self.headers.is_some() {
-            return Ok(());
-        }
         if let Some(kind) = self.failed {
             return Err(safe_error(kind, "POST failed"));
         }
-        let data = match self
-            .receiver
-            .recv_timeout(self.http.deadline.saturating_duration_since(Instant::now()))
-        {
-            Ok(Some(data)) => data,
-            Ok(None) => {
-                return Err(self.fail_response(io::ErrorKind::InvalidData));
+        self.http
+            .cancellation
+            .check()
+            .map_err(|e| self.fail_response(e.kind()))?;
+        if self.headers.is_some() {
+            return Ok(());
+        }
+        let data = loop {
+            if let Err(error) = self.http.cancellation.check() {
+                return Err(self.fail_response(error.kind()));
             }
-            Err(_) => {
+            let left = self.http.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(self.fail_response(io::ErrorKind::TimedOut));
             }
+            match self.receiver.recv_timeout(left.min(IO_SLICE)) {
+                Ok(Some(data)) => break data,
+                Ok(None) => return Err(self.fail_response(io::ErrorKind::InvalidData)),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(self.fail_response(io::ErrorKind::InvalidData))
+                }
+            }
         };
+        if let Err(error) = self.http.cancellation.check() {
+            return Err(self.fail_response(error.kind()));
+        }
         let evidence = self
             .evidence
             .take()
@@ -1273,6 +1401,7 @@ impl Http for RawHttp {
                     deadline: self.deadline,
                     budget: self.budget.clone(),
                     framing: self.framing.clone(),
+                    cancellation: self.cancellation.clone(),
                     config: Arc::clone(&self.config),
                     #[cfg(test)]
                     fixture: self.fixture.clone(),
@@ -1288,6 +1417,7 @@ impl Http for RawHttp {
                     sender: tx,
                     data: Vec::new(),
                     failed: false,
+                    cancellation: self.cancellation.clone(),
                 },
                 headers: Headers {
                     cursor: Cursor::new(Vec::new()),
@@ -1801,7 +1931,12 @@ mod tests {
                 ));
             }
             let allowed = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
-            let n = read_until(&mut self.stream, self.deadline, &mut out[..allowed])?;
+            let n = read_until(
+                &mut self.stream,
+                self.deadline,
+                &CancellationHandle::new(),
+                &mut out[..allowed],
+            )?;
             self.used = self.used.saturating_add(n as u64);
             self.timeout()?;
             Ok(n)
@@ -2039,6 +2174,7 @@ mod tests {
         Body {
             stream: Cursor::new(bytes.to_vec()),
             deadline,
+            cancellation: CancellationHandle::new(),
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -2048,10 +2184,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cancelled_cached_body_fails_stickily_and_marks_response_failed() {
+        let ledger = ResponseLedger::default();
+        let token = CancellationHandle::new();
+        let mut body = Body {
+            stream: Cursor::new(b"cached".to_vec()),
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancellation: token.clone(),
+            framing: BodyFraming::Fixed(6),
+            payload: {
+                let mut payload = [0; BODY_BUFFER];
+                payload[..6].copy_from_slice(b"cached");
+                payload
+            },
+            payload_start: 0,
+            payload_end: 6,
+            failed: None,
+            evidence: Some(ledger.reserve().unwrap().into_body()),
+        };
+        token.cancel();
+        assert_eq!(
+            body.fill_buf().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            body.fill_buf().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            body.read_exact(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.failed(), 1);
+        assert_eq!(snapshot.completed(), 0);
+    }
+
+    #[test]
+    fn cancellation_before_connect_refuses_loopback_connection() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+        let token = CancellationHandle::new();
+        token.cancel();
+        let http = RawHttp::new(
+            repository,
+            AttemptLimits::default(),
+            tls.trusted,
+            token,
+            Some((address, Arc::from("localhost"))),
+        );
+        assert!(
+            matches!(http.connect_socket(), Err(error) if error.kind() == io::ErrorKind::ConnectionAborted)
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn public_cancellation_is_one_way_and_attempt_scoped() {
+        let first = connect(
+            RepositoryUrl::parse("https://github.com/a/b").unwrap(),
+            AttemptLimits::default(),
+            None,
+        )
+        .unwrap();
+        let second = connect(
+            RepositoryUrl::parse("https://github.com/a/b").unwrap(),
+            AttemptLimits::default(),
+            None,
+        )
+        .unwrap();
+        let handle = first.cancellation_handle();
+        let clone = handle.clone();
+        assert!(!clone.is_cancelled());
+        handle.cancel();
+        handle.cancel();
+        assert!(clone.is_cancelled());
+        assert!(first.cancellation_handle().is_cancelled());
+        assert!(!second.cancellation_handle().is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_synchronized_loopback_response_read() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+        let token = CancellationHandle::new();
+        let mut http = RawHttp::new(
+            repository,
+            AttemptLimits::default(),
+            tls.trusted.clone(),
+            token.clone(),
+            Some((address, Arc::from("localhost"))),
+        );
+        let ledger = http.framing.clone();
+        let server_config = Arc::clone(&tls.server);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, server_config).unwrap();
+            let _ = read_request(&mut stream).unwrap();
+            ready_tx.send(()).unwrap();
+            // Keep the response absent until the client has observed cancellation.
+            let mut byte = [0];
+            let _ = stream.read(&mut byte);
+        });
+        let client = thread::spawn(move || {
+            http.request(
+                "GET",
+                "/info/refs?service=git-upload-pack",
+                Vec::new(),
+                None,
+                ledger.reserve().unwrap(),
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        token.cancel();
+        assert!(
+            matches!(client.join().unwrap(), Err(error) if error.kind() == io::ErrorKind::ConnectionAborted)
+        );
+        server.join().unwrap();
+    }
+
     fn tracked_chunk_body(bytes: &[u8], ledger: &ResponseLedger) -> Body<Cursor<Vec<u8>>> {
         Body {
             stream: Cursor::new(bytes.to_vec()),
             deadline: Instant::now() + Duration::from_secs(1),
+            cancellation: CancellationHandle::new(),
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -2112,6 +2374,7 @@ mod tests {
         let body = Body {
             stream: NoRead,
             deadline: Instant::now() + Duration::from_secs(1),
+            cancellation: CancellationHandle::new(),
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -2259,6 +2522,7 @@ mod tests {
         let mut body = Body {
             stream: SlowByte { sent: false },
             deadline: Instant::now() + Duration::from_millis(1),
+            cancellation: CancellationHandle::new(),
             framing: BodyFraming::Chunked(ChunkState::Size),
             payload: [0; BODY_BUFFER],
             payload_start: 0,
@@ -2725,7 +2989,47 @@ mod tests {
                 body.fill_buf().unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
+            http.cancellation.cancel();
         }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn cancelled_lazy_post_wait_stops_before_connect() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+        let token = CancellationHandle::new();
+        let mut http = RawHttp::new(
+            repository.clone(),
+            AttemptLimits::default(),
+            tls.trusted,
+            token.clone(),
+            Some((address, Arc::from("localhost"))),
+        );
+        let PostResponse {
+            post_body,
+            mut headers,
+            ..
+        } = http
+            .post(
+                &format!("{}/git-upload-pack", repository.base()),
+                repository.base(),
+                [
+                    "Content-Type: application/x-git-upload-pack-request",
+                    "Accept: application/x-git-upload-pack-result",
+                ],
+                PostBodyDataKind::BoundedAndFitsIntoMemory,
+            )
+            .unwrap();
+        drop(post_body);
+        token.cancel();
+        assert_eq!(
+            headers.fill_buf().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
         );
