@@ -127,16 +127,45 @@ impl BudgetController {
         Ok(id)
     }
 
-    /// Account a received network chunk. Oversized/impossible accounting blocks
-    /// the job and preserves any already-accounted store bytes.
+    /// Account a received network chunk. Charge observed bytes even when they
+    /// exceed the ingress limit or the counter overflows. Observations remain
+    /// admissible after failure or cancellation while the worker may still be
+    /// receiving data; stopped and completed jobs reject further observations.
     pub fn record_ingress(&mut self, id: JobId, bytes: u64) -> Result<(), BudgetError> {
-        let job = self.running_mut(id)?;
-        let next = match job.usage.ingress_bytes.checked_add(bytes) {
-            Some(v) if v <= PER_REPOSITORY_INGRESS_LIMIT => v,
-            Some(_) => return Self::block_job(job, BlockReason::IngressLimit),
-            None => return Self::block_job(job, BlockReason::ArithmeticOverflow),
+        let job = self.jobs.get_mut(&id).ok_or(BudgetError::UnknownJob(id))?;
+        let may_still_receive = matches!(
+            job.state,
+            JobState::Running
+                | JobState::Failed {
+                    worker_stopped: false,
+                    ..
+                }
+                | JobState::Canceled {
+                    worker_stopped: false,
+                    ..
+                }
+        );
+        if !may_still_receive {
+            return Err(BudgetError::Blocked(BlockReason::JobNotRunning));
+        }
+        let overflow = job.usage.ingress_bytes.checked_add(bytes).is_none();
+        job.usage.ingress_bytes = job.usage.ingress_bytes.saturating_add(bytes);
+        let reason = if overflow {
+            Some(BlockReason::ArithmeticOverflow)
+        } else if job.usage.ingress_bytes > PER_REPOSITORY_INGRESS_LIMIT {
+            Some(BlockReason::IngressLimit)
+        } else {
+            None
         };
-        job.usage.ingress_bytes = next;
+        if let Some(reason) = reason {
+            if job.state == JobState::Running {
+                job.state = JobState::Failed {
+                    reason,
+                    worker_stopped: false,
+                };
+            }
+            return Err(BudgetError::Blocked(reason));
+        }
         Ok(())
     }
 
@@ -433,6 +462,7 @@ mod tests {
             b.record_ingress(id, u64::MAX),
             Err(BudgetError::Blocked(BlockReason::IngressLimit))
         );
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, u64::MAX);
         let mut b = BudgetController::new(Limits {
             headroom_bytes: u64::MAX,
         });
@@ -440,6 +470,135 @@ mod tests {
             b.start(u64::MAX),
             Err(BudgetError::Blocked(BlockReason::ArithmeticOverflow))
         );
+    }
+
+    #[test]
+    fn ingress_charges_over_limit_observations_and_rejects_after_stop() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        assert_eq!(
+            b.record_ingress(id, PER_REPOSITORY_INGRESS_LIMIT + 5),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().usage.ingress_bytes,
+            PER_REPOSITORY_INGRESS_LIMIT + 5
+        );
+        assert_eq!(
+            b.record_ingress(id, 7),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().usage.ingress_bytes,
+            PER_REPOSITORY_INGRESS_LIMIT + 12
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().state,
+            JobState::Failed {
+                reason: BlockReason::IngressLimit,
+                worker_stopped: false,
+            }
+        );
+        b.acknowledge_worker_stopped(id).unwrap();
+        assert_eq!(
+            b.record_ingress(id, 1),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().usage.ingress_bytes,
+            PER_REPOSITORY_INGRESS_LIMIT + 12
+        );
+    }
+
+    #[test]
+    fn late_ingress_after_cancel_is_charged_without_resurrecting_job() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        b.cancel(id).unwrap();
+        b.record_ingress(id, 42).unwrap();
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, 42);
+        assert_eq!(
+            b.snapshot(id).unwrap().state,
+            JobState::Canceled {
+                cleanup_confirmed: false,
+                worker_stopped: false,
+            }
+        );
+        b.acknowledge_worker_stopped(id).unwrap();
+        assert_eq!(
+            b.record_ingress(id, 9),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, 42);
+        assert_eq!(
+            b.snapshot(id).unwrap().state,
+            JobState::Canceled {
+                cleanup_confirmed: false,
+                worker_stopped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn late_over_limit_ingress_after_failure_keeps_original_failure() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        b.fail(id, BlockReason::AttemptTimedOut).unwrap();
+        assert_eq!(
+            b.record_ingress(id, PER_REPOSITORY_INGRESS_LIMIT + 1),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().usage.ingress_bytes,
+            PER_REPOSITORY_INGRESS_LIMIT + 1
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().state,
+            JobState::Failed {
+                reason: BlockReason::AttemptTimedOut,
+                worker_stopped: false,
+            }
+        );
+        b.acknowledge_worker_stopped(id).unwrap();
+        assert_eq!(
+            b.record_ingress(id, 1),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+    }
+
+    #[test]
+    fn ingress_overflow_saturates_and_completion_closes_observations() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        b.cancel(id).unwrap();
+        let canceled = b.snapshot(id).unwrap().state;
+        assert_eq!(
+            b.record_ingress(id, u64::MAX),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(
+            b.record_ingress(id, 1),
+            Err(BudgetError::Blocked(BlockReason::ArithmeticOverflow))
+        );
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, u64::MAX);
+        assert_eq!(b.snapshot(id).unwrap().state, canceled);
+        assert_eq!(
+            b.complete(id),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(
+            b.confirm_cleanup(id),
+            Err(BudgetError::Blocked(BlockReason::CleanupNotPending))
+        );
+        b.acknowledge_worker_stopped(id).unwrap();
+        let next = b.start(free()).unwrap();
+        b.record_ingress(next, 12).unwrap();
+        b.complete(next).unwrap();
+        assert_eq!(
+            b.record_ingress(next, 1),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(b.snapshot(next).unwrap().usage.ingress_bytes, 12);
     }
 
     #[test]
