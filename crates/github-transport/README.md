@@ -45,6 +45,19 @@ This crate is an implementation candidate, not a completed Git fetch, M0
 validation, or production-readiness claim. Its fixture endpoint and trust roots
 are private test-only seams.
 
+An ignored exact-child unit test can be launched by
+`tests::outer_deadline_stops_actual_candidate_tls_handshake`. Its child runs the
+actual candidate transport against the private loopback TLS fixture, which
+validates the complete GET target before printing a bounded readiness sentinel
+and then withholds the HTTP response. The parent uses a three-second monotonic
+outer deadline against a 30-second candidate attempt, captures at most 1 KiB
+of child stdout, and kills, waits for, and joins the bounded output reader
+before checking the evidence. This demonstrates process-level termination of
+this blocked handshake on the platform where run. It does not establish hard
+OS kill latency, descendant-tree termination, storage cleanup, worker
+integration, or M0 completion. The ignored child is intentionally excluded
+from ordinary test runs and must be invoked through its exact parent test.
+
 `observed_ingress_bytes()` reports socket bytes charged beneath TLS, including
 failed attempts, without exposing the socket or credentials. The public gix
 wrapper forces request tracing off and rejects later identity changes and

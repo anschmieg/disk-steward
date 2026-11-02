@@ -1911,6 +1911,7 @@ mod tests {
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::{
         net::{Ipv4Addr, TcpListener},
+        process::{Command, Stdio},
         thread,
     };
 
@@ -3281,6 +3282,181 @@ mod tests {
         };
         assert!(server.join().is_ok());
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+    const OUTER_CHILD_READY: &[u8] = b"CANDIDATE_TLS_GET_VALIDATED\n";
+
+    /// Exact child entry point for the outer-worker deadline proof.
+    #[test]
+    #[ignore = "invoked only by the exact candidate transport deadline parent"]
+    fn candidate_tls_blocked_handshake_child() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let server_config = tls.server.clone();
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).expect("accept candidate TLS connection");
+            let sock = FixtureSocket {
+                stream: socket,
+                // Keep the fixture socket's own deadline beyond the parent's
+                // outer deadline; the child must stay blocked in the candidate.
+                deadline: Instant::now() + Duration::from_secs(35),
+                used: 0,
+                cap: 1024 * 1024,
+            };
+            let conn = rustls::ServerConnection::new(server_config)
+                .expect("create private fixture TLS server");
+            let mut stream = rustls::StreamOwned::new(conn, sock);
+            let (method, target, _, _) =
+                read_request(&mut stream).expect("read complete candidate request over TLS");
+            assert_eq!(method, "GET", "candidate must issue GET");
+            assert_eq!(
+                target, "/example/repo.git/info/refs?service=git-upload-pack",
+                "candidate must preserve the validated repository path"
+            );
+            println!("{}", std::str::from_utf8(OUTER_CHILD_READY).unwrap().trim());
+            io::stdout().flush().expect("flush validated GET sentinel");
+            // Do not write an HTTP response. The outer supervisor must stop
+            // this process before its 30-second candidate deadline.
+            thread::sleep(Duration::from_secs(35));
+        });
+
+        let repository = RepositoryUrl::parse("https://github.com/example/repo.git")
+            .expect("validated fixture repository");
+        let limits = AttemptLimits::new(1024 * 1024, Duration::from_secs(30))
+            .expect("candidate's bounded inner limits");
+        let raw = RawHttp::for_test(
+            repository.clone(),
+            limits,
+            tls.trusted,
+            address,
+            "localhost",
+        )
+        .expect("private loopback test endpoint");
+        let mut transport = assemble(repository, raw, None).expect("assemble candidate transport");
+        let _result = transport.handshake(Service::UploadPack, &[]);
+        // The server thread result is intentionally not joined: it is sleeping
+        // without a response, and the parent terminates this child process.
+        panic!("candidate handshake returned before outer stop; server={server:?}");
+    }
+
+    #[test]
+    fn outer_deadline_stops_actual_candidate_tls_handshake() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let outer_deadline = Instant::now() + Duration::from_secs(3);
+        let mut child = Command::new(executable)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("tests::candidate_tls_blocked_handshake_child")
+            .arg("--nocapture")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn exact candidate child test");
+
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let kill = child.kill();
+                let wait = child.wait();
+                panic!("child stdout pipe unavailable; kill={kill:?}; wait={wait:?}");
+            }
+        };
+        #[derive(Debug)]
+        enum OutputEvent {
+            Ready,
+            Finished { bytes: usize, failed: bool },
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let reader = thread::Builder::new()
+            .name("candidate-deadline-output".into())
+            .spawn(move || {
+                let mut stdout = stdout;
+                let mut captured = [0u8; 1024];
+                let mut used = 0usize;
+                let mut matched = false;
+                let mut failed = false;
+                let mut byte = [0u8; 1];
+                while used < captured.len() {
+                    match stdout.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            captured[used] = byte[0];
+                            used += 1;
+                            if !matched && captured[..used].ends_with(OUTER_CHILD_READY) {
+                                matched = true;
+                                let _ = tx.send(OutputEvent::Ready);
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                let _ = tx.send(OutputEvent::Finished {
+                    bytes: used,
+                    failed,
+                });
+            });
+
+        let reader = match reader {
+            Ok(reader) => reader,
+            Err(error) => {
+                let kill = child.kill();
+                let wait = child.wait();
+                panic!("spawn bounded output reader: {error}; kill={kill:?}; wait={wait:?}");
+            }
+        };
+
+        let readiness = rx.recv_timeout(outer_deadline.saturating_duration_since(Instant::now()));
+        let ready = matches!(&readiness, Ok(OutputEvent::Ready));
+        let before_stop = child.try_wait();
+        let remaining = outer_deadline.saturating_duration_since(Instant::now());
+        let blocked_through_deadline = ready
+            && matches!(&before_stop, Ok(None))
+            && !remaining.is_zero()
+            && matches!(
+                rx.recv_timeout(remaining),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )
+            && matches!(child.try_wait(), Ok(None));
+
+        // Cleanup always precedes evidence assertions so no assertion can
+        // unwind while this exact child or its output reader remains live.
+        let kill_result = child.kill();
+        let wait_result = child.wait();
+        let reader_result = reader.join();
+        let finished = rx.try_iter().find_map(|event| match event {
+            OutputEvent::Finished { bytes, failed } => Some((bytes, failed)),
+            OutputEvent::Ready => None,
+        });
+
+        assert!(
+            ready,
+            "child did not validate and report the real TLS GET: {readiness:?}"
+        );
+        assert!(
+            matches!(before_stop, Ok(None)),
+            "child exited before supervision: {before_stop:?}"
+        );
+        assert!(
+            blocked_through_deadline,
+            "candidate returned or exited before outer deadline"
+        );
+        assert!(
+            kill_result.is_ok(),
+            "killing exact child failed: {kill_result:?}"
+        );
+        assert!(
+            matches!(&wait_result, Ok(status) if !status.success()),
+            "child was not reaped with unsuccessful status: {wait_result:?}"
+        );
+        assert!(reader_result.is_ok(), "bounded output reader did not join");
+        assert!(
+            matches!(finished, Some((1..=1024, false))),
+            "output reader did not finish cleanly within 1024 bytes: {finished:?}"
+        );
     }
 }
 
