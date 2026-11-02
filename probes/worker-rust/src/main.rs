@@ -7,6 +7,27 @@ use std::time::{Duration, Instant};
 
 mod store;
 
+/// Shutdown evidence can only be issued by this supervisor after wait and
+/// reader join have both completed successfully.
+pub(crate) struct StopReceipt {
+    token: String,
+    pid: u32,
+}
+impl StopReceipt {
+    fn confirmed(token: &str, pid: u32) -> Self {
+        Self {
+            token: token.to_owned(),
+            pid,
+        }
+    }
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const OUTER_DEADLINE: Duration = Duration::from_secs(1);
 const FLOOD_BYTES: usize = 1024 * 1024;
@@ -95,6 +116,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        [flag] if flag == "--run-store-worker" => run_store_worker(),
         [flag] if flag == "--run" => {
             for case in [Case::Flood, Case::Stall, Case::Cancel] {
                 let report = supervise(case)?;
@@ -125,8 +147,91 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, or --run-store".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, or --run-store-worker".into()),
     }
+}
+
+fn run_store_worker() -> Result<(), String> {
+    let mut store = store::OwnedStore::create().map_err(|e| format!("create owned store: {e}"))?;
+    let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
+    let mut child = Command::new(executable)
+        .arg("--child")
+        .arg("stall")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("start fixed child: {e}"))?;
+    let pid = child.id();
+    if let Err(error) = store.bind_worker(pid) {
+        return match stop_and_reap(&mut child) {
+            Ok(()) => Err(format!("bind worker: {error}")),
+            Err(stop) => Err(format!(
+                "bind worker: {error}; child cleanup failed: {stop}"
+            )),
+        };
+    }
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return match stop_and_reap(&mut child) {
+                Ok(()) => Err("child stdout pipe unavailable".into()),
+                Err(error) => Err(format!(
+                    "child stdout pipe unavailable; cleanup failed: {error}"
+                )),
+            }
+        }
+    };
+    let (sender, receiver) = mpsc::sync_channel(2);
+    let reader = match thread::Builder::new()
+        .name("store-worker-stdout".into())
+        .spawn(move || read_bounded(stdout, sender))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            return match stop_and_reap(&mut child) {
+                Ok(()) => Err(format!("start bounded stdout reader: {error}")),
+                Err(stop) => Err(format!(
+                    "start bounded stdout reader: {error}; cleanup failed: {stop}"
+                )),
+            }
+        }
+    };
+    let deadline = Instant::now() + OUTER_DEADLINE;
+    if let Err(error) = await_readiness(&receiver, deadline) {
+        return finish_after_error(child, reader, receiver, error);
+    }
+    if let Err(error) = stop_and_reap(&mut child) {
+        let _ = reader.join();
+        return Err(format!("child shutdown unconfirmed: {error}"));
+    }
+    let joined = reader.join().is_ok();
+    if !joined {
+        return Err("stdout reader thread panicked; shutdown receipt withheld".into());
+    }
+    let status = child
+        .try_wait()
+        .map_err(|e| format!("confirm child exit: {e}"))?
+        .ok_or_else(|| "child exit was not observable after wait".to_string())?;
+    let (bytes, failed) = drain_reader_result(&receiver)?;
+    if failed || bytes != 1 {
+        return Err("unexpected store-worker reader result; shutdown receipt withheld".into());
+    }
+    let receipt = StopReceipt::confirmed(store.token(), pid);
+    store
+        .record_stopped(&receipt)
+        .map_err(|e| format!("record stopped transition: {e}"))?;
+    let state = store
+        .inspect_state()
+        .map_err(|e| format!("inspect stopped store: {e}"))?;
+    println!(
+        "store_state={state:?} token={} worker_pid={} child_exit={} reader_joined=true bytes={} cleanup=not_authorized",
+        store.token(),
+        pid,
+        status,
+        bytes
+    );
+    Ok(())
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
@@ -390,5 +495,38 @@ fn finish_after_error<T>(
         (Err(cleanup_error), false) => Err(format!(
             "{error}; cleanup failed: {cleanup_error}; stdout reader thread panicked"
         )),
+    }
+}
+
+#[cfg(test)]
+mod store_worker_tests {
+    use super::{store::OwnedStore, StopReceipt};
+
+    #[test]
+    fn store_binding_is_single_store_and_exact_pid() {
+        let mut first = OwnedStore::create().unwrap();
+        let mut second = OwnedStore::create().unwrap();
+        assert!(first
+            .record_stopped(&StopReceipt::confirmed(first.token(), 41))
+            .is_err());
+        assert!(first.bind_worker(0).is_err());
+        first.bind_worker(41).unwrap();
+        second.bind_worker(41).unwrap();
+        assert!(first.bind_worker(42).is_err());
+        assert!(second
+            .record_stopped(&StopReceipt::confirmed(first.token(), 41))
+            .is_err());
+        assert!(first
+            .record_stopped(&StopReceipt::confirmed(first.token(), 42))
+            .is_err());
+        first
+            .record_stopped(&StopReceipt::confirmed(first.token(), 41))
+            .unwrap();
+        assert!(first
+            .record_stopped(&StopReceipt::confirmed(first.token(), 41))
+            .is_err());
+        second
+            .record_stopped(&StopReceipt::confirmed(second.token(), 41))
+            .unwrap();
     }
 }

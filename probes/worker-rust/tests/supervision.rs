@@ -38,6 +38,28 @@ fn run_supervises_three_fixed_child_cases() {
 }
 
 #[test]
+fn store_worker_records_stopped_only_after_joined_child_shutdown() {
+    let output = probe()
+        .arg("--run-store-worker")
+        .output()
+        .expect("run store worker");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+    assert!(
+        stdout.contains("store_state=NeedsReconciliation"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("worker_pid="), "{stdout}");
+    assert!(stdout.contains("child_exit="), "{stdout}");
+    assert!(stdout.contains("reader_joined=true bytes=1"), "{stdout}");
+    assert!(stdout.contains("cleanup=not_authorized"), "{stdout}");
+}
+
+#[test]
 fn arbitrary_parent_arguments_are_rejected() {
     let output = probe()
         .arg("/bin/sh")
@@ -54,6 +76,7 @@ fn private_dispatcher_rejects_unknown_modes_and_extra_arguments() {
         vec!["--child", "/bin/sh"],
         vec!["--child", "stall", "unexpected"],
         vec!["--run", "unexpected"],
+        vec!["--run-store-worker", "unexpected"],
     ] {
         let output = probe()
             .args(&args)
