@@ -56,8 +56,10 @@ fn bounded_basename(path: &Path) -> Option<String> {
         // Render directional formatting explicitly so a basename cannot visually
         // reorder an extension. This bounded label is never a source identity.
         .flat_map(|ch| {
-            if matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-                format!("\\u{{{:x}}}", ch as u32).chars().collect::<Vec<_>>()
+            if is_bidi_control(ch) {
+                format!("\\u{{{:x}}}", ch as u32)
+                    .chars()
+                    .collect::<Vec<_>>()
             } else {
                 vec![ch]
             }
@@ -69,6 +71,12 @@ fn bounded_basename(path: &Path) -> Option<String> {
     } else {
         Some(sanitized)
     }
+}
+
+/// All directional formatting characters escaped in native display labels and
+/// confirmation locations. This is display hygiene, never identity matching.
+pub(crate) fn is_bidi_control(ch: char) -> bool {
+    matches!(ch as u32, 0x061c | 0x200e..=0x200f | 0x202a..=0x202e | 0x2066..=0x206f)
 }
 
 #[cfg(test)]

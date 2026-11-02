@@ -120,6 +120,7 @@ typed_id!(ActionId, "action");
 typed_id!(ApprovalId, "approval");
 typed_id!(EvidenceId, "evidence");
 typed_id!(InventoryItemId, "inventory-item");
+typed_id!(GlobalExclusionId, "global-exclusion");
 typed_id!(GroupId, "group");
 typed_id!(DuplicateGroupId, "duplicate-group");
 

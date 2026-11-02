@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import AdvancedPlanPanel from "./AdvancedPlanPanel";
+import ExclusionsPanel from "./ExclusionsPanel";
 import type {
   EditorFrozenReview,
   EditorReviewSummary,
@@ -300,6 +301,7 @@ export default function GeneralPlanWorkspace({
           {notice}
         </p>
       )}
+      {display && <ExclusionsPanel busy={busy} run={request} />}
       {display ? (
         <AdvancedPlanPanel
           snapshot={display}

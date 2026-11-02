@@ -21,6 +21,9 @@ fn main() {
             "get_general_review",
             "list_general_reviews",
             "add_selected_general_item",
+            "get_exclusion_registry",
+            "add_global_exclusion",
+            "remove_global_exclusion",
         ]),
     ))
     .expect("failed to generate application permission manifest");

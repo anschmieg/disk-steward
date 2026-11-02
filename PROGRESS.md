@@ -129,3 +129,11 @@ M1B remains In progress: native-selected additions, separately confirmed persist
 
 
 M1B metadata-add follow-up: native file selection adds a blocked basename/size observation with default Keep; no path/content/grant/operation identity is retained. All117 workspace/14native tests and strictClippy/build checks pass. Native cancel/add/undo/restart/redo passed on an app-created47-byte fixture (current pilotRev9/1,001entries/790selected). Independent review found directional filename formatting could mislead display; these characters now render as visible escapes, with regression coverage. Persistent global exclusions, directory discovery/eligibility and three human pilots remain open. PR4 remains a partial M1B checkpoint at0.0.5.
+
+
+## M1B — Remembered exclusions in progress (0.0.6)
+
+Editor PR4 checkpoint b3cd202 is pushed. New feature branch feat/m1b-exclusions implements a separate exact-directory registry, native identity observations and separately confirmed add/remove settings. Its rules are explicitly for future scans, not applied to the synthetic plan or blocked source-less metadata entries. Scope/failure review is recorded in .autonomous/disk-steward/m1b-exclusions-scope.md. Storage/native/UI code is under review; no acceptance or milestone completion is claimed. Matching versions are0.0.6.
+
+
+The0.0.6 exclusion registry slice is verified:128workspace/24native tests, strictClippy/fmt/frontendbuild/version and40.07MiB native bundle pass. Native cancel-add/confirm-add/restart/cancel-remove/confirm-remove passed on a disposable directory, preserving the existing plan revision and fixture sentinel. Private directory/database side-file modes were0700/0600. No source paths or identity bytes reach the renderer, and rules remain saved-unverified for future scans. Details are in docs/M1B-VALIDATION.md. M1B remains In progress; folder additions/eligibility, M2 rule application and human pilots remain open.

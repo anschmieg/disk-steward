@@ -26,6 +26,9 @@
     "allow-freeze-general-review",
     "allow-get-general-review",
     "allow-list-general-reviews",
-    "allow-add-selected-general-item"
+    "allow-add-selected-general-item",
+    "allow-get-exclusion-registry",
+    "allow-add-global-exclusion",
+    "allow-remove-global-exclusion"
   ]
 }

@@ -940,3 +940,76 @@ button:focus-visible,
   border: 1px solid #dfe5dc;
   border-radius: 12px;
 }
+
+/* Remembered preservation rules remain visually separate from plan choices. */
+.exclusions-panel {
+  border: 1px solid var(--border, #e0e5e8);
+  border-radius: 12px;
+  margin: 12px 0;
+  background: var(--surface, #fff);
+}
+.exclusions-panel summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 13px 16px;
+  cursor: pointer;
+  color: #384d56;
+  font-weight: 650;
+}
+.exclusions-panel summary:focus-visible {
+  outline: 2px solid #217b86;
+  outline-offset: 3px;
+  border-radius: 10px;
+}
+.exclusions-count {
+  margin-left: auto;
+  color: #73818a;
+  font-size: 12px;
+  font-weight: 500;
+}
+.exclusions-content {
+  padding: 0 16px 14px;
+  font-size: 13px;
+  color: #586873;
+}
+.exclusions-content > p {
+  max-width: 78ch;
+  line-height: 1.55;
+}
+.exclusions-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.exclusions-content ul {
+  padding: 0;
+  margin: 12px 0 0;
+  list-style: none;
+  max-height: 280px;
+  overflow: auto;
+}
+.exclusions-content li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid #edf0f2;
+}
+.exclusions-content li > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.exclusions-content li small {
+  display: block;
+  font-size: 11px;
+  margin-top: 3px;
+  color: #75818a;
+}
+.exclusions-error {
+  color: #a24435;
+}
+.exclusions-empty {
+  color: #75818a;
+}
