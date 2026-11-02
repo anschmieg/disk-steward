@@ -2,7 +2,7 @@
 
 [package]
 name = "fixture-lifecycle-migration-probe"
-version = "0.0.13"
+version = "0.0.14"
 edition = "2021"
 publish = false
 
