@@ -629,6 +629,7 @@ dependencies = [
  "disk-steward-core",
  "disk-steward-demo-execution",
  "disk-steward-exclusion-store",
+ "disk-steward-fixture-purge",
  "disk-steward-plan-model",
  "disk-steward-plan-store",
  "disk-steward-review-plan",

@@ -13,6 +13,8 @@ fn main() {
             "prepare_fixture_stage",
             "prepare_fixture_restore",
             "request_fixture_execution",
+            "prepare_purge_review",
+            "confirm_purge_execution",
             "get_general_plan",
             "edit_general_plan",
             "undo_general_plan",

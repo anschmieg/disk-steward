@@ -89,14 +89,14 @@ impl From<disk_steward_fixture_lifecycle::LifecycleError> for PurgeError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct PurgeTarget {
     pub action_id: disk_steward_core::ActionId,
     pub receipt_id: ReceiptId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum PurgeReceiptState {
     Staged,
     PurgeIntent,
@@ -105,7 +105,7 @@ pub enum PurgeReceiptState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct PurgeReviewTarget {
     pub action_id: disk_steward_core::ActionId,
     pub receipt_id: ReceiptId,
@@ -115,7 +115,7 @@ pub struct PurgeReviewTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct PreparedPurgeReview {
     pub schema_version: u32,
     pub kind: String,
@@ -132,14 +132,14 @@ pub struct PreparedPurgeReview {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct PurgeItemBatchOutcome {
     pub attempt_id: disk_steward_core::AttemptId,
     pub outcome: PurgeItemOutcome,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct PurgeExecutionResult {
     pub execution_id: disk_steward_core::ExecutionId,
     pub review_id: ReviewId,
@@ -155,7 +155,7 @@ pub struct PurgeExecutionResult {
 /// bindings), plus session, plan/revision, operation, versions, byte sum and
 /// timestamps. Contains no filesystem paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct PurgeManifestV1 {
     schema_version: u32,
     session_id: SessionId,
@@ -170,7 +170,7 @@ struct PurgeManifestV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct ManifestTargetV1 {
     action_id: disk_steward_core::ActionId,
     receipt_id: ReceiptId,
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn review_dto_wire_shape_is_snake_case_and_frozen() {
+    fn review_dto_wire_shape_is_camel_case_and_frozen() {
         let target = PurgeReviewTarget {
             action_id: disk_steward_core::ActionId::new(),
             receipt_id: ReceiptId::new(),
@@ -1055,12 +1055,14 @@ mod tests {
             status: PurgeReceiptState::Staged,
         };
         let wire = serde_json::to_string(&target).unwrap();
-        assert!(wire.contains("\"receipt_id\""));
-        assert!(wire.contains("\"logical_bytes\""));
+        // Renderer DTO keys are camelCase; the operation value stays core's
+        // snake_case variant name.
+        assert!(wire.contains("\"receiptId\""));
+        assert!(wire.contains("\"logicalBytes\""));
         assert!(wire.contains("\"staged\""));
         let restored: PurgeReviewTarget = serde_json::from_str(&wire).unwrap();
         assert_eq!(restored, target);
-        // The operation serializes with its snake_case variant name.
+        // The operation value keeps core's snake_case variant name.
         let operation_wire =
             serde_json::to_string(&SupportedOperation::PermanentlyRemoveStaged).unwrap();
         assert_eq!(operation_wire, "\"permanently_remove_staged\"");
@@ -1158,7 +1160,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "prepared");
-        assert!(stored_json.contains("\"logical_bytes\""));
+        assert!(stored_json.contains("\"logicalBytes\""));
     }
 
     #[test]

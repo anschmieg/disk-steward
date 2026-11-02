@@ -19,6 +19,8 @@
     "allow-prepare-fixture-stage",
     "allow-prepare-fixture-restore",
     "allow-request-fixture-execution",
+    "allow-prepare-purge-review",
+    "allow-confirm-purge-execution",
     "allow-get-general-plan",
     "allow-edit-general-plan",
     "allow-undo-general-plan",

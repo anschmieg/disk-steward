@@ -78,6 +78,8 @@ pub fn run() {
             example_plan::freeze_example_review,
             example_plan::preview_saved_example_review,
             fixture_demo::get_fixture_demo_status,
+            fixture_demo::prepare_purge_review,
+            fixture_demo::confirm_purge_execution,
             fixture_demo::start_fixture_demo,
             fixture_demo::prepare_fixture_stage,
             fixture_demo::prepare_fixture_restore,
