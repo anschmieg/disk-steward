@@ -488,6 +488,7 @@ dependencies = [
  "gix-validate",
  "rcgen",
  "rustls",
+ "verification-budget",
  "webpki-roots",
 ]
 

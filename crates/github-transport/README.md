@@ -138,3 +138,12 @@ framing/ingress/error evidence remain separately available. Poisoned evidence
 returns an error. Even a complete ref observation is not object verification,
 a guarantee of future remote retention, or cleanup authority. The low-level
 stages remain available for callers that explicitly assess both outcomes.
+
+The shared budget controller accepts cumulative ingress with
+`record_ingress_total(job, total)`. Its caller must bind the report to the exact
+job and counter domain. Repeated totals do not double charge; a regressed
+counter blocks a running job and never reduces usage. Candidate tests apply
+actual TLS totals before and after finalization, including to a modeled canceled
+job, without acknowledging worker stop or cleanup. This is accounting
+integration evidence, not production job cancellation routing, durable worker
+reconciliation, or verification completion.
