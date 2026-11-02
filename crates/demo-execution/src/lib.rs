@@ -186,6 +186,7 @@ pub struct DemoExecutionService {
     control: Connection,
     plan: ReviewPlanStore,
     ledger: ApprovalLedger,
+    purge: disk_steward_fixture_purge::FixturePurgeService,
     lifecycle: Option<FixtureLifecycle>,
     now: Box<dyn Fn() -> i64 + Send + Sync>,
 }
@@ -197,7 +198,7 @@ impl DemoExecutionService {
 
     fn open_with_clock(
         app_owned_root: &Path,
-        now: impl Fn() -> i64 + Send + Sync + 'static,
+        now: impl Fn() -> i64 + Send + Sync + Clone + 'static,
     ) -> DemoResult<Self> {
         let root = fs::canonicalize(app_owned_root).map_err(|_| DemoError::Storage)?;
         if !root.is_dir() {
@@ -210,6 +211,15 @@ impl DemoExecutionService {
             ReviewPlanStore::open(root.join(PLAN_DB)).map_err(|_| DemoError::PlanUnavailable)?;
         let ledger =
             ApprovalLedger::open(root.join(LEDGER_DB)).map_err(|_| DemoError::LedgerUnavailable)?;
+        // The purge control store lives in the same app-owned root and is
+        // opened by this lease-owning coordinator (contract: never a second
+        // independently leased service). Its recovery pass runs here.
+        let now_for_purge = now.clone();
+        let purge = disk_steward_fixture_purge::FixturePurgeService::open_with_clock(
+            &root,
+            Box::new(now_for_purge),
+        )
+        .map_err(map_purge)?;
         let mut service = Self {
             root,
             lease: Some(lease),
@@ -217,6 +227,7 @@ impl DemoExecutionService {
             control,
             plan,
             ledger,
+            purge,
             lifecycle: None,
             now: Box::new(now),
         };
@@ -245,6 +256,7 @@ impl DemoExecutionService {
             .map(|v| serde_json::from_str(&v).map_err(|_| DemoError::CorruptData))
             .transpose()?;
         let mut fixtures = Vec::new();
+        let purge_uncertain = self.purge.has_uncertainty().map_err(map_purge)?;
         let mut effective_state = if state == "ready" {
             self.ready_session()?;
             let snapshot = self.snapshot()?;
@@ -256,7 +268,8 @@ impl DemoExecutionService {
                         | FixtureStatus::Uncertain
                         | FixtureStatus::PermanentlyRemoved
                 )
-            }) {
+            }) || purge_uncertain
+            {
                 "needs_inspection".to_owned()
             } else {
                 "ready".to_owned()
@@ -346,6 +359,10 @@ impl DemoExecutionService {
         confirmer: impl FnOnce(&PreparedDemoReview) -> bool,
     ) -> DemoResult<DemoExecutionResult> {
         self.ensure_active()?;
+        // Cross-store uncertainty consult (contract fixture-purge-v1).
+        if self.purge.has_uncertainty().map_err(map_purge)? {
+            return Err(DemoError::NeedsInspection);
+        }
         let now = self.checked_now()?;
         let (prepared, manifest, digest) = self.read_review(review_id)?;
         if prepared.expires_at_ms <= now {
@@ -444,6 +461,162 @@ impl DemoExecutionService {
         }
     }
 
+    /// Whether open uncertainty exists in either control store: the demo
+    /// execution store's uncertain executions or the purge store's started
+    /// executions and pending child attempts.
+    fn uncertainty_across_stores(&self) -> DemoResult<bool> {
+        let demo_uncertain: i64 = self
+            .control
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM executions WHERE state='uncertain')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_sql)?;
+        Ok(demo_uncertain != 0 || self.purge.has_uncertainty().map_err(map_purge)?)
+    }
+
+    /// Prepare an immutable purge review over explicitly selected staged
+    /// receipts (contract fixture-purge-v1). Consults uncertainty in both
+    /// control stores first; the caller selects every target explicitly.
+    pub fn prepare_purge_review(
+        &mut self,
+        expected_revision: RevisionId,
+        targets: Vec<disk_steward_fixture_purge::PurgeTarget>,
+    ) -> DemoResult<disk_steward_fixture_purge::PreparedPurgeReview> {
+        self.ensure_active()?;
+        if self.uncertainty_across_stores()? {
+            return Err(DemoError::NeedsInspection);
+        }
+        self.ready_session()?;
+        let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
+        self.purge
+            .prepare_purge_review(lifecycle, &self.plan, expected_revision, targets)
+            .map_err(map_purge)
+    }
+
+    /// Confirm and execute a prepared purge review: fresh revalidation
+    /// before and after the trusted confirmation callback, a core approval
+    /// reconstructed for the exact frozen plan/revision and manifest digest
+    /// and consumed once through the existing approval ledger, the durable
+    /// execution claim, then serial execution. If any step fails, no unlink
+    /// occurs and the run requires inspection — it is never replayed.
+    pub fn confirm_purge_execution(
+        &mut self,
+        review_id: ReviewId,
+        confirmer: impl FnOnce(&disk_steward_fixture_purge::PreparedPurgeReview) -> bool,
+    ) -> DemoResult<disk_steward_fixture_purge::PurgeExecutionResult> {
+        self.ensure_active()?;
+        if self.uncertainty_across_stores()? {
+            return Err(DemoError::NeedsInspection);
+        }
+        let prepared = self
+            .purge
+            .read_stored_review(&review_id)
+            .map_err(map_purge)?;
+        let now = self.checked_now()?;
+        if now >= prepared.expires_at_ms {
+            return Err(DemoError::ReviewExpired);
+        }
+        {
+            let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
+            self.purge
+                .revalidate(lifecycle, &self.plan, &prepared)
+                .map_err(map_purge)?;
+        }
+        if !confirmer(&prepared) {
+            return Err(DemoError::ConfirmationCancelled);
+        }
+        let after = self.checked_now()?;
+        if after >= prepared.expires_at_ms {
+            return Err(DemoError::ReviewExpired);
+        }
+        {
+            let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
+            self.purge
+                .revalidate(lifecycle, &self.plan, &prepared)
+                .map_err(map_purge)?;
+        }
+        // Durable authority, in contract order: claim (execution row plus
+        // pending child attempts) BEFORE any file mutation, then the core
+        // approval consumed once through the existing ledger, then execution.
+        let (execution_id, attempts) = self.purge.claim(&prepared, after).map_err(map_purge)?;
+        let current_plan = self
+            .plan
+            .get_plan()
+            .map_err(|_| DemoError::PlanUnavailable)?;
+        // Pre-execution revalidation in its own scope so the borrow ends
+        // before the clock read below.
+        {
+            let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
+            self.purge
+                .revalidate(lifecycle, &self.plan, &prepared)
+                .map_err(map_purge)?;
+        }
+        // The core approval snapshot needs the CURRENT fixture identity
+        // digests; take it fresh after the pre-execution revalidation.
+        let session_snapshot = {
+            let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
+            lifecycle.snapshot().map_err(map_lifecycle)?
+        };
+        let snapshot = make_purge_core_snapshot(&prepared, &current_plan, &session_snapshot)?;
+        let approval = Approval::issue(&snapshot, after as u64, prepared.expires_at_ms as u64)
+            .ok_or(DemoError::InvalidReview)?;
+        approval
+            .validate(&snapshot, after as u64)
+            .map_err(|_| DemoError::InvalidReview)?;
+        let approval_id = approval.id();
+        let approval_wire = wire(&approval_id)?;
+        let execution_wire = wire(&execution_id)?;
+        let core_manifest = core_manifest_digest_hex(&prepared)?;
+        let ledger_result = self
+            .ledger
+            .insert_approval(&approval_wire, &core_manifest, prepared.expires_at_ms)
+            .and_then(|()| {
+                self.ledger
+                    .consume_approval(&approval_wire, &core_manifest, after)
+                    .map(|_| ())
+            })
+            .and_then(|()| {
+                self.ledger
+                    .record_intent_started(&execution_wire, &approval_wire, after)
+                    .map(|_| ())
+            });
+        if ledger_result.is_err() {
+            self.purge
+                .mark_execution_uncertain(execution_id, &attempts, after)
+                .map_err(map_purge)?;
+            return Err(DemoError::LedgerUnavailable);
+        }
+        let execution_time = self.checked_now();
+        let execution_check = match execution_time {
+            Ok(time) => {
+                let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
+                self.purge
+                    .revalidate(lifecycle, &self.plan, &prepared)
+                    .map_err(map_purge)
+                    .map(|()| time)
+            }
+            Err(error) => Err(error),
+        };
+        let execution_time = match execution_check {
+            Ok(time) => time,
+            Err(error) => {
+                self.purge
+                    .mark_execution_uncertain(execution_id, &attempts, after)
+                    .map_err(map_purge)?;
+                return Err(error);
+            }
+        };
+        let _ = execution_time;
+        let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
+        let result = self
+            .purge
+            .execute_claimed_batch(lifecycle, execution_id, &prepared, attempts)
+            .map_err(map_purge)?;
+        Ok(result)
+    }
+
     fn prepare(
         &mut self,
         expected: RevisionId,
@@ -451,6 +624,11 @@ impl DemoExecutionService {
         receipt: Option<ReceiptId>,
     ) -> DemoResult<PreparedDemoReview> {
         self.ensure_active()?;
+        // Cross-store uncertainty consult: an open purge uncertainty blocks
+        // new stage/restore work until inspection (contract fixture-purge-v1).
+        if self.purge.has_uncertainty().map_err(map_purge)? {
+            return Err(DemoError::NeedsInspection);
+        }
         let session = self.ready_session()?;
         if self
             .last_execution()?
@@ -1177,6 +1355,84 @@ struct BatchBinding {
     digest: String,
 }
 
+/// The core approval digest for a purge review: the same construction as the
+/// demo review's — the manifest digest bytes hashed, hex-encoded — binding
+/// the consumed approval to the exact frozen purge manifest.
+fn core_manifest_digest_hex(
+    prepared: &disk_steward_fixture_purge::PreparedPurgeReview,
+) -> DemoResult<String> {
+    Ok(hex(&sha_bytes(prepared.manifest_sha256.as_bytes())))
+}
+
+/// The core plan snapshot for a purge confirmation: one ActionBinding per
+/// frozen target (permanently-remove operation, target digest over
+/// session/action/identity, preconditions over content/bytes/status/receipt),
+/// bound to the frozen plan/revision and the purge manifest digest. The
+/// identity digests transitively bind the registered device/inode and
+/// directory bindings; no path or raw inode enters the approval.
+fn make_purge_core_snapshot(
+    prepared: &disk_steward_fixture_purge::PreparedPurgeReview,
+    plan: &PlanView,
+    snapshot: &SessionSnapshot,
+) -> DemoResult<PlanSnapshot> {
+    let scope = ScopeId::new();
+    let mut selected = Vec::new();
+    for target in &prepared.targets {
+        let fixture = snapshot
+            .fixtures
+            .iter()
+            .find(|f| f.action_id == target.action_id)
+            .ok_or(DemoError::InvalidReview)?;
+        let target_digest = sha_bytes(
+            format!(
+                "{}:{}:{}",
+                wire(&prepared.session_id)?,
+                wire(&target.action_id)?,
+                fixture.identity_sha256
+            )
+            .as_bytes(),
+        );
+        let pre = sha_bytes(
+            format!(
+                "{}:{}:{}:{}",
+                fixture.sha256,
+                fixture.bytes,
+                fixture.status_as_text(),
+                fixture
+                    .receipt_id
+                    .as_ref()
+                    .map(wire)
+                    .transpose()?
+                    .unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+        selected.push(ActionBinding::new(
+            target.action_id,
+            scope,
+            SupportedOperation::PermanentlyRemoveStaged,
+            Digest::from_bytes(target_digest),
+            Digest::from_bytes(pre),
+        ));
+    }
+    let manifest_digest = sha_bytes(prepared.manifest_sha256.as_bytes());
+    let preconditions =
+        sha_bytes(format!("{}:{}", wire(&prepared.revision_id)?, plan.revision_number).as_bytes());
+    Ok(PlanSnapshot::new(PlanSnapshotParts {
+        plan: prepared.plan_id,
+        revision: prepared.revision_id,
+        revision_number: plan.revision_number,
+        manifest: Digest::from_bytes(manifest_digest),
+        preconditions: Digest::from_bytes(preconditions),
+        scopes: vec![ScopeSnapshot::new(scope, 1, ScopeAccess::Granted)],
+        adapter_versions: vec![
+            ("fixture-lifecycle".into(), "2".into()),
+            ("fixture-purge".into(), "1".into()),
+        ],
+        actions: selected,
+    }))
+}
+
 fn make_core_snapshot(
     manifest: &FileManifest,
     prepared: &PreparedDemoReview,
@@ -1537,6 +1793,23 @@ fn map_lifecycle(e: LifecycleError) -> DemoError {
         _ => DemoError::FixtureUnavailable,
     }
 }
+fn map_purge(e: disk_steward_fixture_purge::PurgeError) -> DemoError {
+    use disk_steward_fixture_purge::PurgeError;
+    match e {
+        PurgeError::StaleRevision => DemoError::StaleRevision,
+        PurgeError::ReviewExpired => DemoError::ReviewExpired,
+        PurgeError::ReviewReplayed => DemoError::ReviewReused,
+        PurgeError::ConfirmationDeclined => DemoError::ConfirmationCancelled,
+        PurgeError::ChangedTarget => DemoError::FixtureChanged,
+        PurgeError::UnsupportedSchema => DemoError::CorruptData,
+        PurgeError::BusyOwner => DemoError::Busy,
+        PurgeError::LedgerUnavailable => DemoError::LedgerUnavailable,
+        PurgeError::StorageFailure => DemoError::Storage,
+        PurgeError::UncertainOutcome => DemoError::ExecutionUncertain,
+        PurgeError::InvalidInput => DemoError::InvalidReview,
+        PurgeError::UntrustedDirectory => DemoError::Storage,
+    }
+}
 fn map_fixture_status(s: &FixtureStatus) -> FixtureStatus {
     s.clone()
 }
@@ -1566,7 +1839,15 @@ mod tests {
     use tempfile::tempdir;
 
     fn fixture_service() -> (tempfile::TempDir, DemoExecutionService, PlanView) {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().expect("owned test root");
+        // Mirror the production contract: the app-owned root is private
+        // (0700) so the purge control store's private-parent check passes.
+        let mut permissions = std::fs::metadata(dir.path())
+            .expect("root metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).expect("root permissions");
         let mut service = DemoExecutionService::open(dir.path()).expect("open service");
         service.start_demo().expect("create disposable fixture");
         let plan = service.plan.get_plan().expect("plan");
@@ -1846,6 +2127,12 @@ mod tests {
     #[test]
     fn expiry_wall_clock_reversal_and_creation_intent_fail_closed() {
         let dir = tempdir().expect("root");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(dir.path())
+            .expect("root metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).expect("root permissions");
         let clock = Arc::new(AtomicI64::new(1_000));
         let read = clock.clone();
         let mut service =
@@ -2152,6 +2439,159 @@ mod tests {
             service.status().expect("no file call occurred").fixtures[0].status,
             FixtureStatus::Available
         );
+    }
+
+    #[test]
+    fn purge_through_coordinator_unlinks_and_consumes_the_approval() {
+        let (dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let revision = plan.revision_id;
+        // Stage fixture 0 through the demo flow.
+        let stage_review = service.prepare_stage(revision).expect("stage review");
+        service
+            .confirm_and_execute(stage_review.review_id, |_| true)
+            .expect("stage confirm");
+        // Read the staged receipt and its action from the lifecycle store.
+        let (action, receipt): (String, String) = {
+            let entry = std::fs::read_dir(dir.path())
+                .unwrap()
+                .find_map(|e| {
+                    let name = e.unwrap().file_name().into_string().unwrap();
+                    name.starts_with(".disk-steward-fixtures-").then_some(name)
+                })
+                .unwrap();
+            let db = Connection::open(dir.path().join(entry).join("lifecycle.sqlite3")).unwrap();
+            db.query_row(
+                "SELECT action_id, receipt_id FROM fixtures WHERE status='staged'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let targets = vec![disk_steward_fixture_purge::PurgeTarget {
+            action_id: serde_json::from_str(&action).unwrap(),
+            receipt_id: serde_json::from_str(&receipt).unwrap(),
+        }];
+        // Prepare and confirm the purge through the coordinator.
+        let purge_review = service
+            .prepare_purge_review(revision, targets)
+            .expect("purge review");
+        let result = service
+            .confirm_purge_execution(purge_review.review_id, |_| true)
+            .expect("purge executed");
+        assert_eq!(result.state, "finished");
+        assert_eq!(result.items.len(), 1);
+        assert!(matches!(
+            result.items[0].outcome,
+            disk_steward_fixture_lifecycle::PurgeItemOutcome::PermanentlyRemoved { .. }
+        ));
+        // The demo now honestly reports the permanently removed fixture.
+        let status = service.status().expect("status");
+        assert_eq!(status.fixtures[0].status, FixtureStatus::PermanentlyRemoved);
+        assert_eq!(status.state, "needs_inspection");
+        // The approval was consumed once through the existing ledger: two
+        // approvals total (the demo stage review plus this purge), each
+        // consumed exactly once.
+        let db = Connection::open(dir.path().join(LEDGER_DB)).unwrap();
+        let approvals: i64 = db
+            .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(approvals, 2, "the stage review plus this purge review");
+        let consumed: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM approvals WHERE consumed_at_unix_ms IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 2, "both approvals are consumed exactly once");
+        let intents: i64 = db
+            .query_row("SELECT COUNT(*) FROM execution_intents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            intents, 2,
+            "the stage and purge execution intents are durably recorded"
+        );
+    }
+
+    #[test]
+    fn purge_ledger_failure_marks_uncertain_and_blocks_new_work() {
+        let (dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let revision = plan.revision_id;
+        let stage_review = service.prepare_stage(revision).expect("stage review");
+        service
+            .confirm_and_execute(stage_review.review_id, |_| true)
+            .expect("stage confirm");
+        let (action, receipt): (String, String) = {
+            let entry = std::fs::read_dir(dir.path())
+                .unwrap()
+                .find_map(|e| {
+                    let name = e.unwrap().file_name().into_string().unwrap();
+                    name.starts_with(".disk-steward-fixtures-").then_some(name)
+                })
+                .unwrap();
+            let db = Connection::open(dir.path().join(entry).join("lifecycle.sqlite3")).unwrap();
+            db.query_row(
+                "SELECT action_id, receipt_id FROM fixtures WHERE status='staged'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let targets = vec![disk_steward_fixture_purge::PurgeTarget {
+            action_id: serde_json::from_str(&action).unwrap(),
+            receipt_id: serde_json::from_str(&receipt).unwrap(),
+        }];
+        let purge_review = service
+            .prepare_purge_review(revision, targets)
+            .expect("purge review");
+        // Force the ledger failure inside the confirmation callback.
+        let ledger_path = dir.path().join(LEDGER_DB);
+        let error = service
+            .confirm_purge_execution(purge_review.review_id, move |_| {
+                // Force the ledger failure: drop the intents reference first,
+                // then the approvals table itself.
+                let external = Connection::open(&ledger_path).expect("ledger connection");
+                external
+                    .execute("DROP TABLE execution_intents", [])
+                    .expect("force ledger failure (intents)");
+                external
+                    .execute("DROP TABLE approvals", [])
+                    .expect("force ledger failure (approvals)");
+                true
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "ledger_unavailable");
+        // Cross-store uncertainty: new stage/restore work and further purge
+        // reviews are blocked until inspection.
+        let next = service.prepare_stage(revision);
+        assert_eq!(next.unwrap_err(), DemoError::NeedsInspection);
+        let second = service.prepare_purge_review(revision, Vec::new());
+        assert_eq!(second.unwrap_err(), DemoError::NeedsInspection);
+        let status = service.status().expect("status");
+        assert_eq!(status.state, "needs_inspection");
+        // The staged fixture itself was never unlinked and its lifecycle row
+        // stays 'staged': the failure was in the authority layer (before the
+        // lifecycle ever saw a purge intent). The uncertainty lives in the
+        // control stores and blocks new work via the consults above.
+        let fixture_status: String = {
+            let entry = std::fs::read_dir(dir.path())
+                .unwrap()
+                .find_map(|e| {
+                    let name = e.unwrap().file_name().into_string().unwrap();
+                    name.starts_with(".disk-steward-fixtures-").then_some(name)
+                })
+                .unwrap();
+            let db = Connection::open(dir.path().join(entry).join("lifecycle.sqlite3")).unwrap();
+            db.query_row(
+                "SELECT status FROM fixtures WHERE status IN ('staged','uncertain','permanently_removed')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(fixture_status, "staged");
     }
 
     #[test]

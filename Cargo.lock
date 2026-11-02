@@ -181,6 +181,7 @@ dependencies = [
  "approval-ledger",
  "disk-steward-core",
  "disk-steward-fixture-lifecycle",
+ "disk-steward-fixture-purge",
  "disk-steward-review-plan",
  "rusqlite",
  "rustix",
