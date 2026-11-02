@@ -30,6 +30,10 @@ use rustls::pki_types::ServerName;
 const HOST: &str = "github.com";
 const MAX_POST: usize = 1024 * 1024;
 const MAX_HEADERS: usize = 8192;
+const MAX_CONTROL_LINE: usize = 8192;
+const MAX_TRAILER_BYTES: usize = 8192;
+const MAX_TRAILER_COUNT: usize = 32;
+const BODY_BUFFER: usize = 8192;
 const IO_SLICE: Duration = Duration::from_millis(100);
 
 /// Per-attempt limits. Values may only lower the documented defaults.
@@ -395,42 +399,195 @@ impl Write for CountedSocket {
     }
 }
 
-struct Body {
-    stream: rustls::StreamOwned<rustls::ClientConnection, CountedSocket>,
-    left: usize,
-    byte: [u8; 1],
-    ready: bool,
+type NetworkBody = rustls::StreamOwned<rustls::ClientConnection, CountedSocket>;
+
+struct Body<R> {
+    stream: R,
+    deadline: Instant,
+    framing: BodyFraming,
+    payload: [u8; BODY_BUFFER],
+    payload_start: usize,
+    payload_end: usize,
+    failed: Option<io::ErrorKind>,
 }
-impl BufRead for Body {
+#[derive(Clone, Copy)]
+enum BodyFraming {
+    Fixed(usize),
+    Chunked(ChunkState),
+}
+#[derive(Clone, Copy)]
+enum ChunkState {
+    Size,
+    Data(u64),
+    DataCrlf,
+    Trailers { bytes: usize, count: usize },
+    Done,
+}
+impl<R: Read> BufRead for Body<R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        check_deadline(self.stream.sock.deadline)?;
-        if !self.ready && self.left > 0 {
-            let n = self
-                .stream
-                .read(&mut self.byte)
-                .map_err(|_| safe_error(io::ErrorKind::Other, "response read failed"))?;
-            if n == 0 {
-                return Err(safe_error(
-                    io::ErrorKind::UnexpectedEof,
-                    "response truncated",
-                ));
-            }
-            self.left -= n;
-            self.ready = true;
+        if let Some(kind) = self.failed {
+            return Err(body_error(kind));
         }
-        if self.ready {
-            Ok(&self.byte)
-        } else {
-            Ok(&[])
+        if let Err(error) = check_deadline(self.deadline) {
+            self.failed = Some(error.kind());
+            return Err(error);
+        }
+        if self.payload_start < self.payload_end {
+            return Ok(&self.payload[self.payload_start..self.payload_end]);
+        }
+        match self.advance() {
+            Ok(true) => Ok(&self.payload[self.payload_start..self.payload_end]),
+            Ok(false) => Ok(&[]),
+            Err(error) => {
+                self.failed = Some(error.kind());
+                Err(error)
+            }
         }
     }
     fn consume(&mut self, n: usize) {
-        if n > 0 {
-            self.ready = false;
-        }
+        self.payload_start = self.payload_start.saturating_add(n).min(self.payload_end);
     }
 }
-impl Read for Body {
+impl<R: Read> Body<R> {
+    fn read_byte(&mut self) -> io::Result<u8> {
+        check_deadline(self.deadline)?;
+        let mut byte = [0];
+        let count = self
+            .stream
+            .read(&mut byte)
+            .map_err(|error| safe_error(error.kind(), "response read failed"))?;
+        check_deadline(self.deadline)?;
+        if count == 0 {
+            return Err(safe_error(
+                io::ErrorKind::UnexpectedEof,
+                "response truncated",
+            ));
+        }
+        Ok(byte[0])
+    }
+
+    fn read_line(&mut self, limit: usize) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        loop {
+            let byte = self.read_byte()?;
+            if byte == b'\r' {
+                if self.read_byte()? != b'\n' {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "invalid chunk line ending",
+                    ));
+                }
+                return Ok(line);
+            }
+            if byte == b'\n' || line.len() >= limit {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "chunk control line exceeds limit",
+                ));
+            }
+            if !(byte == b'\t' || (0x20..=0x7e).contains(&byte)) {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "invalid chunk control byte",
+                ));
+            }
+            line.push(byte);
+        }
+    }
+
+    fn advance(&mut self) -> io::Result<bool> {
+        check_deadline(self.deadline)?;
+        loop {
+            match self.framing {
+                BodyFraming::Fixed(left) => {
+                    if left == 0 {
+                        return Ok(false);
+                    }
+                    let count = self.read_payload(left.min(BODY_BUFFER))?;
+                    self.framing = BodyFraming::Fixed(left - count);
+                    return Ok(true);
+                }
+                BodyFraming::Chunked(ChunkState::Size) => {
+                    let line = self.read_line(MAX_CONTROL_LINE)?;
+                    let size = parse_chunk_size(&line)?;
+                    self.framing = BodyFraming::Chunked(if size == 0 {
+                        ChunkState::Trailers { bytes: 0, count: 0 }
+                    } else {
+                        ChunkState::Data(size)
+                    });
+                }
+                BodyFraming::Chunked(ChunkState::Data(left)) => {
+                    if left == 0 {
+                        self.framing = BodyFraming::Chunked(ChunkState::DataCrlf);
+                        continue;
+                    }
+                    let count = self.read_payload(
+                        usize::try_from(left.min(BODY_BUFFER as u64)).unwrap_or(BODY_BUFFER),
+                    )?;
+                    self.framing = BodyFraming::Chunked(ChunkState::Data(left - count as u64));
+                    return Ok(true);
+                }
+                BodyFraming::Chunked(ChunkState::DataCrlf) => {
+                    if self.read_byte()? != b'\r' || self.read_byte()? != b'\n' {
+                        return Err(safe_error(
+                            io::ErrorKind::InvalidData,
+                            "invalid chunk data delimiter",
+                        ));
+                    }
+                    self.framing = BodyFraming::Chunked(ChunkState::Size);
+                }
+                BodyFraming::Chunked(ChunkState::Trailers { bytes, count }) => {
+                    let line = self.read_line(MAX_CONTROL_LINE)?;
+                    let total = bytes.checked_add(line.len() + 2).ok_or_else(|| {
+                        safe_error(io::ErrorKind::InvalidData, "trailers exceed limit")
+                    })?;
+                    if total > MAX_TRAILER_BYTES {
+                        return Err(safe_error(
+                            io::ErrorKind::InvalidData,
+                            "trailers exceed limit",
+                        ));
+                    }
+                    if line.is_empty() {
+                        self.framing = BodyFraming::Chunked(ChunkState::Done);
+                        continue;
+                    }
+                    let count = count + 1;
+                    if count > MAX_TRAILER_COUNT {
+                        return Err(safe_error(io::ErrorKind::InvalidData, "too many trailers"));
+                    }
+                    validate_trailer(&line)?;
+                    self.framing = BodyFraming::Chunked(ChunkState::Trailers {
+                        bytes: total,
+                        count,
+                    });
+                }
+                BodyFraming::Chunked(ChunkState::Done) => return Ok(false),
+            }
+        }
+    }
+
+    fn read_payload(&mut self, limit: usize) -> io::Result<usize> {
+        check_deadline(self.deadline)?;
+        let count = self
+            .stream
+            .read(&mut self.payload[..limit])
+            .map_err(|error| safe_error(error.kind(), "response read failed"))?;
+        check_deadline(self.deadline)?;
+        if count == 0 {
+            return Err(safe_error(
+                io::ErrorKind::UnexpectedEof,
+                "response truncated",
+            ));
+        }
+        self.payload_start = 0;
+        self.payload_end = count;
+        Ok(count)
+    }
+}
+fn body_error(kind: io::ErrorKind) -> io::Error {
+    safe_error(kind, "response body failed")
+}
+impl<R: Read> Read for Body<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -439,9 +596,10 @@ impl Read for Body {
         if b.is_empty() {
             return Ok(0);
         }
-        out[0] = b[0];
-        self.consume(1);
-        Ok(1)
+        let count = out.len().min(b.len());
+        out[..count].copy_from_slice(&b[..count]);
+        self.consume(count);
+        Ok(count)
     }
 }
 
@@ -544,7 +702,7 @@ impl RawHttp {
         path: &str,
         headers: Vec<String>,
         body: Option<Vec<u8>>,
-    ) -> io::Result<(Cursor<Vec<u8>>, Body)> {
+    ) -> io::Result<(Cursor<Vec<u8>>, Body<NetworkBody>)> {
         if path != "/info/refs?service=git-upload-pack" && path != "/git-upload-pack" {
             return Err(safe_error(
                 io::ErrorKind::InvalidInput,
@@ -641,24 +799,33 @@ impl RawHttp {
         if !(200..300).contains(&parsed.status) {
             return Err(safe_error(io::ErrorKind::Other, "HTTP response rejected"));
         }
-        let length = parsed
-            .length
-            .ok_or_else(|| safe_error(io::ErrorKind::InvalidData, "missing response length"))?;
+        let length = parsed.length.unwrap_or(0);
         let content_type = parsed
             .content_type
             .ok_or_else(|| safe_error(io::ErrorKind::InvalidData, "missing response type"))?;
-        let h = format!(
-            "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
-            content_type, length
-        )
-        .into_bytes();
+        let h = if parsed.chunked {
+            format!("Content-Type: {}\r\n\r\n", content_type).into_bytes()
+        } else {
+            format!(
+                "Content-Type: {}\r\nContent-Length: {}\r\n\r\n",
+                content_type, length
+            )
+            .into_bytes()
+        };
         Ok((
             Cursor::new(h),
             Body {
                 stream: tls,
-                left: length,
-                byte: [0],
-                ready: false,
+                deadline: self.deadline,
+                framing: if parsed.chunked {
+                    BodyFraming::Chunked(ChunkState::Size)
+                } else {
+                    BodyFraming::Fixed(length)
+                },
+                payload: [0; BODY_BUFFER],
+                payload_start: 0,
+                payload_end: 0,
+                failed: None,
             },
         ))
     }
@@ -725,7 +892,7 @@ struct Headers {
     pending: Option<Arc<Mutex<PostState>>>,
 }
 struct Response {
-    body: Option<Body>,
+    body: Option<Body<NetworkBody>>,
     pending: Option<Arc<Mutex<PostState>>>,
 }
 struct PostState {
@@ -733,7 +900,7 @@ struct PostState {
     http: RawHttp,
     request_headers: Vec<String>,
     headers: Option<Cursor<Vec<u8>>>,
-    body: Option<Body>,
+    body: Option<Body<NetworkBody>>,
     failed: Option<io::ErrorKind>,
 }
 impl PostState {
@@ -939,6 +1106,187 @@ struct Parsed {
     status: u16,
     length: Option<usize>,
     content_type: Option<String>,
+    chunked: bool,
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
+    let mut cursor = 0;
+    let mut size = 0u64;
+    while cursor < line.len() && line[cursor].is_ascii_hexdigit() {
+        let digit = match line[cursor] {
+            b'0'..=b'9' => u64::from(line[cursor] - b'0'),
+            b'a'..=b'f' => u64::from(line[cursor] - b'a' + 10),
+            b'A'..=b'F' => u64::from(line[cursor] - b'A' + 10),
+            _ => unreachable!(),
+        };
+        size = size
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(digit))
+            .ok_or_else(|| safe_error(io::ErrorKind::InvalidData, "chunk size overflow"))?;
+        cursor += 1;
+    }
+    if cursor == 0 {
+        return Err(safe_error(io::ErrorKind::InvalidData, "invalid chunk size"));
+    }
+
+    while cursor < line.len() {
+        while matches!(line.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        if cursor == line.len() {
+            break;
+        }
+        if line[cursor] != b';' {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "invalid chunk extension",
+            ));
+        }
+        cursor += 1;
+        while matches!(line.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        let name_start = cursor;
+        while line.get(cursor).is_some_and(|b| is_token_byte(*b)) {
+            cursor += 1;
+        }
+        if cursor == name_start {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "invalid chunk extension",
+            ));
+        }
+        while matches!(line.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        if line.get(cursor) == Some(&b'=') {
+            cursor += 1;
+            while matches!(line.get(cursor), Some(b' ' | b'\t')) {
+                cursor += 1;
+            }
+            if line.get(cursor) == Some(&b'"') {
+                cursor += 1;
+                let mut closed = false;
+                while let Some(&byte) = line.get(cursor) {
+                    match byte {
+                        b'"' => {
+                            cursor += 1;
+                            closed = true;
+                            break;
+                        }
+                        b'\\' => {
+                            cursor += 1;
+                            if !line
+                                .get(cursor)
+                                .is_some_and(|b| matches!(*b, b'\t' | b' ' | 0x21..=0x7e))
+                            {
+                                return Err(safe_error(
+                                    io::ErrorKind::InvalidData,
+                                    "invalid quoted chunk extension",
+                                ));
+                            }
+                            cursor += 1;
+                        }
+                        b'\t' | b' ' | b'!' | b'#'..=b'[' | b']'..=b'~' => cursor += 1,
+                        _ => {
+                            return Err(safe_error(
+                                io::ErrorKind::InvalidData,
+                                "invalid quoted chunk extension",
+                            ))
+                        }
+                    }
+                }
+                if !closed {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "unterminated chunk extension",
+                    ));
+                }
+            } else {
+                let value_start = cursor;
+                while line.get(cursor).is_some_and(|b| is_token_byte(*b)) {
+                    cursor += 1;
+                }
+                if cursor == value_start {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "invalid chunk extension value",
+                    ));
+                }
+            }
+            while matches!(line.get(cursor), Some(b' ' | b'\t')) {
+                cursor += 1;
+            }
+        }
+        if cursor < line.len() && line[cursor] != b';' {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "invalid chunk extension",
+            ));
+        }
+    }
+    Ok(size)
+}
+
+fn validate_trailer(line: &[u8]) -> io::Result<()> {
+    let colon = line
+        .iter()
+        .position(|b| *b == b':')
+        .ok_or_else(|| safe_error(io::ErrorKind::InvalidData, "invalid trailer field"))?;
+    let (name, value_with_colon) = line.split_at(colon);
+    let value = &value_with_colon[1..];
+    if name.is_empty()
+        || !name.iter().copied().all(is_token_byte)
+        || !value
+            .iter()
+            .all(|b| *b == b'\t' || (0x20..=0x7e).contains(b))
+    {
+        return Err(safe_error(
+            io::ErrorKind::InvalidData,
+            "invalid trailer field",
+        ));
+    }
+    let lower = name.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    const FORBIDDEN: &[&[u8]] = &[
+        b"authorization",
+        b"proxy-authorization",
+        b"www-authenticate",
+        b"proxy-authenticate",
+        b"cookie",
+        b"set-cookie",
+        b"content-length",
+        b"transfer-encoding",
+        b"trailer",
+        b"host",
+        b"destination",
+        b"content-location",
+        b"connection",
+        b"keep-alive",
+        b"proxy-connection",
+        b"te",
+        b"upgrade",
+        b"content-encoding",
+        b"content-type",
+        b"content-range",
+        b"location",
+        b"via",
+        b"expect",
+        b"max-forwards",
+        b"range",
+        b"origin",
+        b"referer",
+    ];
+    if FORBIDDEN.contains(&lower.as_slice()) {
+        return Err(safe_error(
+            io::ErrorKind::InvalidData,
+            "forbidden trailer field",
+        ));
+    }
+    Ok(())
 }
 fn validate_request_headers(method: &str, headers: &[String]) -> io::Result<()> {
     let mut seen_auth = false;
@@ -1099,7 +1447,7 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
     let code = code_text
         .parse::<u16>()
         .map_err(|_| safe_error(io::ErrorKind::InvalidData, "invalid response status"))?;
-    let (mut length, mut ctype) = (None, None);
+    let (mut length, mut ctype, mut transfer_encoding) = (None, None, None);
     for line in lines {
         if line.is_empty() {
             continue;
@@ -1153,7 +1501,22 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
                     "ambiguous response type",
                 ))
             }
-            "transfer-encoding" | "content-encoding" | "location" => {
+            "transfer-encoding" if transfer_encoding.is_none() => {
+                if !v.eq_ignore_ascii_case("chunked") {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "unsupported transfer coding",
+                    ));
+                }
+                transfer_encoding = Some(());
+            }
+            "transfer-encoding" => {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "ambiguous transfer coding",
+                ))
+            }
+            "content-encoding" | "location" => {
                 return Err(safe_error(
                     io::ErrorKind::InvalidData,
                     "response framing rejected",
@@ -1162,7 +1525,15 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
             _ => {}
         }
     }
-    if code == 200 && (length.is_none() || ctype.is_none()) {
+    if length.is_some() && transfer_encoding.is_some() {
+        return Err(safe_error(
+            io::ErrorKind::InvalidData,
+            "conflicting response framing",
+        ));
+    }
+    if (200..300).contains(&code)
+        && (ctype.is_none() || (length.is_none() == transfer_encoding.is_none()))
+    {
         return Err(safe_error(
             io::ErrorKind::InvalidData,
             "incomplete response headers",
@@ -1172,6 +1543,7 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
         status: code,
         length,
         content_type: ctype,
+        chunked: transfer_encoding.is_some(),
     })
 }
 
@@ -1376,6 +1748,31 @@ mod tests {
         stream.flush()
     }
 
+    fn write_chunked_response(
+        stream: &mut FixtureStream,
+        content_type: &str,
+        chunks: &[&[u8]],
+        trailers: &[&str],
+    ) -> io::Result<()> {
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: ChUnKeD\r\nConnection: close\r\n\r\n")?;
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index == 0 {
+                write!(stream, "{:x};fixture=\"ignored;value\"\r\n", chunk.len())?;
+            } else {
+                write!(stream, "{:x};extension\r\n", chunk.len())?;
+            }
+            stream.write_all(chunk)?;
+            stream.write_all(b"\r\n")?;
+        }
+        stream.write_all(b"0\r\n")?;
+        for trailer in trailers {
+            stream.write_all(trailer.as_bytes())?;
+            stream.write_all(b"\r\n")?;
+        }
+        stream.write_all(b"\r\n")?;
+        stream.flush()
+    }
+
     fn transport_at(
         endpoint: SocketAddr,
         config: Arc<rustls::ClientConfig>,
@@ -1428,6 +1825,137 @@ mod tests {
             b"HTTP/1.1 200 OK\r\n Content-Length: 0\r\nContent-Type: x\r\n\r\n",
             b"HTTP/1.1 302 Found\r\nLocation: https://elsewhere.invalid/\r\nContent-Length: 0\r\n\r\n",
         ] { assert!(parse_headers(raw).is_err()); }
+    }
+
+    fn chunk_body(bytes: &[u8], deadline: Instant) -> Body<Cursor<Vec<u8>>> {
+        Body {
+            stream: Cursor::new(bytes.to_vec()),
+            deadline,
+            framing: BodyFraming::Chunked(ChunkState::Size),
+            payload: [0; BODY_BUFFER],
+            payload_start: 0,
+            payload_end: 0,
+            failed: None,
+        }
+    }
+
+    #[test]
+    fn chunked_body_decodes_unknown_extensions_and_discards_valid_trailers() {
+        let wire = b"2;foo=bar\r\na1\r\n3;quoted=\"x;y\"\r\nbcd\r\n0\r\nX-Checksum: ok\r\n\r\n";
+        let mut body = chunk_body(wire, Instant::now() + Duration::from_secs(1));
+        let mut decoded = Vec::new();
+        body.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"a1bcd");
+        assert_eq!(body.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn malformed_chunk_streams_fail_stickily() {
+        let mut too_many_trailers = b"0\r\n".to_vec();
+        for _ in 0..=MAX_TRAILER_COUNT {
+            too_many_trailers.extend_from_slice(b"X: y\r\n");
+        }
+        too_many_trailers.extend_from_slice(b"\r\n");
+        let mut too_large_trailer = b"0\r\nX: ".to_vec();
+        too_large_trailer.extend(vec![b'x'; MAX_TRAILER_BYTES]);
+        too_large_trailer.extend_from_slice(b"\r\n\r\n");
+        let mut too_many_trailer_bytes = b"0\r\n".to_vec();
+        for _ in 0..3 {
+            too_many_trailer_bytes.extend_from_slice(b"X: ");
+            too_many_trailer_bytes.extend(vec![b'x'; 3000]);
+            too_many_trailer_bytes.extend_from_slice(b"\r\n");
+        }
+        too_many_trailer_bytes.extend_from_slice(b"\r\n");
+        for bad in [
+            &b"Z\r\n"[..],
+            b"10000000000000000\r\n",
+            b"3\r\nx",
+            b"1\r\nxZ\n0\r\n\r\n",
+            b"1\r\nx\n0\r\n\r\n",
+            b"0\r\n folded: bad\r\n\r\n",
+            b"0\r\nAuthorization: secret\r\n\r\n",
+            b"1;=value\r\nx\r\n0\r\n\r\n",
+            b"1;quoted=\"bad\x01\"\r\nx\r\n0\r\n\r\n",
+            too_many_trailers.as_slice(),
+            too_large_trailer.as_slice(),
+            too_many_trailer_bytes.as_slice(),
+        ] {
+            let mut body = chunk_body(bad, Instant::now() + Duration::from_secs(1));
+            assert!(body.read_to_end(&mut Vec::new()).is_err());
+            let first_kind = body.failed.unwrap();
+            assert_eq!(body.read(&mut [0]).unwrap_err().kind(), first_kind);
+        }
+    }
+
+    #[test]
+    fn transfer_encoding_parser_rejects_ambiguous_or_unsupported_framing() {
+        for headers in [
+            &b"Transfer-Encoding: chunked\r\nContent-Length: 1\r\n"[..],
+            b"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+            b"Transfer-Encoding: gzip, chunked\r\n",
+            b"Transfer-Encoding: gzip\r\n",
+        ] {
+            let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: x\r\n".to_vec();
+            response.extend_from_slice(headers);
+            response.extend_from_slice(b"\r\n");
+            assert!(parse_headers(&response).is_err());
+        }
+        assert!(
+            parse_headers(
+                b"HTTP/1.1 200 OK\r\nContent-Type: x\r\nTransfer-Encoding: ChUnKeD\r\n\r\n"
+            )
+            .unwrap()
+            .chunked
+        );
+    }
+
+    struct SlowByte {
+        sent: bool,
+    }
+    impl Read for SlowByte {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.sent || out.is_empty() {
+                return Ok(0);
+            }
+            thread::sleep(Duration::from_millis(20));
+            out[0] = b'0';
+            self.sent = true;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn chunk_control_reads_enforce_sticky_attempt_deadline() {
+        let mut body = Body {
+            stream: SlowByte { sent: false },
+            deadline: Instant::now() + Duration::from_millis(1),
+            framing: BodyFraming::Chunked(ChunkState::Size),
+            payload: [0; BODY_BUFFER],
+            payload_start: 0,
+            payload_end: 0,
+            failed: None,
+        };
+        assert_eq!(
+            body.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            body.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn cached_chunk_payload_still_checks_and_sticks_expired_deadline() {
+        let mut body = chunk_body(
+            b"3\r\nabc\r\n0\r\n\r\n",
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(body.fill_buf().unwrap(), b"abc");
+        body.consume(1);
+        body.deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(body.fill_buf().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(body.fill_buf().unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -1569,6 +2097,117 @@ mod tests {
         let server_result = server.join();
         assert!(server_result.is_ok(), "local fixture server thread failed");
         assert!(operation.is_ok(), "local TLS gix exchange failed");
+    }
+
+    #[test]
+    fn local_tls_gix_get_and_post_decode_chunk_splits_extensions_and_discard_trailers() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let config = Arc::clone(&tls.server);
+        let server = thread::spawn(move || {
+            for (expected, content_type, chunks) in [
+                (
+                    "GET",
+                    "application/x-git-upload-pack-advertisement",
+                    vec![&b"000e"[..], &b"version 2\n000"[..], &b"cagent=x\n0000"[..]],
+                ),
+                (
+                    "POST",
+                    "application/x-git-upload-pack-result",
+                    vec![&b"0009\x01"[..], &b"PACK"[..], &b"0000"[..]],
+                ),
+            ] {
+                let socket = accept_until(&listener).unwrap();
+                let mut stream = tls_stream(socket, Arc::clone(&config)).unwrap();
+                let (method, target, request_body, _) = read_request(&mut stream).unwrap();
+                assert_eq!(method, expected);
+                assert_eq!(
+                    target,
+                    if expected == "GET" {
+                        "/example/repo.git/info/refs?service=git-upload-pack"
+                    } else {
+                        "/example/repo.git/git-upload-pack"
+                    }
+                );
+                if expected == "POST" {
+                    assert!(request_body.ends_with(b"0000"));
+                }
+                write_chunked_response(
+                    &mut stream,
+                    content_type,
+                    &chunks,
+                    &["X-Fixture-Note: ignored"],
+                )
+                .unwrap();
+            }
+        });
+        let mut transport = transport_at(
+            address,
+            Arc::clone(&tls.trusted),
+            AttemptLimits::new(1024 * 1024, Duration::from_secs(3)).unwrap(),
+        );
+        let operation = (|| -> io::Result<Vec<u8>> {
+            transport
+                .handshake(Service::UploadPack, &[])
+                .map_err(|_| safe_error(io::ErrorKind::Other, "fixture handshake failed"))?;
+            let request = transport
+                .request(
+                    gix_transport::client::WriteMode::Binary,
+                    gix_transport::client::MessageKind::Flush,
+                    true,
+                )
+                .map_err(|_| safe_error(io::ErrorKind::Other, "fixture request failed"))?;
+            let mut response = request
+                .into_read()
+                .map_err(|_| safe_error(io::ErrorKind::Other, "fixture response failed"))?;
+            let mut bytes = Vec::new();
+            response
+                .read_to_end(&mut bytes)
+                .map_err(|_| safe_error(io::ErrorKind::Other, "fixture response failed"))?;
+            Ok(bytes)
+        })();
+        let server_result = server.join();
+        assert!(server_result.is_ok(), "chunked TLS fixture server failed");
+        // This gix reader preserves the sideband channel byte.
+        assert_eq!(operation.unwrap(), b"\x01PACK");
+    }
+
+    #[test]
+    fn raw_ingress_ceiling_counts_chunk_controls_and_payload() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let config = Arc::clone(&tls.server);
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, config).unwrap();
+            let (method, _, _, _) = read_request(&mut stream).unwrap();
+            assert_eq!(method, "GET");
+            let payload = vec![b'x'; 16 * 1024];
+            write_chunked_response(
+                &mut stream,
+                "application/x-git-upload-pack-advertisement",
+                &[&payload],
+                &[],
+            )
+            .unwrap();
+        });
+        let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+        let limit = 4096u64;
+        let mut http = RawHttp::for_test(
+            repository.clone(),
+            AttemptLimits::new(limit, Duration::from_secs(3)).unwrap(),
+            Arc::clone(&tls.trusted),
+            address,
+            "localhost",
+        )
+        .unwrap();
+        let url = format!("{}/info/refs?service=git-upload-pack", repository.base());
+        let mut response = http
+            .get(&url, repository.base(), std::iter::empty::<&str>())
+            .unwrap();
+        assert!(response.body.read_to_end(&mut Vec::new()).is_err());
+        assert_eq!(*http.budget.used.lock().unwrap(), limit);
+        assert!(server.join().is_ok());
     }
 
     #[test]

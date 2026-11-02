@@ -11,10 +11,17 @@ The adapter has a shared raw socket ingress ceiling and monotonic attempt
 deadline across the gix GET and POST. It uses rustls with the bundled WebPKI
 root set and hostname verification. The root set is compiled into the binary;
 updating Mozilla roots and matching packaged-app trust policy remain release
-gates, and this is not the operating system trust store. Redirects, non-2xx responses, compression,
-chunked framing, malformed/ambiguous headers, and oversized POST requests fail
-closed. POST request data is buffered only up to its fixed cap and sent after
-gix closes the request writer.
+gates, and this is not the operating system trust store. Redirects, non-2xx
+responses, compression, malformed/ambiguous headers, and oversized POST
+requests fail closed. Responses may use either a single `Content-Length` or one
+`Transfer-Encoding: chunked` coding; chains, duplicates, or both framing modes
+are rejected. Chunk payloads stream through a bounded decoder above the raw
+TLS byte budget. Chunk control lines and the aggregate trailer section are
+limited to 8 KiB, with at most 32 trailer fields. Unknown syntactically valid
+chunk extensions are ignored; forbidden, malformed, or control-bearing trailer
+fields fail closed and trailers are never exposed as response headers. POST
+request data is buffered only up to its fixed cap and sent after gix closes the
+request writer.
 
 Credentials are optional and explicit. This crate does not access Keychain,
 credential helpers, environment variables, proxies, or renderer APIs. Callers
@@ -36,3 +43,11 @@ copies are not proven zeroized; no secure-memory or credential-broker gate is
 claimed. The per-request buffered upload cap is 1 MiB, and framing restrictions
 may reject otherwise legitimate GitHub responses. Such outcomes are incomplete
 verification, never grounds to relax an approval or removal check.
+
+Chunk extensions and trailer values use this candidate's bounded ASCII policy.
+Framing validation applies as the response body is consumed; callers must not
+infer whole-message validation from an early Git packet flush. Full-fetch
+integration still needs to establish response completion before issuing a
+verification receipt. The decoder's fixed 8 KiB payload buffer is independent
+of declared chunk sizes, and its framing bytes remain charged by the socket
+counter beneath TLS.
