@@ -44,6 +44,17 @@ claimed. The per-request buffered upload cap is 1 MiB, and framing restrictions
 may reject otherwise legitimate GitHub responses. Such outcomes are incomplete
 verification, never grounds to relax an approval or removal check.
 
+`GitHubTransport::http_framing_snapshot()` returns bounded per-attempt response
+counts: pending, completed, failed, and abandoned. At most 64 responses are
+tracked per transport; an over-limit attempt fails before connecting and
+permanently makes `all_responses_completed()` false. Completion means the
+adapter observed the HTTP framing terminator while reading the response body.
+A gix packet flush alone does not complete that framing. Dropping a body before
+its terminator records it as abandoned without draining or performing other I/O;
+setup and read errors record failure. A snapshot is point-in-time metadata only.
+Even when all tracked bodies completed, it is not evidence of a complete Git
+fetch, repository verification, cleanup authorization, or worker termination.
+
 Chunk extensions and trailer values use this candidate's bounded ASCII policy.
 Framing validation applies as the response body is consumed; callers must not
 infer whole-message validation from an early Git packet flush. Full-fetch
