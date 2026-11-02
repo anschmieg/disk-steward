@@ -35,6 +35,158 @@ const MAX_TRAILER_BYTES: usize = 8192;
 const MAX_TRAILER_COUNT: usize = 32;
 const BODY_BUFFER: usize = 8192;
 const IO_SLICE: Duration = Duration::from_millis(100);
+const MAX_HTTP_RESPONSES: usize = 64;
+
+/// Read-only counts for HTTP response framing attempts in one transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HttpFramingSnapshot {
+    pending: usize,
+    completed: usize,
+    failed: usize,
+    abandoned: usize,
+    tracking_exhausted: bool,
+}
+
+impl HttpFramingSnapshot {
+    pub fn pending(&self) -> usize {
+        self.pending
+    }
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+    pub fn failed(&self) -> usize {
+        self.failed
+    }
+    pub fn abandoned(&self) -> usize {
+        self.abandoned
+    }
+
+    /// True only when at least one response started and every started response
+    /// reached its HTTP framing terminator without failure or abandonment.
+    pub fn all_responses_completed(&self) -> bool {
+        self.completed > 0
+            && self.pending == 0
+            && self.failed == 0
+            && self.abandoned == 0
+            && !self.tracking_exhausted
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FramingStatus {
+    Pending,
+    Completed,
+    Failed,
+    Abandoned,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    responses: Vec<FramingStatus>,
+    tracking_exhausted: bool,
+}
+
+#[derive(Clone, Default)]
+struct ResponseLedger(Arc<Mutex<LedgerState>>);
+
+impl ResponseLedger {
+    fn reserve(&self) -> io::Result<ResponseGuard> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| safe_error(io::ErrorKind::Other, "transport unavailable"))?;
+        if state.responses.len() >= MAX_HTTP_RESPONSES {
+            state.tracking_exhausted = true;
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "HTTP response attempt limit reached",
+            ));
+        }
+        let id = state.responses.len();
+        state.responses.push(FramingStatus::Pending);
+        Ok(ResponseGuard {
+            ledger: self.clone(),
+            id,
+            body_owned: false,
+            terminal: false,
+        })
+    }
+
+    fn snapshot(&self) -> io::Result<HttpFramingSnapshot> {
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| safe_error(io::ErrorKind::Other, "transport unavailable"))?;
+        let mut result = HttpFramingSnapshot::default();
+        for status in &state.responses {
+            match status {
+                FramingStatus::Pending => result.pending += 1,
+                FramingStatus::Completed => result.completed += 1,
+                FramingStatus::Failed => result.failed += 1,
+                FramingStatus::Abandoned => result.abandoned += 1,
+            }
+        }
+        result.tracking_exhausted = state.tracking_exhausted;
+        Ok(result)
+    }
+
+    fn finish(&self, id: usize, status: FramingStatus) -> io::Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| safe_error(io::ErrorKind::Other, "transport unavailable"))?;
+        let entry = state
+            .responses
+            .get_mut(id)
+            .ok_or_else(|| safe_error(io::ErrorKind::Other, "transport unavailable"))?;
+        if *entry == FramingStatus::Pending {
+            *entry = status;
+        }
+        Ok(())
+    }
+}
+
+struct ResponseGuard {
+    ledger: ResponseLedger,
+    id: usize,
+    body_owned: bool,
+    terminal: bool,
+}
+
+impl ResponseGuard {
+    fn into_body(mut self) -> Self {
+        self.body_owned = true;
+        self
+    }
+    fn finish(&mut self, status: FramingStatus) -> io::Result<()> {
+        if self.terminal {
+            return Ok(());
+        }
+        self.ledger.finish(self.id, status)?;
+        self.terminal = true;
+        Ok(())
+    }
+    fn complete(&mut self) -> io::Result<()> {
+        self.finish(FramingStatus::Completed)
+    }
+    fn fail(&mut self) -> io::Result<()> {
+        self.finish(FramingStatus::Failed)
+    }
+}
+
+impl Drop for ResponseGuard {
+    fn drop(&mut self) {
+        if !self.terminal {
+            let status = if self.body_owned {
+                FramingStatus::Abandoned
+            } else {
+                FramingStatus::Failed
+            };
+            let _ = self.ledger.finish(self.id, status);
+            self.terminal = true;
+        }
+    }
+}
 
 /// Per-attempt limits. Values may only lower the documented defaults.
 #[derive(Clone, Copy, Debug)]
@@ -174,6 +326,7 @@ fn assemble(
     credential: Option<AppCredential>,
 ) -> io::Result<GitHubTransport> {
     let budget = http.budget.clone();
+    let framing = http.framing.clone();
     let url = gix_url::parse(repository.base())
         .map_err(|_| safe_error(io::ErrorKind::InvalidInput, "invalid repository URL"))?;
     let mut inner = gix_transport::client::blocking_io::http::Transport::new_http(
@@ -196,16 +349,26 @@ fn assemble(
                 )
             })?;
     }
-    Ok(GitHubTransport { inner, budget })
+    Ok(GitHubTransport {
+        inner,
+        budget,
+        framing,
+    })
 }
 
 /// gix's blocking HTTP transport, ready for an explicit handshake.
 pub struct GitHubTransport {
     inner: gix_transport::client::blocking_io::http::Transport<RawHttp>,
     budget: Budget,
+    framing: ResponseLedger,
 }
 
 impl GitHubTransport {
+    /// Read-only response-framing counts. A poisoned ledger returns an error.
+    pub fn http_framing_snapshot(&self) -> io::Result<HttpFramingSnapshot> {
+        self.framing.snapshot()
+    }
+
     /// Socket bytes observed beneath TLS, including incomplete attempts.
     pub fn observed_ingress_bytes(&self) -> io::Result<u64> {
         self.budget
@@ -409,6 +572,7 @@ struct Body<R> {
     payload_start: usize,
     payload_end: usize,
     failed: Option<io::ErrorKind>,
+    evidence: Option<ResponseGuard>,
 }
 #[derive(Clone, Copy)]
 enum BodyFraming {
@@ -429,19 +593,18 @@ impl<R: Read> BufRead for Body<R> {
             return Err(body_error(kind));
         }
         if let Err(error) = check_deadline(self.deadline) {
-            self.failed = Some(error.kind());
-            return Err(error);
+            return Err(self.fail(error));
         }
         if self.payload_start < self.payload_end {
             return Ok(&self.payload[self.payload_start..self.payload_end]);
         }
         match self.advance() {
             Ok(true) => Ok(&self.payload[self.payload_start..self.payload_end]),
-            Ok(false) => Ok(&[]),
-            Err(error) => {
-                self.failed = Some(error.kind());
-                Err(error)
-            }
+            Ok(false) => match self.complete() {
+                Ok(()) => Ok(&[]),
+                Err(error) => Err(self.fail(error)),
+            },
+            Err(error) => Err(self.fail(error)),
         }
     }
     fn consume(&mut self, n: usize) {
@@ -449,6 +612,24 @@ impl<R: Read> BufRead for Body<R> {
     }
 }
 impl<R: Read> Body<R> {
+    fn fail(&mut self, error: io::Error) -> io::Error {
+        self.failed = Some(error.kind());
+        if let Some(evidence) = &mut self.evidence {
+            if let Err(ledger_error) = evidence.fail() {
+                self.failed = Some(ledger_error.kind());
+                return safe_error(ledger_error.kind(), "transport unavailable");
+            }
+        }
+        error
+    }
+
+    fn complete(&mut self) -> io::Result<()> {
+        if let Some(evidence) = &mut self.evidence {
+            evidence.complete()?;
+        }
+        Ok(())
+    }
+
     fn read_byte(&mut self) -> io::Result<u8> {
         check_deadline(self.deadline)?;
         let mut byte = [0];
@@ -608,6 +789,7 @@ struct RawHttp {
     limits: AttemptLimits,
     deadline: Instant,
     budget: Budget,
+    framing: ResponseLedger,
     config: Arc<rustls::ClientConfig>,
     #[cfg(test)]
     fixture: Option<(SocketAddr, Arc<str>)>,
@@ -632,6 +814,7 @@ impl RawHttp {
                 max: limits.ingress_bytes,
                 used: Arc::new(Mutex::new(0)),
             },
+            framing: ResponseLedger::default(),
             config,
             #[cfg(test)]
             fixture,
@@ -702,6 +885,7 @@ impl RawHttp {
         path: &str,
         headers: Vec<String>,
         body: Option<Vec<u8>>,
+        evidence: ResponseGuard,
     ) -> io::Result<(Cursor<Vec<u8>>, Body<NetworkBody>)> {
         if path != "/info/refs?service=git-upload-pack" && path != "/git-upload-pack" {
             return Err(safe_error(
@@ -826,6 +1010,7 @@ impl RawHttp {
                 payload_start: 0,
                 payload_end: 0,
                 failed: None,
+                evidence: Some(evidence.into_body()),
             },
         ))
     }
@@ -902,8 +1087,19 @@ struct PostState {
     headers: Option<Cursor<Vec<u8>>>,
     body: Option<Body<NetworkBody>>,
     failed: Option<io::ErrorKind>,
+    evidence: Option<ResponseGuard>,
 }
 impl PostState {
+    fn fail_response(&mut self, kind: io::ErrorKind) -> io::Error {
+        self.failed = Some(kind);
+        if let Some(mut evidence) = self.evidence.take() {
+            if let Err(error) = evidence.fail() {
+                return safe_error(error.kind(), "transport unavailable");
+            }
+        }
+        safe_error(kind, "POST failed")
+    }
+
     fn init(&mut self) -> io::Result<()> {
         if self.headers.is_some() {
             return Ok(());
@@ -917,22 +1113,22 @@ impl PostState {
         {
             Ok(Some(data)) => data,
             Ok(None) => {
-                self.failed = Some(io::ErrorKind::InvalidData);
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "POST body limit exceeded",
-                ));
+                return Err(self.fail_response(io::ErrorKind::InvalidData));
             }
             Err(_) => {
-                self.failed = Some(io::ErrorKind::TimedOut);
-                return Err(safe_error(io::ErrorKind::TimedOut, "POST unavailable"));
+                return Err(self.fail_response(io::ErrorKind::TimedOut));
             }
         };
+        let evidence = self
+            .evidence
+            .take()
+            .ok_or_else(|| safe_error(io::ErrorKind::Other, "transport unavailable"))?;
         let result = self.http.request(
             "POST",
             "/git-upload-pack",
             std::mem::take(&mut self.request_headers),
             Some(data),
+            evidence,
         );
         let (h, b) = match result {
             Ok(result) => result,
@@ -1030,7 +1226,15 @@ impl Http for RawHttp {
         let result: io::Result<_> = (|| {
             self.validate(url, base, false)?;
             let hs = collect_headers(headers)?;
-            let (h, b) = self.request("GET", "/info/refs?service=git-upload-pack", hs, None)?;
+            validate_request_headers("GET", &hs)?;
+            let evidence = self.framing.reserve()?;
+            let (h, b) = self.request(
+                "GET",
+                "/info/refs?service=git-upload-pack",
+                hs,
+                None,
+                evidence,
+            )?;
             Ok(GetResponse {
                 headers: Headers {
                     cursor: h,
@@ -1058,6 +1262,8 @@ impl Http for RawHttp {
         let result: io::Result<_> = (|| {
             self.validate(url, base, true)?;
             let hs = collect_headers(headers)?;
+            validate_request_headers("POST", &hs)?;
+            let evidence = self.framing.reserve()?;
             let (tx, rx) = mpsc::sync_channel(1);
             let state = Arc::new(Mutex::new(PostState {
                 receiver: rx,
@@ -1066,11 +1272,13 @@ impl Http for RawHttp {
                     limits: self.limits,
                     deadline: self.deadline,
                     budget: self.budget.clone(),
+                    framing: self.framing.clone(),
                     config: Arc::clone(&self.config),
                     #[cfg(test)]
                     fixture: self.fixture.clone(),
                 },
                 request_headers: hs,
+                evidence: Some(evidence),
                 headers: None,
                 body: None,
                 failed: None,
@@ -1836,6 +2044,20 @@ mod tests {
             payload_start: 0,
             payload_end: 0,
             failed: None,
+            evidence: None,
+        }
+    }
+
+    fn tracked_chunk_body(bytes: &[u8], ledger: &ResponseLedger) -> Body<Cursor<Vec<u8>>> {
+        Body {
+            stream: Cursor::new(bytes.to_vec()),
+            deadline: Instant::now() + Duration::from_secs(1),
+            framing: BodyFraming::Chunked(ChunkState::Size),
+            payload: [0; BODY_BUFFER],
+            payload_start: 0,
+            payload_end: 0,
+            failed: None,
+            evidence: Some(ledger.reserve().unwrap().into_body()),
         }
     }
 
@@ -1847,6 +2069,114 @@ mod tests {
         body.read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded, b"a1bcd");
         assert_eq!(body.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn evidence_counts_complete_failed_abandoned_and_keeps_snapshots_immutable() {
+        let ledger = ResponseLedger::default();
+        let mut body = tracked_chunk_body(b"1\r\na\r\n0\r\n\r\n", &ledger);
+        let pending = ledger.snapshot().unwrap();
+        assert_eq!(pending.pending(), 1);
+        assert!(!pending.all_responses_completed());
+        body.read_to_end(&mut Vec::new()).unwrap();
+        let completed = ledger.snapshot().unwrap();
+        assert_eq!(completed.completed(), 1);
+        assert!(completed.all_responses_completed());
+        assert_eq!(pending.pending(), 1, "snapshot is a stable value");
+
+        let mut failed_body = tracked_chunk_body(b"0\r\nAuthorization: secret\r\n\r\n", &ledger);
+        assert!(failed_body.read_to_end(&mut Vec::new()).is_err());
+        assert!(failed_body.read(&mut [0]).is_err());
+        drop(failed_body);
+        let failed = ledger.snapshot().unwrap();
+        assert_eq!(failed.failed(), 1);
+        assert_eq!(failed.completed(), 1);
+        assert!(!failed.all_responses_completed());
+
+        let abandoned_body = tracked_chunk_body(b"2\r\nab\r\n0\r\n\r\n", &ledger);
+        drop(abandoned_body);
+        let abandoned = ledger.snapshot().unwrap();
+        assert_eq!(abandoned.abandoned(), 1);
+        assert!(!abandoned.all_responses_completed());
+    }
+
+    #[test]
+    fn dropping_tracked_body_performs_no_read_or_network_work() {
+        struct NoRead;
+        impl Read for NoRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("drop must not read")
+            }
+        }
+        let ledger = ResponseLedger::default();
+        let body = Body {
+            stream: NoRead,
+            deadline: Instant::now() + Duration::from_secs(1),
+            framing: BodyFraming::Chunked(ChunkState::Size),
+            payload: [0; BODY_BUFFER],
+            payload_start: 0,
+            payload_end: 0,
+            failed: None,
+            evidence: Some(ledger.reserve().unwrap().into_body()),
+        };
+        drop(body);
+        assert_eq!(ledger.snapshot().unwrap().abandoned(), 1);
+    }
+
+    #[test]
+    fn response_limit_refuses_sixty_fifth_and_invalidates_success_predicate() {
+        let ledger = ResponseLedger::default();
+        for _ in 0..MAX_HTTP_RESPONSES {
+            let mut response = ledger.reserve().unwrap();
+            response.complete().unwrap();
+        }
+        assert!(ledger.snapshot().unwrap().all_responses_completed());
+        assert!(ledger.reserve().is_err());
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.completed(), MAX_HTTP_RESPONSES);
+        assert!(!snapshot.all_responses_completed());
+    }
+
+    #[test]
+    fn sixty_fifth_response_refused_before_loopback_connect() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let repository = RepositoryUrl::parse("https://github.com/example/repo").unwrap();
+        let mut http = RawHttp::for_test(
+            repository.clone(),
+            AttemptLimits::default(),
+            Arc::clone(&tls.trusted),
+            address,
+            "localhost",
+        )
+        .unwrap();
+        for _ in 0..MAX_HTTP_RESPONSES {
+            let mut guard = http.framing.reserve().unwrap();
+            guard.complete().unwrap();
+        }
+        let url = format!("{}/info/refs?service=git-upload-pack", repository.base());
+        assert!(http
+            .get(&url, repository.base(), std::iter::empty::<&str>())
+            .is_err());
+        assert!(
+            matches!(listener.accept(), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        let snapshot = http.framing.snapshot().unwrap();
+        assert_eq!(snapshot.completed(), MAX_HTTP_RESPONSES);
+        assert!(!snapshot.all_responses_completed());
+    }
+
+    #[test]
+    fn poisoned_response_ledger_returns_error() {
+        let ledger = ResponseLedger::default();
+        let poisoned = ledger.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.0.lock().unwrap();
+            panic!("poison fixture");
+        })
+        .join();
+        assert!(ledger.snapshot().is_err());
+        assert!(ledger.reserve().is_err());
     }
 
     #[test]
@@ -1934,6 +2264,7 @@ mod tests {
             payload_start: 0,
             payload_end: 0,
             failed: None,
+            evidence: None,
         };
         assert_eq!(
             body.read(&mut [0]).unwrap_err().kind(),
@@ -1991,6 +2322,10 @@ mod tests {
             transport.to_url().as_ref().to_str().unwrap(),
             "https://github.com/a/b"
         );
+        assert!(!transport
+            .http_framing_snapshot()
+            .unwrap()
+            .all_responses_completed());
         let (listener, address) = listener();
         let mut http = RawHttp::for_test(
             RepositoryUrl::parse("https://github.com/a/b").unwrap(),
@@ -2024,6 +2359,9 @@ mod tests {
                 std::iter::empty::<&str>()
             )
             .is_err());
+        let snapshot = http.framing.snapshot().unwrap();
+        assert_eq!(snapshot.failed(), 1);
+        assert_eq!(snapshot.pending(), 0);
     }
 
     #[test]
@@ -2170,6 +2508,85 @@ mod tests {
         assert!(server_result.is_ok(), "chunked TLS fixture server failed");
         // This gix reader preserves the sideband channel byte.
         assert_eq!(operation.unwrap(), b"\x01PACK");
+    }
+
+    #[test]
+    fn full_http_body_read_marks_response_complete() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let config = Arc::clone(&tls.server);
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, config).unwrap();
+            let (method, target, _, _) = read_request(&mut stream).unwrap();
+            assert_eq!(method, "GET");
+            assert_eq!(
+                target,
+                "/example/repo.git/info/refs?service=git-upload-pack"
+            );
+            write_response(
+                &mut stream,
+                "application/x-git-upload-pack-advertisement",
+                b"full-body",
+            )
+            .unwrap();
+        });
+        let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+        let mut http = RawHttp::for_test(
+            repository.clone(),
+            AttemptLimits::default(),
+            Arc::clone(&tls.trusted),
+            address,
+            "localhost",
+        )
+        .unwrap();
+        let url = format!("{}/info/refs?service=git-upload-pack", repository.base());
+        let mut response = http
+            .get(&url, repository.base(), std::iter::empty::<&str>())
+            .unwrap();
+        assert_eq!(http.framing.snapshot().unwrap().pending(), 1);
+        let mut payload = Vec::new();
+        response.body.read_to_end(&mut payload).unwrap();
+        assert_eq!(payload, b"full-body");
+        let snapshot = http.framing.snapshot().unwrap();
+        assert_eq!(snapshot.completed(), 1);
+        assert!(snapshot.all_responses_completed());
+        assert!(server.join().is_ok());
+    }
+
+    #[test]
+    fn gix_packet_flush_does_not_complete_http_chunked_framing() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let config = Arc::clone(&tls.server);
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, config).unwrap();
+            let (method, _, _, _) = read_request(&mut stream).unwrap();
+            assert_eq!(method, "GET");
+            let payload = b"000eversion 2\n000cagent=x\n0000";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", payload.len()).unwrap();
+            stream.write_all(payload).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            stream.flush().unwrap();
+            // Deliberately omit the zero chunk and final trailer terminator.
+        });
+        let mut transport =
+            transport_at(address, Arc::clone(&tls.trusted), AttemptLimits::default());
+        let ledger = transport.framing.clone();
+        let handshake_ok = transport.handshake(Service::UploadPack, &[]).is_ok();
+        assert!(server.join().is_ok());
+        let before_drop = ledger.snapshot().unwrap();
+        assert!(
+            handshake_ok,
+            "the valid Git packet flush should finish gix handshake"
+        );
+        assert_eq!(before_drop.pending(), 1);
+        assert!(!before_drop.all_responses_completed());
+        drop(transport);
+        let after_drop = ledger.snapshot().unwrap();
+        assert_eq!(after_drop.abandoned(), 1);
+        assert!(!after_drop.all_responses_completed());
     }
 
     #[test]
@@ -2529,11 +2946,13 @@ mod tests {
             "localhost",
         )
         .unwrap();
+        let evidence = http.framing.reserve().unwrap();
         let error = match http.request(
             "GET",
             "/info/refs?service=git-upload-pack",
             Vec::new(),
             None,
+            evidence,
         ) {
             Ok(_) => panic!("401 must fail"),
             Err(error) => error,
