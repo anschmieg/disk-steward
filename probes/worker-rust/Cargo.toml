@@ -1,0 +1,13 @@
+[package]
+name = "disk-steward-worker-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true
