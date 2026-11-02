@@ -53,6 +53,7 @@ export default function DemoLifecyclePanel({
     null,
   );
   const lastError = useRef<unknown>(null);
+  const previousRevision = useRef(plan.revisionId);
   const busy = pending || planBusy;
   const actionsById = useMemo(
     () => new Map(plan.actions.map((action) => [action.id, action])),
@@ -61,6 +62,7 @@ export default function DemoLifecyclePanel({
   const selected = plan.actions.filter(
     (action) => action.decision === "include",
   );
+  const selectedIds = new Set(selected.map((action) => action.id));
 
   const run = useCallback(
     async <T,>(task: () => Promise<T>): Promise<T | undefined> => {
@@ -92,6 +94,7 @@ export default function DemoLifecyclePanel({
       if (next) {
         setStatus(next);
         setPrepared(null);
+        setPurgePrepared(null);
         if (alsoRefreshPlan) {
           try {
             await onPlanRefresh();
@@ -129,6 +132,14 @@ export default function DemoLifecyclePanel({
       active = false;
     };
   }, [native]);
+
+  useEffect(() => {
+    if (previousRevision.current === plan.revisionId) return;
+    previousRevision.current = plan.revisionId;
+    setPrepared(null);
+    setPurgePrepared(null);
+    setNeedsRefresh(true);
+  }, [plan.revisionId]);
 
   const start = async () => {
     const next = await run(() => invoke<DemoStatus>("start_fixture_demo"));
@@ -240,7 +251,12 @@ export default function DemoLifecyclePanel({
   // parented confirmation dialog; the renderer only selects the staged
   // receipt pairs and displays the sanitized result.
   const stagedPairs = (status?.fixtures ?? [])
-    .filter((fixture) => fixture.status === "staged" && fixture.receiptId)
+    .filter(
+      (fixture) =>
+        fixture.status === "staged" &&
+        fixture.receiptId &&
+        selectedIds.has(fixture.actionId),
+    )
     .map((fixture) => ({
       actionId: fixture.actionId,
       receiptId: fixture.receiptId!,
@@ -265,7 +281,7 @@ export default function DemoLifecyclePanel({
     else setNeedsRefresh(true);
   };
   const confirmPurge = async () => {
-    if (!purgePrepared) return;
+    if (!purgePrepared || needsRefresh) return;
     const completed = await run(async () => {
       const purge = await invoke<PurgeExecutionResult>(
         "confirm_purge_execution",
@@ -280,8 +296,20 @@ export default function DemoLifecyclePanel({
       setPurgeResult(completed.purge);
       setPurgePrepared(null);
       if (completed.latest) setStatus(completed.latest);
-      if (completed.purge.state !== "finished") setNeedsRefresh(true);
-    } else setNeedsRefresh(true);
+      if (!completed.latest || completed.purge.state !== "finished")
+        setNeedsRefresh(true);
+      if (!completed.latest)
+        setError(
+          "The removal result was recorded, but demo status could not be refreshed. Refresh both plan and demo status before continuing.",
+        );
+    } else {
+      const code = errorCode(lastError.current);
+      if (code === "confirmation_cancelled") {
+        setPurgePrepared(null);
+        setError("");
+        setNotice("Confirmation cancelled. No demo files were changed.");
+      } else setNeedsRefresh(true);
+    }
   };
   return (
     <section className="demo-panel" aria-labelledby="demo-title">
@@ -619,8 +647,8 @@ export default function DemoLifecyclePanel({
         <div className="demo-safety">
           <CircleHelp size={15} />
           <span>
-            Demo files only · no permanent deletion · restoring does not recover
-            disk space
+            Demo files only · permanent removal requires separate review and
+            native confirmation · restoring does not recover disk space
           </span>
         </div>
       )}
