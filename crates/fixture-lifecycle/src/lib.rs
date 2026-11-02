@@ -15,6 +15,20 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+thread_local! {
+    static PURGE_CRASH_BOUNDARY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn purge_crash_checkpoint(boundary: &'static str) {
+    PURGE_CRASH_BOUNDARY.with(|selected| {
+        if selected.get() == Some(boundary) {
+            std::process::exit(86);
+        }
+    });
+}
+
 const FIXTURES: [(&str, u64); 5] = [
     ("compiler-output", 3_145_728),
     ("test-cache", 1_048_576),
@@ -447,6 +461,8 @@ impl FixtureLifecycle {
         self.verify_fixture(&fixture, &self.holding_dir, &slot)?;
         self.verify_directories()?;
         self.record_intent(attempt, &fixture, "purge", Some(receipt))?;
+        #[cfg(test)]
+        purge_crash_checkpoint("intent");
         self.complete_purge(receipt, attempt, &fixture, &slot)
     }
 
@@ -472,13 +488,18 @@ impl FixtureLifecycle {
         {
             return Err(self.uncertain_error(attempt, &fixture.action_id));
         }
-        if unlinkat(&self.holding_dir, slot, AtFlags::empty()).is_err()
-            || sync_dir(&self.holding_dir).is_err()
-        {
+        if unlinkat(&self.holding_dir, slot, AtFlags::empty()).is_err() {
             // The unlink may or may not have occurred; the result cannot be
             // established, so the receipt state becomes Uncertain.
             return Err(self.uncertain_error(attempt, &fixture.action_id));
         }
+        #[cfg(test)]
+        purge_crash_checkpoint("unlink");
+        if sync_dir(&self.holding_dir).is_err() {
+            return Err(self.uncertain_error(attempt, &fixture.action_id));
+        }
+        #[cfg(test)]
+        purge_crash_checkpoint("directory_sync");
         if self
             .record_outcome(
                 attempt,
@@ -490,6 +511,8 @@ impl FixtureLifecycle {
         {
             return Err(self.uncertain_error(attempt, &fixture.action_id));
         }
+        #[cfg(test)]
+        purge_crash_checkpoint("terminal");
         Ok(PurgeItemOutcome::PermanentlyRemoved {
             receipt_id: receipt,
             logical_bytes: fixture.bytes,
@@ -1610,6 +1633,150 @@ fn rename_no_replace(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    use std::{
+        process::{Child, Command, ExitStatus},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const PURGE_CRASH_CHILD: &str = "tests::purge_crash_child_runs_real_purge";
+
+    #[test]
+    #[ignore = "launched only by the bounded parent subprocess test"]
+    fn purge_crash_child_runs_real_purge() {
+        let args = std::env::args_os();
+        let payload = args
+            .skip_while(|arg| arg != "--")
+            .nth(1)
+            .expect("parent-provided payload");
+        let (root, receipt, boundary): (PathBuf, ReceiptId, String) =
+            serde_json::from_str(&payload.to_string_lossy()).unwrap();
+        let selected = match boundary.as_str() {
+            "intent" => "intent",
+            "unlink" => "unlink",
+            "directory_sync" => "directory_sync",
+            "terminal" => "terminal",
+            _ => panic!("unknown purge boundary"),
+        };
+        let session_id = fs::read_to_string(root.join("session-id")).unwrap();
+        let (mut life, _) = FixtureLifecycle::reopen(
+            root.parent().unwrap(),
+            serde_json::from_str(&session_id).unwrap(),
+        )
+        .unwrap();
+        PURGE_CRASH_BOUNDARY.with(|hook| hook.set(Some(selected)));
+        let _ = life.purge_receipt(receipt, AttemptId::new());
+        panic!("selected crash boundary was not reached");
+    }
+
+    fn wait_bounded(child: &mut Child) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("purge crash child exceeded 15 seconds");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn crash_child(root: &Path, receipt: ReceiptId, boundary: &str) -> ExitStatus {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(PURGE_CRASH_CHILD)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--")
+            .arg(serde_json::to_string(&(root, receipt, boundary)).unwrap())
+            .spawn()
+            .unwrap();
+        wait_bounded(&mut child)
+    }
+
+    #[test]
+    fn purge_subprocess_crashes_at_real_filesystem_and_journal_boundaries() {
+        for (boundary, expected_exists, expected_outcome, expected_status) in [
+            ("intent", true, "intent", FixtureStatus::Uncertain),
+            ("unlink", false, "intent", FixtureStatus::Uncertain),
+            ("directory_sync", false, "intent", FixtureStatus::Uncertain),
+            (
+                "terminal",
+                false,
+                "permanently_removed",
+                FixtureStatus::PermanentlyRemoved,
+            ),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let ids = bindings();
+            let (mut life, _) = FixtureLifecycle::create(parent.path(), ids).unwrap();
+            let receipt = life.stage(ids[0], AttemptId::new()).unwrap();
+            // The child receives the private root and derives its session ID
+            // from a parent-owned marker, keeping fixture setup in this test.
+            let sid = life.session_id();
+            fs::write(
+                life.root.join("session-id"),
+                serde_json::to_vec(&sid).unwrap(),
+            )
+            .unwrap();
+            let slot = receipt_slot(receipt).unwrap();
+            let sentinel = life.root.join("unrelated-sentinel");
+            fs::write(&sentinel, b"preserve this sentinel").unwrap();
+            let root = life.root.clone();
+            drop(life);
+
+            let status = crash_child(&root, receipt, boundary);
+            assert_eq!(status.code(), Some(86), "child did not crash at {boundary}");
+
+            let (mut reopened, view) = FixtureLifecycle::reopen(parent.path(), sid).unwrap();
+            assert_eq!(
+                view.fixtures[0].status, expected_status,
+                "boundary={boundary}"
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"preserve this sentinel");
+            assert_eq!(
+                open_regular(&reopened.holding_dir, &slot).is_ok(),
+                expected_exists
+            );
+            let outcome: String = reopened
+                .db
+                .query_row(
+                    "SELECT outcome FROM attempts WHERE operation='purge'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(outcome, expected_outcome, "boundary={boundary}");
+            let journal_before_refusals = dump_all(&reopened.db);
+            for fixture in &view.fixtures[1..] {
+                assert_eq!(fixture.status, FixtureStatus::Available);
+            }
+            if expected_outcome == "intent" {
+                assert!(matches!(
+                    reopened.purge_receipt(receipt, AttemptId::new()),
+                    Err(LifecycleError::Uncertain)
+                ));
+                assert!(matches!(
+                    reopened.restore(receipt, AttemptId::new()),
+                    Err(LifecycleError::Uncertain)
+                ));
+            } else {
+                assert!(matches!(
+                    reopened.purge_receipt(receipt, AttemptId::new()),
+                    Err(LifecycleError::WrongState)
+                ));
+                assert!(matches!(
+                    reopened.restore(receipt, AttemptId::new()),
+                    Err(LifecycleError::WrongState)
+                ));
+            }
+            assert_eq!(dump_all(&reopened.db), journal_before_refusals);
+        }
+    }
+
     fn downgrade_to_v1(db: &Connection) {
         let before = dump_all(db);
         let tx = db.unchecked_transaction().unwrap();
