@@ -28,6 +28,17 @@ The probe intentionally leaves the created directory in place, including on
 failure. It does not bind a worker, contain output, measure disk growth, or
 prove crash durability. The command does not grant cleanup authority.
 
+`--run-store-worker` creates the same private store, starts exactly one copy of
+its own executable in the fixed `stall` child mode, records that PID as bound,
+waits for readiness, then cancels, waits for child exit, and joins the bounded
+stdout reader. Only after those shutdown checks does the supervisor issue a
+private stop receipt and record `stopped` for the same store token and PID.
+Inspection still returns `NeedsReconciliation`; the journal is not adopted
+after restart and stopped state grants no cleanup authority. Journal updates
+validate the prior contents and inode/mode, use the fixed descriptor-relative
+marker, and poison the live handle after any update error. An interrupted
+in-place update may leave a malformed journal requiring manual reconciliation.
+
 This demonstrates bounded stdout reading and ordinary local child
 kill/reap/thread-join behavior. It does not demonstrate Git ingress or store
 budgets, production worker isolation, process-tree containment, CPU or memory
@@ -40,6 +51,7 @@ Run from the repository root:
 ```sh
 cargo run -p disk-steward-worker-probe
 cargo run -p disk-steward-worker-probe -- --run
+cargo run -p disk-steward-worker-probe -- --run-store-worker
 cargo test -p disk-steward-worker-probe --locked
 ```
 

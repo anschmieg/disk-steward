@@ -3,7 +3,7 @@
 
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -62,6 +62,16 @@ pub struct OwnedStore {
     parent_id: (u64, u64),
     root_id: (u64, u64),
     token: String,
+    journal_id: Option<(u64, u64)>,
+    phase: Phase,
+    poisoned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    Created,
+    Bound(u32),
+    Stopped(u32),
 }
 
 impl OwnedStore {
@@ -115,10 +125,7 @@ impl OwnedStore {
                 return Err(StoreError::InvalidJournal);
             }
             marker.take(512).read_to_end(&mut bytes)?;
-            let expected = format!(
-                "disk-steward-worker-store-v1\n{}\n{}:{}\n{}:{}\ncreated\n",
-                self.token, self.parent_id.0, self.parent_id.1, self.root_id.0, self.root_id.1
-            );
+            let expected = self.journal_contents();
             if bytes != expected.as_bytes() {
                 return Err(StoreError::InvalidJournal);
             }
@@ -132,6 +139,105 @@ impl OwnedStore {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    fn journal_contents(&self) -> String {
+        let phase = match self.phase {
+            Phase::Created => "created".to_string(),
+            Phase::Bound(pid) => format!("bound:{pid}"),
+            Phase::Stopped(pid) => format!("stopped:{pid}"),
+        };
+        format!(
+            "disk-steward-worker-store-v1\n{}\n{}:{}\n{}:{}\n{}\n",
+            self.token, self.parent_id.0, self.parent_id.1, self.root_id.0, self.root_id.1, phase
+        )
+    }
+
+    pub fn bind_worker(&mut self, pid: u32) -> Result<(), StoreError> {
+        if self.phase != Phase::Created || pid == 0 {
+            return Err(StoreError::InvalidJournal);
+        }
+        self.update_journal(Phase::Bound(pid))
+    }
+
+    pub fn record_stopped(&mut self, receipt: &crate::StopReceipt) -> Result<(), StoreError> {
+        let pid = receipt.pid();
+        if receipt.token() != self.token || self.phase != Phase::Bound(pid) {
+            return Err(StoreError::InvalidJournal);
+        }
+        self.update_journal(Phase::Stopped(pid))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn update_journal(&mut self, next: Phase) -> Result<(), StoreError> {
+        use rustix::fs::{openat, OFlags};
+        if self.poisoned {
+            return Err(StoreError::InvalidJournal);
+        }
+        let result = (|| {
+            if identity(&self.parent)? != self.parent_id || identity(&self.root)? != self.root_id {
+                return Err(StoreError::InvalidIdentity);
+            }
+            let parent = open_parent(&self.parent_path)?;
+            if identity(&parent)? != self.parent_id {
+                return Err(StoreError::InvalidIdentity);
+            }
+            let root = openat(
+                &parent,
+                &self.name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            if identity(&root)? != self.root_id {
+                return Err(StoreError::InvalidIdentity);
+            }
+            validate_private_directory(&root)?;
+            let fd = openat(
+                &root,
+                "owner.journal",
+                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )?;
+            let mut marker = File::from(fd);
+            let metadata = marker.metadata()?;
+            use std::os::unix::fs::MetadataExt;
+            let marker_id = (metadata.dev(), metadata.ino());
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || self.journal_id != Some(marker_id)
+            {
+                return Err(StoreError::InvalidJournal);
+            }
+            let mut current = Vec::new();
+            marker.try_clone()?.take(512).read_to_end(&mut current)?;
+            if current != self.journal_contents().as_bytes() {
+                return Err(StoreError::InvalidJournal);
+            }
+            marker.set_len(0)?;
+            marker.rewind()?;
+            let old_phase = self.phase;
+            self.phase = next;
+            if let Err(error) = marker
+                .write_all(self.journal_contents().as_bytes())
+                .and_then(|_| marker.sync_all())
+            {
+                self.phase = old_phase;
+                return Err(StoreError::Io(error));
+            }
+            self.journal_id = Some(identity(&marker)?);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn update_journal(&mut self, _next: Phase) -> Result<(), StoreError> {
+        Err(StoreError::UnsupportedPlatform)
     }
 }
 
@@ -171,6 +277,8 @@ fn create_supported() -> Result<OwnedStore, StoreError> {
     writeln!(marker, "{}:{}", root_id.0, root_id.1)?;
     writeln!(marker, "created")?;
     marker.sync_all()?;
+    use std::os::unix::fs::MetadataExt;
+    let journal_id = Some((marker.metadata()?.dev(), marker.metadata()?.ino()));
     drop(marker);
     // Keep open descriptors as the authority; the path is retained only to
     // reacquire and compare the internally generated parent on reopen.
@@ -184,6 +292,9 @@ fn create_supported() -> Result<OwnedStore, StoreError> {
         parent_id,
         root_id,
         token,
+        journal_id,
+        phase: Phase::Created,
+        poisoned: false,
     })
 }
 
@@ -287,5 +398,39 @@ mod tests {
         assert!(std::fs::read(root.join("saved.journal"))
             .unwrap()
             .starts_with(b"disk-steward-worker-store-v1\n"));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failed_update_poisoning_prevents_retry_after_permissions_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut store = OwnedStore::create().unwrap();
+        let path = store.parent_path.join(&store.name).join("owner.journal");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(store.bind_worker(41).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(store.bind_worker(41).is_err());
+        assert_eq!(store.phase, Phase::Created);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_contents_in_replaced_marker_are_not_mutated() {
+        let mut store = OwnedStore::create().unwrap();
+        let root = store.parent_path.join(&store.name);
+        let path = root.join("owner.journal");
+        let expected = std::fs::read(&path).unwrap();
+        std::fs::rename(&path, root.join("saved.journal")).unwrap();
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut replacement = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        replacement.write_all(&expected).unwrap();
+        replacement.sync_all().unwrap();
+        assert!(store.bind_worker(41).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+        assert_eq!(std::fs::read(root.join("saved.journal")).unwrap(), expected);
     }
 }
