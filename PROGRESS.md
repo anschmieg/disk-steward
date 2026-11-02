@@ -154,3 +154,8 @@ PR7 contains the isolated migration experiment (b2a9984). A proposed fixture-pur
 
 
 Autonomous work paused at the requested quota boundary: Codex usage reached76% (24% remaining), and the heartbeat was set toPAUSED. The isolated0.0.9 runtime-schema work passed131 workspace tests and five standalone migration tests plus strictClippy, but remains a local checkpoint pending final review and native startup verification. No purge API or user-file cleanup is enabled. Resume state and exact worktree/next steps are in .autonomous/disk-steward/progress.md.
+
+
+## M1C follow-up — 0.0.15
+
+Batches A–E implement selective receipt-based purge, backend-owned approval and native confirmation, conservative cross-store recovery, subprocess persistence tests, and the demo UI. PR15 merged with all five checks passing. Main still needs the D/E integration and the validation follow-up. M1C is not complete: controlled-volume measurement and the seeded real-app migration check remain open; M0 and M1B human/credential gates remain open as recorded in their validation documents. The earlier quota-pause entries are historical; Adrian authorized continued implementation and automatic merging of green PRs on 2026-11-02. No release or user-file cleanup is authorized.

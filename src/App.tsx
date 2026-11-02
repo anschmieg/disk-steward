@@ -394,7 +394,7 @@ export default function App() {
           <ShieldCheck size={15} />
           <span>
             {page === "demo"
-              ? "Only app-created demo fixtures can be staged or restored."
+              ? "Only app-created demo fixtures can be staged, restored, or permanently removed."
               : "This plan is metadata only and cannot authorize file operations."}
           </span>
         </div>
@@ -429,7 +429,7 @@ export default function App() {
               {page === "advanced"
                 ? "Review groups and exceptions, keep what matters, and inspect the evidence before saving a snapshot."
                 : page === "demo"
-                  ? "Review and restore files created only for this demo. Each operation needs its own native confirmation."
+                  ? "Review, restore, or permanently remove files created only for this demo. Each operation needs its own native confirmation."
                   : page === "edit"
                     ? "Choose what to include. The plan totals update from the current revision."
                     : native
@@ -759,7 +759,7 @@ export default function App() {
         )}
         <footer className="footnote">
           {page === "demo"
-            ? "Only app-created demo fixtures · exact review and native confirmation required · no permanent deletion"
+            ? "Only app-created demo fixtures · permanent removal requires separate review and native confirmation"
             : "Metadata review only · this plan cannot authorize staging or cleanup"}
         </footer>
       </main>

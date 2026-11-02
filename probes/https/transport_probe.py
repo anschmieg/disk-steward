@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Protocol
 from urllib.parse import urlsplit
 
-VERSION = "0.0.13"
+VERSION = "0.0.15"
 _DEFAULT_MAX_BYTES = 1024 * 1024
 _DEFAULT_DEADLINE_SECONDS = 10.0
 _ENDPOINT = re.compile(r"^/([A-Za-z0-9_-][A-Za-z0-9_.-]*)/([A-Za-z0-9_-][A-Za-z0-9_.-]*\.git)/info/refs$")

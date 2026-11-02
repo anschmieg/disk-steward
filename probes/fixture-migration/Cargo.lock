@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "approval-ledger"
+version = "0.0.15"
+dependencies = [
+ "rusqlite",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -70,19 +77,59 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-core"
-version = "0.0.13"
+version = "0.0.15"
 dependencies = [
  "serde",
  "uuid",
 ]
 
 [[package]]
+name = "disk-steward-demo-execution"
+version = "0.0.15"
+dependencies = [
+ "approval-ledger",
+ "disk-steward-core",
+ "disk-steward-fixture-lifecycle",
+ "disk-steward-fixture-purge",
+ "disk-steward-review-plan",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "disk-steward-fixture-lifecycle"
-version = "0.0.13"
+version = "0.0.15"
 dependencies = [
  "disk-steward-core",
  "rusqlite",
  "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "disk-steward-fixture-purge"
+version = "0.0.15"
+dependencies = [
+ "disk-steward-core",
+ "disk-steward-fixture-lifecycle",
+ "disk-steward-review-plan",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "disk-steward-review-plan"
+version = "0.0.15"
+dependencies = [
+ "disk-steward-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -124,10 +171,12 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "fixture-lifecycle-migration-probe"
-version = "0.0.13"
+version = "0.0.15"
 dependencies = [
  "disk-steward-core",
+ "disk-steward-demo-execution",
  "disk-steward-fixture-lifecycle",
+ "disk-steward-review-plan",
  "rusqlite",
  "serde_json",
  "sha2",

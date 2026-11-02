@@ -10,3 +10,5 @@ src-tauri/gen/
 *.log
 *.tsbuildinfo
 __pycache__/
+
+.vitest/

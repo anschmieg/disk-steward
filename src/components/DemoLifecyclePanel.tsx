@@ -16,6 +16,8 @@ import type {
   DemoPlanProjection,
   DemoStatus,
   PreparedDemoReview,
+  PreparedPurgeReview,
+  PurgeExecutionResult,
 } from "../demo-contract";
 import "./DemoLifecyclePanel.css";
 
@@ -45,7 +47,13 @@ export default function DemoLifecyclePanel({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [needsRefresh, setNeedsRefresh] = useState(false);
+  const [purgePrepared, setPurgePrepared] =
+    useState<PreparedPurgeReview | null>(null);
+  const [purgeResult, setPurgeResult] = useState<PurgeExecutionResult | null>(
+    null,
+  );
   const lastError = useRef<unknown>(null);
+  const previousRevision = useRef(plan.revisionId);
   const busy = pending || planBusy;
   const actionsById = useMemo(
     () => new Map(plan.actions.map((action) => [action.id, action])),
@@ -54,6 +62,7 @@ export default function DemoLifecyclePanel({
   const selected = plan.actions.filter(
     (action) => action.decision === "include",
   );
+  const selectedIds = new Set(selected.map((action) => action.id));
 
   const run = useCallback(
     async <T,>(task: () => Promise<T>): Promise<T | undefined> => {
@@ -85,6 +94,7 @@ export default function DemoLifecyclePanel({
       if (next) {
         setStatus(next);
         setPrepared(null);
+        setPurgePrepared(null);
         if (alsoRefreshPlan) {
           try {
             await onPlanRefresh();
@@ -122,6 +132,14 @@ export default function DemoLifecyclePanel({
       active = false;
     };
   }, [native]);
+
+  useEffect(() => {
+    if (previousRevision.current === plan.revisionId) return;
+    previousRevision.current = plan.revisionId;
+    setPrepared(null);
+    setPurgePrepared(null);
+    setNeedsRefresh(true);
+  }, [plan.revisionId]);
 
   const start = async () => {
     const next = await run(() => invoke<DemoStatus>("start_fixture_demo"));
@@ -228,6 +246,71 @@ export default function DemoLifecyclePanel({
       return fixture?.status === "available" || fixture?.status === "restored";
     });
   const canStart = status?.state === "not_started" && !needsRefresh && !busy;
+
+  // Permanent removal of staged demo files: the native side owns the
+  // parented confirmation dialog; the renderer only selects the staged
+  // receipt pairs and displays the sanitized result.
+  const stagedPairs = (status?.fixtures ?? [])
+    .filter(
+      (fixture) =>
+        fixture.status === "staged" &&
+        fixture.receiptId &&
+        selectedIds.has(fixture.actionId),
+    )
+    .map((fixture) => ({
+      actionId: fixture.actionId,
+      receiptId: fixture.receiptId!,
+    }));
+  const canPreparePurge =
+    native &&
+    status?.state === "ready" &&
+    planConfirmed &&
+    !needsRefresh &&
+    !busy &&
+    stagedPairs.length > 0;
+  const preparePurge = async () => {
+    const next = await run(() =>
+      invoke<PreparedPurgeReview>("prepare_purge_review", {
+        request: {
+          expectedRevisionId: plan.revisionId,
+          targets: stagedPairs,
+        },
+      }),
+    );
+    if (next) setPurgePrepared(next);
+    else setNeedsRefresh(true);
+  };
+  const confirmPurge = async () => {
+    if (!purgePrepared || needsRefresh) return;
+    const completed = await run(async () => {
+      const purge = await invoke<PurgeExecutionResult>(
+        "confirm_purge_execution",
+        { request: { reviewId: purgePrepared.reviewId } },
+      );
+      const latest = await invoke<DemoStatus>("get_fixture_demo_status").catch(
+        () => null,
+      );
+      return { purge, latest };
+    });
+    if (completed) {
+      setPurgeResult(completed.purge);
+      setPurgePrepared(null);
+      if (completed.latest) setStatus(completed.latest);
+      if (!completed.latest || completed.purge.state !== "finished")
+        setNeedsRefresh(true);
+      if (!completed.latest)
+        setError(
+          "The removal result was recorded, but demo status could not be refreshed. Refresh both plan and demo status before continuing.",
+        );
+    } else {
+      const code = errorCode(lastError.current);
+      if (code === "confirmation_cancelled") {
+        setPurgePrepared(null);
+        setError("");
+        setNotice("Confirmation cancelled. No demo files were changed.");
+      } else setNeedsRefresh(true);
+    }
+  };
   return (
     <section className="demo-panel" aria-labelledby="demo-title">
       <header className="demo-heading">
@@ -441,6 +524,57 @@ export default function DemoLifecyclePanel({
                   {pending ? "Preparing review…" : "Review selected demo files"}
                 </button>
               </div>
+              {stagedPairs.length > 0 && (
+                <div className="stage-row">
+                  <div>
+                    <b>Permanently remove staged demo files</b>
+                    <span>
+                      {purgePrepared
+                        ? `${purgePrepared.targets.length} staged demo file(s) · ${purgePrepared.selectedLogicalBytes} logical bytes · the native dialog asks for confirmation`
+                        : "Staged demo files can be permanently removed; the native dialog confirms."}
+                    </span>
+                  </div>
+                  <button
+                    className="demo-button danger"
+                    onClick={() =>
+                      void (purgePrepared ? confirmPurge() : preparePurge())
+                    }
+                    disabled={
+                      busy ||
+                      needsRefresh ||
+                      !canPreparePurge ||
+                      (!purgePrepared && stagedPairs.length === 0)
+                    }
+                  >
+                    {purgePrepared
+                      ? "Confirm permanent removal"
+                      : "Prepare permanent removal"}
+                  </button>
+                </div>
+              )}
+              {purgeResult && (
+                <div className="stage-row">
+                  <div>
+                    <b>
+                      {purgeResult.state === "finished"
+                        ? "Removed permanently"
+                        : purgeResult.state === "partial"
+                          ? "Removal partially completed"
+                          : "Removal needs inspection"}
+                    </b>
+                    <span>
+                      {purgeResult.durablyUnlinkedLogicalBytes} of{" "}
+                      {purgeResult.selectedLogicalBytes} logical bytes removed.
+                      Logical bytes are not a promise of free-space recovery.
+                    </span>
+                    {purgeResult.state !== "finished" && (
+                      <small className="stage-help">
+                        Some items need inspection before any further demo step.
+                      </small>
+                    )}
+                  </div>
+                </div>
+              )}
             </>
           )}
         </>
@@ -513,8 +647,8 @@ export default function DemoLifecyclePanel({
         <div className="demo-safety">
           <CircleHelp size={15} />
           <span>
-            Demo files only · no permanent deletion · restoring does not recover
-            disk space
+            Demo files only · permanent removal requires separate review and
+            native confirmation · restoring does not recover disk space
           </span>
         </div>
       )}

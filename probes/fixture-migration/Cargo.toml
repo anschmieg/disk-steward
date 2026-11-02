@@ -2,13 +2,15 @@
 
 [package]
 name = "fixture-lifecycle-migration-probe"
-version = "0.0.13"
+version = "0.0.15"
 edition = "2021"
 publish = false
 
 [dependencies]
-disk-steward-core = { path = "../../crates/disk-steward-core" }
 disk-steward-fixture-lifecycle = { path = "../../crates/fixture-lifecycle" }
+disk-steward-demo-execution = { path = "../../crates/demo-execution" }
+disk-steward-review-plan = { path = "../../crates/review-plan" }
+disk-steward-core = { path = "../../crates/disk-steward-core" }
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
 serde_json = "1.0"
 sha2 = "0.10"
