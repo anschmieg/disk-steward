@@ -112,6 +112,12 @@ beforeEach(() => {
         ?.profile ?? "pilot";
     if (command === "get_general_plan") return summary(profile) as never;
     if (command === "list_general_reviews") return reviews as never;
+    if (command === "edit_general_plan")
+      return {
+        snapshot: { ...summary(profile, `${profile}-r2`), canUndo: true },
+        blocked: [],
+        changed: true,
+      } as never;
     if (command === "get_exclusion_registry")
       return {
         schemaVersion: 1,
@@ -292,5 +298,164 @@ describe("GeneralPlanWorkspace revision and review boundaries", () => {
       request: { profile: "pilot", expectedRevisionId: "pilot-r1" },
     });
     expect(screen.getByText("pilot-r1")).toBeInTheDocument();
+  });
+
+  it("records only aggregate events after an explicit pilot start and exposes the report without exporting it", async () => {
+    mount();
+    await screen.findByText("pilot-r1");
+    await waitFor(() =>
+      expect(screen.getByTestId("panel-state")).toHaveTextContent(
+        "false:true:false",
+      ),
+    );
+    fireEvent.click(screen.getByText("Review pilot recording"));
+    fireEvent.change(screen.getByLabelText(/anonymous participant code/i), {
+      target: { value: "P1" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await screen.findByText("Choice saved.");
+    fireEvent.click(screen.getByRole("button", { name: "Finish recording" }));
+    const report = JSON.parse(
+      (screen.getByLabelText("Pilot session report") as HTMLTextAreaElement)
+        .value,
+    );
+    expect(report).toMatchObject({
+      kind: "synthetic_review_pilot_metrics",
+      profile: "pilot",
+      participantCode: "P1",
+      initial: {
+        revisionNumber: 1,
+        itemCount: 1,
+        groupCount: 0,
+        confirmed: true,
+      },
+      final: { revisionNumber: 1, itemCount: 1, confirmed: true },
+      counts: {
+        item_choice: 1,
+        pointer_activation: expect.any(Number),
+        refresh: expect.any(Number),
+      },
+      humanAssessment: "not_recorded",
+      executionAvailable: false,
+    });
+    expect(JSON.stringify(report)).not.toContain("item-pilot");
+    expect(
+      screen.queryByRole("button", { name: /export|download/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("records refresh, failed requests, and canceled selection without inventing a metadata addition", async () => {
+    mockedInvoke.mockImplementation(async (command, args) => {
+      const profile =
+        (args as { request?: { profile?: "pilot" | "stress" } })?.request
+          ?.profile ?? "pilot";
+      if (command === "get_general_plan") return summary(profile) as never;
+      if (command === "list_general_reviews") return reviews as never;
+      if (command === "get_exclusion_registry")
+        return {
+          schemaVersion: 1,
+          revisionId: "exclusions-1",
+          entries: [],
+        } as never;
+      if (command === "edit_general_plan") throw new Error("edit failed");
+      if (command === "add_selected_general_item")
+        return { snapshot: null, canceled: true } as never;
+      throw new Error(`Unexpected command ${String(command)}`);
+    });
+    mount();
+    await screen.findByText("pilot-r1");
+    await waitFor(() =>
+      expect(screen.getByTestId("panel-state")).toHaveTextContent(
+        "false:true:false",
+      ),
+    );
+    fireEvent.click(screen.getByText("Review pilot recording"));
+    fireEvent.change(screen.getByLabelText(/anonymous participant code/i), {
+      target: { value: "P2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("panel-state")).toHaveTextContent(
+        "false:false:false",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refresh editor" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("panel-state")).toHaveTextContent(
+        "false:true:false",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /add file metadata/i }));
+    await screen.findByText("Selection canceled. The plan is unchanged.");
+    fireEvent.click(screen.getByRole("button", { name: "Finish recording" }));
+    const report = JSON.parse(
+      (screen.getByLabelText("Pilot session report") as HTMLTextAreaElement)
+        .value,
+    );
+    expect(report.counts).toMatchObject({
+      request_failed: 1,
+      refresh: 1,
+      selection_canceled: 1,
+      add_file_metadata: 0,
+    });
+  });
+
+  it("can finish while a saved review is displayed and keeps profile and browser boundaries", async () => {
+    mockedInvoke.mockImplementation(async (command, args) => {
+      const profile =
+        (args as { request?: { profile?: "pilot" | "stress" } })?.request
+          ?.profile ?? "pilot";
+      if (command === "get_general_plan") return summary(profile) as never;
+      if (command === "list_general_reviews") return reviews as never;
+      if (command === "get_exclusion_registry")
+        return {
+          schemaVersion: 1,
+          revisionId: "exclusions-1",
+          entries: [],
+        } as never;
+      if (command === "freeze_general_review") return frozen as never;
+      throw new Error(`Unexpected command ${String(command)}`);
+    });
+    const view = mount();
+    await screen.findByText("pilot-r1");
+    fireEvent.click(screen.getByText("Review pilot recording"));
+    fireEvent.change(screen.getByLabelText(/anonymous participant code/i), {
+      target: { value: "P3" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
+    expect(screen.getByLabelText(/example workspace/i)).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Freeze review" }));
+    await screen.findByText(/Saved review · revision/);
+    fireEvent.click(screen.getByRole("button", { name: "Finish recording" }));
+    const report = JSON.parse(
+      (screen.getByLabelText("Pilot session report") as HTMLTextAreaElement)
+        .value,
+    );
+    expect(report.counts.freeze_review).toBe(1);
+    expect(report.final.confirmed).toBe(true);
+    expect(JSON.stringify(report)).not.toMatch(
+      /item-pilot|Synthetic retained item/,
+    );
+    expect(
+      mockedInvoke.mock.calls.some(([command]) =>
+        /export|download/i.test(String(command)),
+      ),
+    ).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Discard recording" }));
+    fireEvent.change(screen.getByLabelText(/example workspace/i), {
+      target: { value: "stress" },
+    });
+    await screen.findByText("stress-r1");
+    expect(
+      screen.queryByText("Review pilot recording"),
+    ).not.toBeInTheDocument();
+    view.unmount();
+    mount(false);
+    expect(
+      screen.queryByText("Review pilot recording"),
+    ).not.toBeInTheDocument();
   });
 });

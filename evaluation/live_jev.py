@@ -20,7 +20,7 @@ from typing import Callable, Mapping
 
 MODEL = "typesafe/jev-1.14"
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
-VERSION = "0.0.16"
+VERSION = "0.0.17"
 MAX_REQUESTS = 5
 MAX_RESPONSE_BYTES = 256 * 1024
 ROUTES = ("keep", "inspect_metadata", "run_specialist", "reasoning_review", "ask_user")

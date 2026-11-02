@@ -9,6 +9,9 @@ import type {
   EditOutcome,
   PlanEdit,
 } from "../general-plan-contract";
+import { useReviewPilotSession } from "../review-pilot";
+import type { PilotContext, PilotEvent } from "../review-pilot-contract";
+import ReviewPilotPanel from "./ReviewPilotPanel";
 
 export type GeneralPlanSummary = {
   count: number;
@@ -39,6 +42,26 @@ export default function GeneralPlanWorkspace({
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const recorder = useReviewPilotSession();
+  const pilotContext = useMemo<PilotContext | null>(
+    () =>
+      snapshot
+        ? {
+            revisionNumber: snapshot.revisionNumber,
+            itemCount: snapshot.items.length,
+            groupCount: snapshot.groups.length,
+            selectedCount: snapshot.totals.selectedCount,
+            logicalSelectedBytes: snapshot.totals.logicalSelectedBytes,
+            confirmed,
+          }
+        : null,
+    [snapshot, confirmed],
+  );
+  const record = recorder.record;
+  const recordInteraction = useCallback(
+    (event: PilotEvent) => record(event),
+    [record],
+  );
   const running = useRef(false);
   const mounted = useRef(true);
   useEffect(() => {
@@ -59,6 +82,7 @@ export default function GeneralPlanWorkspace({
       try {
         return await operation();
       } catch (failure) {
+        recordInteraction("request_failed");
         if (mounted.current) {
           setConfirmed(false);
           setError(messageFor(failure));
@@ -70,7 +94,7 @@ export default function GeneralPlanWorkspace({
         onBusyChange(false);
       }
     },
-    [native, onBusyChange],
+    [native, onBusyChange, recordInteraction],
   );
 
   const refresh = useCallback(async () => {
@@ -85,12 +109,13 @@ export default function GeneralPlanWorkspace({
       return { next, reviews };
     });
     if (loaded && mounted.current) {
+      recordInteraction("refresh");
       setSnapshot(loaded.next);
       setReviewHistory(loaded.reviews);
       setConfirmed(true);
       setNotice("");
     }
-  }, [profile, request]);
+  }, [profile, request, recordInteraction]);
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -125,6 +150,7 @@ export default function GeneralPlanWorkspace({
       }),
     );
     if (next) {
+      recordInteraction(editEvent(change));
       setSnapshot(next.snapshot);
       setConfirmed(true);
       setNotice(
@@ -147,6 +173,11 @@ export default function GeneralPlanWorkspace({
       ),
     );
     if (result) {
+      if (result.canceled) recordInteraction("selection_canceled");
+      else if (result.snapshot)
+        recordInteraction(
+          kind === "folder" ? "add_folder_metadata" : "add_file_metadata",
+        );
       if (result.snapshot) setSnapshot(result.snapshot);
       setConfirmed(true);
       setNotice(
@@ -166,6 +197,7 @@ export default function GeneralPlanWorkspace({
       }),
     );
     if (next) {
+      recordInteraction(direction);
       setSnapshot(next);
       setConfirmed(true);
       setNotice(
@@ -183,6 +215,7 @@ export default function GeneralPlanWorkspace({
       }),
     );
     if (review) {
+      recordInteraction("freeze_review");
       setSavedReview(review);
       setReviewHistory((previous) => [
         {
@@ -206,6 +239,7 @@ export default function GeneralPlanWorkspace({
       }),
     );
     if (review) {
+      recordInteraction("open_review");
       setSavedReview(review);
       setShowReview(true);
       setNotice("");
@@ -222,14 +256,19 @@ export default function GeneralPlanWorkspace({
       </section>
     );
   return (
-    <section className="general-workspace">
+    <section
+      className="general-workspace"
+      onClickCapture={() => record("pointer_activation")}
+      onKeyDownCapture={() => record("key_press")}
+    >
       <div className="general-toolbar">
         <label>
           Example workspace{" "}
           <select
             value={profile}
-            disabled={busy || showReview}
+            disabled={busy || showReview || recorder.phase === "recording"}
             onChange={(event) => {
+              if (recorder.phase === "recording") return;
               setSnapshot(null);
               setSavedReview(null);
               setReviewHistory([]);
@@ -285,7 +324,10 @@ export default function GeneralPlanWorkspace({
           <button
             className="ap-button quiet"
             disabled={busy}
-            onClick={() => setShowReview(true)}
+            onClick={() => {
+              setShowReview(true);
+              record("open_review");
+            }}
           >
             View saved review · revision {savedReview.revisionNumber}
           </button>
@@ -302,7 +344,10 @@ export default function GeneralPlanWorkspace({
           </div>
           <button
             className="ap-button quiet"
-            onClick={() => setShowReview(false)}
+            onClick={() => {
+              setShowReview(false);
+              record("return_to_editor");
+            }}
           >
             Return to editor
           </button>
@@ -327,7 +372,14 @@ export default function GeneralPlanWorkspace({
           onEdit={edit}
           onUndo={() => history("undo")}
           onRedo={() => history("redo")}
-          onRefresh={showReview ? async () => setShowReview(false) : refresh}
+          onRefresh={
+            showReview
+              ? async () => {
+                  setShowReview(false);
+                  record("return_to_editor");
+                }
+              : refresh
+          }
           onFreezeReview={freeze}
         />
       ) : (
@@ -342,8 +394,31 @@ export default function GeneralPlanWorkspace({
           </button>
         </div>
       )}
+      {profile === "pilot" && (
+        <ReviewPilotPanel
+          recorder={recorder}
+          context={pilotContext}
+          busy={busy}
+          canStart={!!snapshot && confirmed && !showReview}
+        />
+      )}
     </section>
   );
+}
+
+function editEvent(edit: PlanEdit): PilotEvent {
+  switch (edit.kind) {
+    case "setChoice":
+      return "item_choice";
+    case "setGroupChoice":
+      return "group_choice";
+    case "setMembership":
+      return "membership_change";
+    case "excludeDescendants":
+      return "descendant_exclusion";
+    case "setDuplicateSurvivor":
+      return "duplicate_survivor";
+  }
 }
 
 function messageFor(error: unknown): string {

@@ -1,0 +1,73 @@
+.review-pilot-panel {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid #d8e1d9;
+  border-radius: 7px;
+  color: #2d4035;
+  font-size: 12px;
+}
+.review-pilot-panel summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+.review-pilot-panel p {
+  max-width: 700px;
+  line-height: 1.5;
+}
+.review-pilot-controls {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 12px 0;
+}
+.review-pilot-controls label,
+.review-pilot-report {
+  display: grid;
+  gap: 5px;
+}
+.review-pilot-panel input,
+.review-pilot-panel textarea {
+  border: 1px solid #cbd7cd;
+  border-radius: 5px;
+  padding: 7px;
+  font: inherit;
+}
+.review-pilot-panel button {
+  border: 1px solid #cbd7cd;
+  border-radius: 5px;
+  padding: 7px 10px;
+  background: #fff;
+  color: #315a43;
+  cursor: pointer;
+}
+.review-pilot-panel button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.review-pilot-report {
+  margin: 12px 0;
+}
+.review-pilot-counts {
+  margin: 14px 0;
+  padding: 10px 12px;
+  border: 1px solid #e4ebe5;
+  border-radius: 6px;
+}
+.review-pilot-counts h3 {
+  margin: 0 0 7px;
+  font-size: 12px;
+}
+.review-pilot-counts p {
+  margin: 4px 0;
+}
+.review-pilot-report textarea {
+  width: min(100%, 720px);
+  min-height: 240px;
+  font:
+    11px/1.45 ui-monospace,
+    monospace;
+}
+.review-pilot-status {
+  min-height: 1em;
+}
