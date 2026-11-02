@@ -154,3 +154,13 @@ actual TLS totals before and after finalization, including to a modeled canceled
 job, without acknowledging worker stop or cleanup. This is accounting
 integration evidence, not production job cancellation routing, durable worker
 reconciliation, or verification completion.
+
+On Unix, a private interoperability test routes the candidate's actual v2 GET
+and `ls-refs` POST through loopback TLS to `/usr/bin/git upload-pack`. It creates
+only a new private bare SHA-1 fixture with a commit and annotated tag. Git runs
+with a cleared environment, isolated configuration, fixed commands, bounded
+stdin/stdout, and deadline/reap handling. Fixture identity is checked before
+commands and cleanup. The test checks real HEAD/main/tag and peeled metadata
+and both HTTP finalizations. This is local ref-protocol evidence on the Git
+version/platform where run, not fetching, object completeness, a broad version
+matrix, real GitHub/private authentication, or cleanup eligibility.

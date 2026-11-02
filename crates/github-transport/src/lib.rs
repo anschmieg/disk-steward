@@ -2090,6 +2090,8 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 #[cfg(test)]
 mod tests {
     mod failure_tests;
+    #[cfg(unix)]
+    mod git_interop;
 
     use super::*;
     use gix_transport::bstr::ByteSlice as _;
