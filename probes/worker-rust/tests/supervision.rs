@@ -14,7 +14,7 @@ fn default_is_dry_run_and_starts_no_child() {
 }
 
 #[test]
-fn run_supervises_only_the_two_fixed_child_cases() {
+fn run_supervises_three_fixed_child_cases() {
     let output = probe().arg("--run").output().expect("run fixed probe");
     assert!(
         output.status.success(),
@@ -24,8 +24,12 @@ fn run_supervises_only_the_two_fixed_child_cases() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
     assert!(stdout.contains("case=flood stop=OutputLimit"), "{stdout}");
     assert!(stdout.contains("case=stall stop=Deadline"), "{stdout}");
-    assert_eq!(stdout.matches("reader_joined=true").count(), 2, "{stdout}");
-    assert_eq!(stdout.matches("child_exit=").count(), 2, "{stdout}");
+    assert!(
+        stdout.contains("case=cancel stop=Canceled bytes=1"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("reader_joined=true").count(), 3, "{stdout}");
+    assert_eq!(stdout.matches("child_exit=").count(), 3, "{stdout}");
     assert!(stdout.contains("bytes=65537"), "{stdout}");
     assert!(
         stdout.contains("case=stall stop=Deadline bytes=1"),

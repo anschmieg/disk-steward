@@ -4,7 +4,11 @@ This development-only probe provides a small Rust counterpart to the Python
 worker fixture. Running the binary with no arguments is a dry run: it starts
 no child. `--run` starts two sequential copies of its own executable using
 fixed internal modes. The flood child signals readiness and writes a finite
-1 MiB synthetic stream; the stall child signals readiness and sleeps. The
+1 MiB synthetic stream; the stall child signals readiness and sleeps. For the
+cancel case, the parent starts that same fixed `stall` child, waits for its
+readiness byte, then explicitly selects `Canceled` and enters the shared
+stop, reap, and reader-join path. This is synthetic parent-directed
+cancellation, not real UI or network cancellation. The
 parent reads stdout on a dedicated thread, retains no output bytes, stops
 reading after 64 KiB plus one byte, and applies a one-second monotonic deadline.
 On either limit it kills the child, waits for its exit, and joins the reader
@@ -32,7 +36,8 @@ cargo test -p disk-steward-worker-probe --locked
 
 The live probe prints one result per case. The expected flood result is
 `stop=OutputLimit bytes=65537`; the expected stall result is
-`stop=Deadline bytes=1`. Each result requires a recorded child exit and
+`stop=Deadline bytes=1`; the expected cancel result is
+`stop=Canceled bytes=1`. Each result requires a recorded child exit and
 `reader_joined=true`. A missing readiness signal, reader failure or unconfirmed
 cleanup returns an error instead. Elapsed time includes shutdown and may exceed
 the one-second detection deadline; it is not an OS scheduling guarantee.
