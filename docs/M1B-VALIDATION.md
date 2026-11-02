@@ -44,3 +44,12 @@ The pilot can now add a folder through its own native picker and typed profile/r
 All26 native tests, strict native Clippy, formatting and frontend type/build/version checks passed. The40.14MiB macOS debug bundle passed picker cancellation at revision9, addition at revision10 (1,002 entries/790 selected), restart persistence, undo at revision11 (1,001/790) and redo at revision12 (1,002/790), using the same disposable directory. The inspector showed unknown size/recovery and explicitly unknown contents/emptiness; Include was disabled. The valuable sentinel remained unchanged. Shared workspace code last passed its128 tests in the preceding0.0.6 checkpoint; this batch changes native metadata/UI plus matching versions.
 
 File/folder additions are available as blocked observations. Real source inventory and eligibility still belong to discovery, and the three-participant preservation/comprehension pilot remains unperformed. M1B stays In progress.
+
+
+## Component preservation coverage — 0.0.16, 2026-11-02
+
+Added ten real-panel behavioral tests and five workspace orchestration tests. Panel tests cover blocked Include, one group-target command, visible user Keep, exact duplicate-survivor and descendant-exclusion identities, busy/read-only/unconfirmed mutation guards, and keyboard Home/End/Arrow/Enter navigation across virtualized windows. The navigation fixtures contain 1,000 flat findings in 25 groups and 10,000 findings in one large group; detailed blocker/folder/duplicate interactions use separate small fixtures. They are not the full participant-pilot dataset. Mounted row count is bounded and focus follows the window movement; jsdom does not establish native frame timing or screen-reader behavior.
+
+The workspace tests mock Tauri responses and isolate orchestration: profile/review loading, revision-bound edit/undo/redo/freeze requests, stale-error refusal until refresh, immutable read-only reviews, canceled metadata selection and profile switching. They explicitly distinguish loaded/editable state from an immutable saved review. Integration review retained the existing production behavior; no editor defect was confirmed and no authority or runtime code was changed.
+
+The frontend suite now has 28 passing tests, including the existing 13 purge tests. TypeScript/production build, Prettier and npm audit (zero vulnerabilities) pass. The three-participant preservation/comprehension pilot, native accessibility and measured native performance remain open. No M1B completion or user-file execution is enabled by these tests.
