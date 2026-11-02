@@ -119,6 +119,10 @@ typed_id!(AttemptId, "attempt");
 typed_id!(ActionId, "action");
 typed_id!(ApprovalId, "approval");
 typed_id!(EvidenceId, "evidence");
+typed_id!(InventoryItemId, "inventory-item");
+typed_id!(GlobalExclusionId, "global-exclusion");
+typed_id!(GroupId, "group");
+typed_id!(DuplicateGroupId, "duplicate-group");
 
 /// Host platform identifiers used to describe adapter coverage. These values do
 /// not imply that an adapter is installed, available, or validated.

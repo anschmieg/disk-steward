@@ -1,7 +1,34 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Local diagnostics, example-plan commands, and a bounded native disposable-file demo bridge; no generic filesystem, shell or SQL access.",
-  "windows": ["main"],
-  "permissions": ["core:default", "allow-foundation-status", "allow-check-selected-folder-access", "allow-preview-native-review", "allow-get-example-plan", "allow-edit-example-plan", "allow-freeze-example-review", "allow-preview-saved-example-review", "allow-get-fixture-demo-status", "allow-start-fixture-demo", "allow-prepare-fixture-stage", "allow-prepare-fixture-restore", "allow-request-fixture-execution"]
+  "description": "Typed local diagnostics, metadata plan editors and app-created fixture demo only; no generic filesystem, shell, SQL or user-file execution access.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-foundation-status",
+    "allow-check-selected-folder-access",
+    "allow-preview-native-review",
+    "allow-get-example-plan",
+    "allow-edit-example-plan",
+    "allow-freeze-example-review",
+    "allow-preview-saved-example-review",
+    "allow-get-fixture-demo-status",
+    "allow-start-fixture-demo",
+    "allow-prepare-fixture-stage",
+    "allow-prepare-fixture-restore",
+    "allow-request-fixture-execution",
+    "allow-get-general-plan",
+    "allow-edit-general-plan",
+    "allow-undo-general-plan",
+    "allow-redo-general-plan",
+    "allow-freeze-general-review",
+    "allow-get-general-review",
+    "allow-list-general-reviews",
+    "allow-add-selected-general-item",
+    "allow-get-exclusion-registry",
+    "allow-add-global-exclusion",
+    "allow-remove-global-exclusion"
+  ]
 }

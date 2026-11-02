@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-general-reviews"
+description = "Enables the list_general_reviews command without any pre-configured scope."
+commands.allow = ["list_general_reviews"]
+
+[[permission]]
+identifier = "deny-list-general-reviews"
+description = "Denies the list_general_reviews command without any pre-configured scope."
+commands.deny = ["list_general_reviews"]

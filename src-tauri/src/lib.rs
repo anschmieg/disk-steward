@@ -1,5 +1,9 @@
 mod example_plan;
+mod exclusion_identity;
 mod fixture_demo;
+mod general_plan;
+mod global_exclusions;
+mod selected_metadata;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
@@ -61,6 +65,8 @@ pub fn run() {
         .setup(|app| {
             app.manage(example_plan::ExamplePlanState::open(app.handle()));
             app.manage(fixture_demo::FixtureDemoState::open(app.handle()));
+            app.manage(general_plan::GeneralPlanState::open(app.handle()));
+            app.manage(global_exclusions::ExclusionState::open(app.handle()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -75,7 +81,18 @@ pub fn run() {
             fixture_demo::start_fixture_demo,
             fixture_demo::prepare_fixture_stage,
             fixture_demo::prepare_fixture_restore,
-            fixture_demo::request_fixture_execution
+            fixture_demo::request_fixture_execution,
+            general_plan::get_general_plan,
+            general_plan::edit_general_plan,
+            general_plan::undo_general_plan,
+            general_plan::redo_general_plan,
+            general_plan::freeze_general_review,
+            general_plan::get_general_review,
+            general_plan::list_general_reviews,
+            general_plan::add_selected_general_item,
+            global_exclusions::get_exclusion_registry,
+            global_exclusions::add_global_exclusion,
+            global_exclusions::remove_global_exclusion
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disk Steward");
