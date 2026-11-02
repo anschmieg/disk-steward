@@ -4,7 +4,8 @@ use std::{
     any::Any,
     io::{self, BufRead, Cursor, Read, Write},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    process::{Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -14,11 +15,13 @@ use gix_transport::client::blocking_io::http::{GetResponse, Http, PostBodyDataKi
 
 const HEADER_LIMIT: usize = 8192;
 const IO_SLICE_TIMEOUT: Duration = Duration::from_millis(100);
+const CHILD_READY_LINE: &[u8] = b"GIX_LOOPBACK_GET_ACCEPTED\n";
 
 #[derive(Clone)]
 struct SharedBudget {
     limit: usize,
     used: Arc<Mutex<usize>>,
+    read_slice: Duration,
 }
 
 impl SharedBudget {
@@ -26,6 +29,7 @@ impl SharedBudget {
         Self {
             limit,
             used: Arc::new(Mutex::new(0)),
+            read_slice: IO_SLICE_TIMEOUT,
         }
     }
 
@@ -334,7 +338,7 @@ fn read_counted(
     output: &mut [u8],
 ) -> io::Result<usize> {
     read_counted_with(budget, deadline, output, |limited_output| {
-        let timeout = remaining_timeout(deadline)?.min(IO_SLICE_TIMEOUT);
+        let timeout = remaining_timeout(deadline)?.min(budget.read_slice);
         stream.set_read_timeout(Some(timeout))?;
         stream.read(limited_output)
     })
@@ -490,6 +494,158 @@ fn listener() -> (TcpListener, SocketAddr) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback listener");
     let address = listener.local_addr().expect("listener address");
     (listener, address)
+}
+
+/// Child-only exact test selected by `outer_worker_deadline_kills_blocked_gix_handshake`.
+/// It intentionally keeps the server socket open without a response so the
+/// real gix handshake remains blocked until its long inner deadline.
+#[test]
+#[ignore = "invoked only by the exact subprocess deadline test"]
+fn blocked_gix_handshake_child_fixture() {
+    let (listener, address) = listener();
+    let _server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept loopback GET");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound fixture request read");
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream
+                .read_exact(&mut byte)
+                .expect("read complete loopback request headers");
+            request.push(byte[0]);
+            assert!(request.len() <= HEADER_LIMIT, "bounded request headers");
+        }
+        assert!(request.starts_with(b"GET /info/refs?service=git-upload-pack HTTP/1.1\r\n"));
+        println!("{}", String::from_utf8_lossy(CHILD_READY_LINE).trim());
+        io::stdout().flush().expect("flush child readiness line");
+        // Keep the connection open. The parent must terminate the child before
+        // this intentionally long inner deadline expires.
+        thread::sleep(Duration::from_secs(35));
+    });
+
+    let mut client = SocketHttp::new(address, 4096, Duration::from_secs(30));
+    // Disable the short fixture socket cutoff for this child only: the outer
+    // process deadline must terminate a genuinely blocked read.
+    client.budget.read_slice = Duration::from_secs(30);
+    let url = gix_url::parse("https://fixture.invalid/synthetic.git").expect("fixture URL");
+    let mut transport = gix_transport::client::blocking_io::http::Transport::new_http(
+        client,
+        url,
+        gix_transport::Protocol::V2,
+        false,
+    );
+    use gix_transport::{client::blocking_io::Transport as _, Service};
+    let _ = transport.handshake(Service::UploadPack, &[]);
+    panic!("blocked handshake unexpectedly returned before the outer supervisor stopped it");
+}
+
+#[test]
+fn outer_worker_deadline_kills_blocked_gix_handshake() {
+    let executable = std::env::current_exe().expect("current test executable");
+    let outer_deadline = Instant::now() + Duration::from_secs(2);
+    let mut child = Command::new(executable)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("loopback_http_tests::blocked_gix_handshake_child_fixture")
+        .arg("--nocapture")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn exact child test");
+    // Start the attempt clock before launching the output reader. No assertion
+    // may unwind past a live child: always kill/wait and join before checking.
+    let stdout = child.stdout.take().expect("child stdout pipe");
+    #[derive(Debug)]
+    enum Event {
+        Ready,
+        Finished { bytes: usize, failed: bool },
+    }
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::Builder::new()
+        .name("gix-deadline-child-output".into())
+        .spawn(move || {
+            let mut stdout = stdout;
+            let mut bytes = Vec::new();
+            let mut failed = false;
+            let mut ready = false;
+            let mut byte = [0];
+            while bytes.len() < 1024 {
+                match stdout.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        bytes.push(byte[0]);
+                        if !ready && bytes.ends_with(CHILD_READY_LINE) {
+                            ready = true;
+                            let _ = tx.send(Event::Ready);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(Event::Finished {
+                bytes: bytes.len(),
+                failed,
+            });
+        });
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("spawn bounded reader: {error}");
+        }
+    };
+    let readiness = rx.recv_timeout(outer_deadline.saturating_duration_since(Instant::now()));
+    let reached_transport = matches!(readiness, Ok(Event::Ready));
+    let before_stop = child.try_wait();
+    let remaining = outer_deadline.saturating_duration_since(Instant::now());
+    let still_blocked = reached_transport
+        && matches!(before_stop, Ok(None))
+        && !remaining.is_zero()
+        && matches!(
+            rx.recv_timeout(remaining),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+    let killed = child.kill().is_ok();
+    let status = child.wait();
+    let reader_joined = reader.join().is_ok();
+    let captured = rx.try_recv().ok();
+
+    assert!(
+        reached_transport,
+        "child did not prove gix issued the loopback GET: {readiness:?}"
+    );
+    assert!(
+        matches!(before_stop, Ok(None)),
+        "child exited before outer stop: {before_stop:?}"
+    );
+    assert!(still_blocked, "child completed before the outer deadline");
+    assert!(killed, "outer supervisor must kill the still-running child");
+    assert!(
+        !status.expect("confirmed wait/reap").success(),
+        "killed child must have unsuccessful status"
+    );
+    assert!(
+        reader_joined,
+        "bounded output reader must join after child exit"
+    );
+    assert!(
+        matches!(
+            captured,
+            Some(Event::Finished {
+                bytes: 1..1024,
+                failed: false
+            })
+        ),
+        "reader must report EOF after child exit"
+    );
 }
 
 #[test]

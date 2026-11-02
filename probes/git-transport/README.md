@@ -82,3 +82,16 @@ The next proof must wrap the selected production HTTP backend below any
 socket/TLS/decompression read-ahead buffer or measure bounded cancellation
 overshoot explicitly, using a local adversarial HTTP fixture. A worker-level
 deadline is still needed for DNS, connection establishment, and reads.
+
+The test-only `outer_worker_deadline_kills_blocked_gix_handshake` runs the exact
+current test executable with one fixed ignored helper selected. That helper
+owns a loopback server, confirms the actual gix upload-pack GET, and withholds
+its response. Its socket-read and transport deadlines are 30 seconds; the
+parent's two-second attempt deadline includes process startup. The parent
+receives readiness through bounded output, kills and waits for the child,
+and joins the output reader before asserting the result. The helper is ignored
+in the ordinary test list because it must run under its parent supervisor.
+An early handshake return fails rather than being hidden by a server join.
+This proves outer termination of this blocked local gix read. It does not
+integrate the separate store worker, exercise DNS/TLS or credentials, establish
+an OS kill/wait latency guarantee, or complete the production transport gate.
