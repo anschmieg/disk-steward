@@ -243,3 +243,9 @@ capacity; registry/control overhead, shared app-wide admission, process death,
 power loss and production worker lifecycle remain separate gates. The fixture
 is gated to the registry adapter's Linux/macOS targets. No application or
 renderer calls this test sink.
+
+The fixed system-Git fixture supervises repository setup and local receiver
+verification with a ten-second per-command budget, while upload-pack RPC
+commands retain a three-second budget. Shared macOS CI exceeded the earlier
+three-second setup budget; the failing child was reaped. These are test-fixture
+limits, not changes to transport or product attempt deadlines.
