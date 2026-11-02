@@ -601,11 +601,15 @@ fn safe_error(kind: io::ErrorKind, message: &'static str) -> io::Error {
     io::Error::new(kind, message)
 }
 
-fn request_io_error(cancellation: &CancellationHandle, message: &'static str) -> io::Error {
+fn request_io_error(
+    cancellation: &CancellationHandle,
+    error: io::Error,
+    message: &'static str,
+) -> io::Error {
     if cancellation.is_cancelled() {
         safe_error(io::ErrorKind::ConnectionAborted, "attempt cancelled")
     } else {
-        safe_error(io::ErrorKind::Other, message)
+        safe_error(error.kind(), message)
     }
 }
 
@@ -720,6 +724,7 @@ fn read_until(
             Ok(count) => return Ok(count),
             Err(error) => {
                 cancellation.check()?;
+                check_deadline(deadline)?;
                 return Err(error);
             }
         }
@@ -760,7 +765,11 @@ fn write_until(
             {
                 continue
             }
-            Err(_) => return Err(safe_error(io::ErrorKind::Other, "transport write failed")),
+            Err(error) => {
+                cancellation.check()?;
+                check_deadline(deadline)?;
+                return Err(safe_error(error.kind(), "transport write failed"));
+            }
         }
     }
     Ok(())
@@ -1212,15 +1221,17 @@ impl RawHttp {
         }
         req.push_str("\r\n");
         tls.write_all(req.as_bytes())
-            .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
+            .map_err(|error| request_io_error(&self.cancellation, error, "request write failed"))?;
         if let Some(b) = body {
-            tls.write_all(&b)
-                .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
-            tls.flush()
-                .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
+            tls.write_all(&b).map_err(|error| {
+                request_io_error(&self.cancellation, error, "request write failed")
+            })?;
+            tls.flush().map_err(|error| {
+                request_io_error(&self.cancellation, error, "request write failed")
+            })?;
         }
         tls.flush()
-            .map_err(|_| request_io_error(&self.cancellation, "request write failed"))?;
+            .map_err(|error| request_io_error(&self.cancellation, error, "request write failed"))?;
         let mut raw = Vec::new();
         let mut byte = [0];
         while !raw.ends_with(b"\r\n\r\n") {
@@ -1230,20 +1241,23 @@ impl RawHttp {
                     "response headers exceed limit",
                 ));
             }
-            tls.read_exact(&mut byte).map_err(|_| {
-                request_io_error(&self.cancellation, "response headers unavailable")
+            tls.read_exact(&mut byte).map_err(|error| {
+                request_io_error(&self.cancellation, error, "response headers unavailable")
             })?;
             raw.push(byte[0]);
         }
         let parsed = parse_headers(&raw)?;
-        if parsed.status == 401 {
+        if matches!(parsed.status, 401 | 403) {
             return Err(safe_error(
                 io::ErrorKind::PermissionDenied,
-                "GitHub authentication required",
+                "HTTP access denied",
             ));
         }
-        if !(200..300).contains(&parsed.status) {
-            return Err(safe_error(io::ErrorKind::Other, "HTTP response rejected"));
+        if parsed.status != 200 {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "HTTP response rejected",
+            ));
         }
         let length = parsed.length.unwrap_or(0);
         if method == "GET" && (length as u64) > MAX_ADVERTISEMENT {
@@ -2075,6 +2089,8 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 
 #[cfg(test)]
 mod tests {
+    mod failure_tests;
+
     use super::*;
     use gix_transport::bstr::ByteSlice as _;
     use gix_transport::client::blocking_io::Transport as _;

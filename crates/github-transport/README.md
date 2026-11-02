@@ -13,7 +13,14 @@ root set and hostname verification. The root set is compiled into the binary;
 updating Mozilla roots and matching packaged-app trust policy remain release
 gates, and this is not the operating system trust store. Redirects, non-2xx
 responses, compression, malformed/ambiguous headers, and oversized POST
-requests fail closed. Responses may use either a single `Content-Length` or one
+requests fail closed. Only HTTP `200` is accepted as successful; `401` and
+`403` map to `PermissionDenied`, while all other statuses (including other 2xx
+responses and `304`) fail closed. This candidate has no cache or conditional
+revalidation support. See the [Git HTTP protocol](https://git-scm.com/docs/http-protocol)
+for discovery and access-denial semantics. Socket and ref-observation errors
+preserve I/O kinds through bounded cause-metadata inspection, while public
+messages discard response/header/credential diagnostic context. Responses may
+use either a single `Content-Length` or one
 `Transfer-Encoding: chunked` coding; chains, duplicates, or both framing modes
 are rejected. Chunk payloads stream through a bounded decoder above the raw
 TLS byte budget. Chunk control lines and the aggregate trailer section are

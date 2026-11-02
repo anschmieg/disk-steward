@@ -88,10 +88,11 @@ pub(super) fn read_advertised_refs(t: &mut GitHubTransport) -> io::Result<Vec<Ad
         gix_transport::Service::UploadPack,
         &[],
     )
-    .map_err(|_| {
-        cancellation.check().err().unwrap_or_else(|| {
-            safe_error(io::ErrorKind::InvalidData, "upload-pack handshake failed")
-        })
+    .map_err(|error| {
+        cancellation
+            .check()
+            .err()
+            .unwrap_or_else(|| map_client_error(error, "upload-pack handshake failed"))
     })?;
     let protocol = response.actual_protocol;
     let capabilities = response.capabilities.clone();
@@ -125,11 +126,11 @@ pub(super) fn read_advertised_refs(t: &mut GitHubTransport) -> io::Result<Vec<Ad
             Some([b"peel".to_vec().into(), b"symrefs".to_vec().into()].into_iter()),
             false,
         )
-        .map_err(|_| {
+        .map_err(|error| {
             cancellation
                 .check()
                 .err()
-                .unwrap_or_else(|| safe_error(io::ErrorKind::InvalidData, "ls-refs request failed"))
+                .unwrap_or_else(|| map_client_error(error, "ls-refs request failed"))
         })?;
     let mut refs = Vec::new();
     let mut names = HashSet::new();
@@ -145,7 +146,8 @@ pub(super) fn read_advertised_refs(t: &mut GitHubTransport) -> io::Result<Vec<Ad
                 "incomplete ls-refs response",
             ));
         };
-        let item = item.map_err(|error| safe_error(error.kind(), "invalid ls-refs packet"))?;
+        let item =
+            item.map_err(|error| safe_error(io_failure_kind(&error), "invalid ls-refs packet"))?;
         let line = match item {
             Ok(gix_transport::packetline::PacketLineRef::Data(d)) => d,
             _ => {
@@ -169,6 +171,51 @@ pub(super) fn read_advertised_refs(t: &mut GitHubTransport) -> io::Result<Vec<Ad
     cancellation.check()?;
     check_deadline(deadline)?;
     Ok(refs)
+}
+
+// Third-party transport layers can wrap an I/O cause in ErrorKind::Other.
+// Inspect only bounded cause metadata; never copy diagnostic payloads.
+fn io_failure_kind(error: &io::Error) -> io::ErrorKind {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
+    for _ in 0..32 {
+        if let Some(error) = cause.downcast_ref::<io::Error>() {
+            if error.kind() != io::ErrorKind::Other {
+                return error.kind();
+            }
+            match error.get_ref() {
+                Some(inner) => cause = inner,
+                None => break,
+            }
+        } else if let Some(error) = cause.downcast_ref::<gix_error::Error>() {
+            match error.downcast_any_ref::<io::Error>() {
+                Some(inner) => cause = inner,
+                None => break,
+            }
+        } else {
+            match cause.source() {
+                Some(inner) => cause = inner,
+                None => break,
+            }
+        }
+    }
+    io::ErrorKind::Other
+}
+
+fn map_client_error(error: gix_transport::client::Error, message: &'static str) -> io::Error {
+    use gix_transport::client::Error as ClientError;
+
+    let kind = match error {
+        ClientError::Io(error) => io_failure_kind(&error),
+        ClientError::Http(error) | ClientError::Capabilities { err: error } => error
+            .downcast_any_ref::<io::Error>()
+            .map(io_failure_kind)
+            .unwrap_or(io::ErrorKind::InvalidData),
+        ClientError::AuthenticationUnsupported | ClientError::AuthenticationRefused(_) => {
+            io::ErrorKind::PermissionDenied
+        }
+        _ => io::ErrorKind::InvalidData,
+    };
+    safe_error(kind, message)
 }
 
 fn parse_ref_line(line: &[u8]) -> io::Result<AdvertisedRef> {
@@ -331,6 +378,53 @@ mod parser_tests {
             &[b"symref-target:refs/heads/../bad"]
         ))
         .is_err());
+    }
+
+    #[test]
+    fn client_error_mapping_keeps_io_kind_without_context() {
+        use gix_error::ErrorExt;
+        use gix_transport::client::Error as ClientError;
+        const SECRET: &str = "fixture-secret-url-token";
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::InvalidData,
+        ] {
+            for error in [
+                ClientError::Io(io::Error::new(kind, SECRET)),
+                ClientError::Http(
+                    io::Error::new(kind, SECRET)
+                        .and_raise(gix_error::message(SECRET))
+                        .into_error(),
+                ),
+                ClientError::Capabilities {
+                    err: io::Error::new(kind, SECRET)
+                        .and_raise(gix_error::message(SECRET))
+                        .into_error(),
+                },
+            ] {
+                let mapped = map_client_error(error, "operation failed");
+                assert_eq!(mapped.kind(), kind);
+                assert_eq!(mapped.to_string(), "operation failed");
+                assert!(!format!("{mapped:?}").contains(SECRET));
+            }
+        }
+        assert_eq!(
+            map_client_error(
+                ClientError::UnsupportedProtocolVersion(SECRET.into()),
+                "operation failed"
+            )
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            map_client_error(
+                ClientError::AuthenticationRefused(SECRET),
+                "operation failed"
+            )
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
