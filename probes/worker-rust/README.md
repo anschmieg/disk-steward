@@ -156,3 +156,10 @@ Block counts follow [Rust's Unix metadata contract](https://doc.rust-lang.org/st
 They can differ from file length for sparse or compressed files. Shared extents,
 delayed allocation and filesystem-specific reclamation still need separate
 validation; a sampled high-water charge is not a disk-space reservation.
+
+The indexed-worker fixture also records a fixed 128 KiB admission reservation
+before starting its child, then verifies that the exact value survives worker
+stop and registry reopen. Reopen must refuse further reservation growth until
+reconciliation. This is an admission-bookkeeping exercise, not a measurement of
+the fixture's footprint or proof of global aggregate enforcement. The probe
+retains its per-store private control layout and grants no cleanup authority.

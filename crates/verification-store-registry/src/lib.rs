@@ -24,11 +24,26 @@ use std::{
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const APP_ID: i64 = 0x4453_5652; // DSVR
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_STORE_RESERVATION: u64 = 2 * 1024 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_TOTAL_RESERVATION: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_RECORDS: i64 = 4096;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_PAGE: usize = 256;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const V1_TABLE_SCHEMA: &str = "CREATE TABLE verification_stores (
+    store_id TEXT PRIMARY KEY NOT NULL CHECK (length(CAST(store_id AS BLOB)) = 32 AND instr(store_id,char(0)) = 0 AND store_id NOT GLOB '*[^0-9a-f]*'),
+    parent_dev TEXT NOT NULL CHECK (length(CAST(parent_dev AS BLOB)) BETWEEN 1 AND 20 AND parent_dev NOT GLOB '*[^0-9]*'),
+    parent_ino TEXT NOT NULL CHECK (length(CAST(parent_ino AS BLOB)) BETWEEN 1 AND 20 AND parent_ino NOT GLOB '*[^0-9]*'),
+    root_dev TEXT NOT NULL CHECK (length(CAST(root_dev AS BLOB)) BETWEEN 1 AND 20 AND root_dev NOT GLOB '*[^0-9]*'),
+    root_ino TEXT NOT NULL CHECK (length(CAST(root_ino AS BLOB)) BETWEEN 1 AND 20 AND root_ino NOT GLOB '*[^0-9]*'),
+    state TEXT NOT NULL CHECK (state IN ('registered','active','stopped','cleanup_pending','cleanup_complete','needs_reconciliation')),
+    prior_state TEXT CHECK (prior_state IS NULL OR prior_state IN ('registered','active','stopped','cleanup_pending')),
+    CHECK ((state = 'needs_reconciliation' AND prior_state IS NOT NULL AND prior_state IN ('registered','active','stopped','cleanup_pending')) OR (state != 'needs_reconciliation' AND prior_state IS NULL))
+)";
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const TABLE_SCHEMA: &str = "CREATE TABLE verification_stores (
     store_id TEXT PRIMARY KEY NOT NULL CHECK (length(CAST(store_id AS BLOB)) = 32 AND instr(store_id,char(0)) = 0 AND store_id NOT GLOB '*[^0-9a-f]*'),
@@ -38,6 +53,7 @@ const TABLE_SCHEMA: &str = "CREATE TABLE verification_stores (
     root_ino TEXT NOT NULL CHECK (length(CAST(root_ino AS BLOB)) BETWEEN 1 AND 20 AND root_ino NOT GLOB '*[^0-9]*'),
     state TEXT NOT NULL CHECK (state IN ('registered','active','stopped','cleanup_pending','cleanup_complete','needs_reconciliation')),
     prior_state TEXT CHECK (prior_state IS NULL OR prior_state IN ('registered','active','stopped','cleanup_pending')),
+    reserved_bytes TEXT NOT NULL DEFAULT '0' CHECK (length(CAST(reserved_bytes AS BLOB)) BETWEEN 1 AND 20 AND reserved_bytes NOT GLOB '*[^0-9]*'),
     CHECK ((state = 'needs_reconciliation' AND prior_state IS NOT NULL AND prior_state IN ('registered','active','stopped','cleanup_pending')) OR (state != 'needs_reconciliation' AND prior_state IS NULL))
 )";
 
@@ -93,6 +109,8 @@ pub struct StoreRecord {
     pub root_ino: u64,
     pub state: StoreState,
     pub prior_state: Option<StoreState>,
+    /// `u64::MAX` marks a migrated v1 row whose prior usage is unknown.
+    pub reserved_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -102,6 +120,8 @@ pub enum RegistryError {
     UnsupportedPlatform,
     UnsupportedSchema,
     Capacity,
+    ReservationLimit,
+    ReconciliationRequired,
     Duplicate,
     NotFound,
     StaleState,
@@ -117,6 +137,8 @@ impl std::fmt::Display for RegistryError {
             Self::UnsupportedPlatform => "registry platform is unsupported",
             Self::UnsupportedSchema => "registry schema is unknown or unsupported",
             Self::Capacity => "registry capacity reached",
+            Self::ReservationLimit => "reservation budget exceeded",
+            Self::ReconciliationRequired => "a store needs reconciliation",
             Self::Duplicate => "store ID already exists",
             Self::NotFound => "store does not exist",
             Self::StaleState => "store state changed",
@@ -282,7 +304,85 @@ impl VerificationStoreRegistry {
             root_ino,
             state: StoreState::Registered,
             prior_state: None,
+            reserved_bytes: 0,
         })
+    }
+
+    /// Store a monotonic admission reservation as metadata, not an allocation claim.
+    pub fn reserve(
+        &mut self,
+        id: &str,
+        expected_current: u64,
+        new_total: u64,
+    ) -> Result<StoreRecord, RegistryError> {
+        self.validate_lease()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RegistryError::Storage)?;
+        validate_schema(&tx)?;
+        validate_records(&tx)?;
+        validate_id(id)?;
+        if new_total < expected_current {
+            return Err(RegistryError::InvalidInput);
+        }
+        if new_total > MAX_STORE_RESERVATION {
+            return Err(RegistryError::ReservationLimit);
+        }
+        let blocked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM verification_stores WHERE state='needs_reconciliation' OR reserved_bytes=?1)", [u64::MAX.to_string()], |r| r.get(0)).map_err(|_| RegistryError::Storage)?;
+        if blocked {
+            return Err(RegistryError::ReconciliationRequired);
+        }
+        let found: Option<(String, String)> = tx
+            .query_row(
+                "SELECT reserved_bytes,state FROM verification_stores WHERE store_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| RegistryError::Storage)?;
+        let (current_s, state) = found.ok_or(RegistryError::NotFound)?;
+        let current = current_s
+            .parse::<u64>()
+            .map_err(|_| RegistryError::UnsupportedSchema)?;
+        if current != expected_current {
+            return Err(RegistryError::StaleState);
+        }
+        if !matches!(state.as_str(), "registered" | "active") {
+            return Err(RegistryError::InvalidTransition);
+        }
+        let mut total = 0u64;
+        let mut stmt = tx
+            .prepare("SELECT reserved_bytes FROM verification_stores")
+            .map_err(|_| RegistryError::Storage)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|_| RegistryError::Storage)?;
+        for row in rows {
+            total = total
+                .checked_add(
+                    row.map_err(|_| RegistryError::Storage)?
+                        .parse::<u64>()
+                        .map_err(|_| RegistryError::UnsupportedSchema)?,
+                )
+                .ok_or(RegistryError::ReservationLimit)?;
+        }
+        drop(stmt);
+        let after = total
+            .checked_sub(current)
+            .and_then(|v| v.checked_add(new_total))
+            .ok_or(RegistryError::ReservationLimit)?;
+        if after > MAX_TOTAL_RESERVATION {
+            return Err(RegistryError::ReservationLimit);
+        }
+        tx.execute(
+            "UPDATE verification_stores SET reserved_bytes=?2 WHERE store_id=?1",
+            params![id, new_total.to_string()],
+        )
+        .map_err(|_| RegistryError::Storage)?;
+        let record=tx.query_row("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes FROM verification_stores WHERE store_id=?1",[id],read_record).map_err(|_|RegistryError::Storage)?;
+        tx.commit().map_err(|_| RegistryError::Storage)?;
+        Ok(record)
     }
 
     /// Compare-and-transition bookkeeping state; this grants no operational permission.
@@ -318,7 +418,7 @@ impl VerificationStoreRegistry {
                 RegistryError::NotFound
             });
         }
-        let record = tx.query_row("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state FROM verification_stores WHERE store_id=?1", [id], read_record).map_err(|_| RegistryError::Storage)?;
+        let record = tx.query_row("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes FROM verification_stores WHERE store_id=?1", [id], read_record).map_err(|_| RegistryError::Storage)?;
         tx.commit().map_err(|_| RegistryError::Storage)?;
         Ok(record)
     }
@@ -332,7 +432,7 @@ impl VerificationStoreRegistry {
         validate_schema(&tx)?;
         validate_records(&tx)?;
         validate_id(id)?;
-        let record = tx.query_row("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state FROM verification_stores WHERE store_id=?1", [id], read_record).optional().map_err(|_| RegistryError::Storage)?;
+        let record = tx.query_row("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes FROM verification_stores WHERE store_id=?1", [id], read_record).optional().map_err(|_| RegistryError::Storage)?;
         tx.commit().map_err(|_| RegistryError::Storage)?;
         Ok(record)
     }
@@ -356,7 +456,7 @@ impl VerificationStoreRegistry {
         if let Some(id) = after {
             validate_id(id)?;
         }
-        let mut statement = tx.prepare("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state FROM verification_stores WHERE (?1 IS NULL OR store_id>?1) ORDER BY store_id LIMIT ?2").map_err(|_| RegistryError::Storage)?;
+        let mut statement = tx.prepare("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes FROM verification_stores WHERE (?1 IS NULL OR store_id>?1) ORDER BY store_id LIMIT ?2").map_err(|_| RegistryError::Storage)?;
         let rows = statement
             .query_map(params![after, limit as i64], read_record)
             .map_err(|_| RegistryError::Storage)?;
@@ -420,6 +520,10 @@ fn read_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoreRecord> {
         prior_state: prior_s
             .map(|s| StoreState::parse(&s).ok_or(rusqlite::Error::InvalidQuery))
             .transpose()?,
+        reserved_bytes: r
+            .get::<_, String>(7)?
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
     })
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -464,6 +568,15 @@ fn initialize_and_classify(c: &mut Connection) -> Result<(), RegistryError> {
         ))
         .map_err(|_| RegistryError::Storage)?;
     }
+    if app == APP_ID && version == 1 {
+        validate_schema_version(&tx, 1)?;
+        validate_records_v1(&tx)?;
+        tx.execute_batch("ALTER TABLE verification_stores RENAME TO verification_stores_v1;")
+            .map_err(|_| RegistryError::Storage)?;
+        tx.execute_batch(TABLE_SCHEMA)
+            .map_err(|_| RegistryError::Storage)?;
+        tx.execute_batch("INSERT INTO verification_stores(store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes) SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,'18446744073709551615' FROM verification_stores_v1; DROP TABLE verification_stores_v1; PRAGMA user_version=2;").map_err(|_| RegistryError::Storage)?;
+    }
     validate_schema(&tx)?;
     validate_records(&tx)?;
     tx.execute("UPDATE verification_stores SET prior_state = CASE WHEN state = 'needs_reconciliation' THEN prior_state ELSE state END, state = 'needs_reconciliation' WHERE state != 'cleanup_complete'", []).map_err(|_| RegistryError::Storage)?;
@@ -472,27 +585,38 @@ fn initialize_and_classify(c: &mut Connection) -> Result<(), RegistryError> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_schema(c: &Connection) -> Result<(), RegistryError> {
+    validate_schema_version(c, 2)
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_schema_version(c: &Connection, version_expected: i64) -> Result<(), RegistryError> {
     let app: i64 = c
         .query_row("PRAGMA application_id", [], |r| r.get(0))
         .map_err(|_| RegistryError::Storage)?;
     let version: i64 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|_| RegistryError::Storage)?;
-    if app != APP_ID || version != SCHEMA_VERSION {
+    if app != APP_ID || version != version_expected {
         return Err(RegistryError::UnsupportedSchema);
     }
     let mut statement = c
         .prepare("SELECT CASE WHEN length(CAST(type AS BLOB))<=16 THEN type ELSE '' END,CASE WHEN length(CAST(name AS BLOB))<=128 THEN name ELSE '' END,CASE WHEN length(CAST(tbl_name AS BLOB))<=128 THEN tbl_name ELSE '' END,CASE WHEN sql IS NULL THEN NULL WHEN length(CAST(sql AS BLOB))=?1 THEN sql ELSE '' END FROM sqlite_master LIMIT 3")
         .map_err(|_| RegistryError::Storage)?;
     let objects = statement
-        .query_map([TABLE_SCHEMA.len() as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })
+        .query_map(
+            [if version_expected == 1 {
+                V1_TABLE_SCHEMA.len() as i64
+            } else {
+                TABLE_SCHEMA.len() as i64
+            }],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
         .map_err(|_| RegistryError::Storage)?;
     let objects = objects
         .collect::<Result<Vec<_>, _>>()
@@ -500,11 +624,16 @@ fn validate_schema(c: &Connection) -> Result<(), RegistryError> {
     if objects.len() != 2 {
         return Err(RegistryError::UnsupportedSchema);
     }
+    let expected_table_schema = if version_expected == 1 {
+        V1_TABLE_SCHEMA
+    } else {
+        TABLE_SCHEMA
+    };
     let table_ok = objects.iter().any(|o| {
         o.0 == "table"
             && o.1 == "verification_stores"
             && o.2 == "verification_stores"
-            && o.3.as_deref() == Some(TABLE_SCHEMA)
+            && o.3.as_deref() == Some(expected_table_schema)
     });
     let index_ok = objects.iter().any(|o| {
         o.0 == "index"
@@ -541,9 +670,35 @@ fn validate_records(c: &Connection) -> Result<(), RegistryError> {
           typeof(state)!='text' OR length(CAST(state AS BLOB)) NOT BETWEEN 1 AND 32 OR state NOT IN ('registered','active','stopped','cleanup_pending','cleanup_complete','needs_reconciliation') OR
           (prior_state IS NOT NULL AND (typeof(prior_state)!='text' OR length(CAST(prior_state AS BLOB)) NOT BETWEEN 1 AND 32 OR prior_state NOT IN ('registered','active','stopped','cleanup_pending'))) OR
           (state='needs_reconciliation' AND (prior_state IS NULL OR prior_state='cleanup_complete')) OR
-          (state!='needs_reconciliation' AND prior_state IS NOT NULL))",
+          (state!='needs_reconciliation' AND prior_state IS NOT NULL) OR
+          typeof(reserved_bytes)!='text' OR length(CAST(reserved_bytes AS BLOB)) NOT BETWEEN 1 AND 20 OR reserved_bytes GLOB '*[^0-9]*' OR (length(reserved_bytes)>1 AND substr(reserved_bytes,1,1)='0'))",
         [], |r| r.get(0)).map_err(|_| RegistryError::Storage)?;
     if malformed {
+        return Err(RegistryError::UnsupportedSchema);
+    }
+    let mut total = 0u64;
+    let mut stmt = c
+        .prepare("SELECT reserved_bytes FROM verification_stores")
+        .map_err(|_| RegistryError::Storage)?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|_| RegistryError::Storage)?;
+    for row in rows {
+        let n = row
+            .map_err(|_| RegistryError::Storage)?
+            .parse::<u64>()
+            .map_err(|_| RegistryError::UnsupportedSchema)?;
+        if n == u64::MAX {
+            continue;
+        }
+        if n > MAX_STORE_RESERVATION {
+            return Err(RegistryError::UnsupportedSchema);
+        }
+        total = total
+            .checked_add(n)
+            .ok_or(RegistryError::UnsupportedSchema)?;
+    }
+    if total > MAX_TOTAL_RESERVATION {
         return Err(RegistryError::UnsupportedSchema);
     }
     let mut stmt = c
@@ -562,6 +717,52 @@ fn validate_records(c: &Connection) -> Result<(), RegistryError> {
     for row in rows {
         let (a, b, d, e) = row.map_err(|_| RegistryError::Storage)?;
         if [a, b, d, e].iter().any(|s| s.parse::<u64>().is_err()) {
+            return Err(RegistryError::UnsupportedSchema);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_records_v1(c: &Connection) -> Result<(), RegistryError> {
+    validate_records_v1_inner(c)
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_records_v1_inner(c: &Connection) -> Result<(), RegistryError> {
+    // The legacy validator is the same bounded identity/lifecycle scan without the new column.
+    let count: i64 = c
+        .query_row(
+            "SELECT count(*) FROM (SELECT 1 FROM verification_stores LIMIT 4097)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| RegistryError::Storage)?;
+    if count > MAX_RECORDS {
+        return Err(RegistryError::UnsupportedSchema);
+    }
+    let malformed:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM verification_stores WHERE typeof(store_id)!='text' OR length(CAST(store_id AS BLOB))!=32 OR instr(store_id,char(0))!=0 OR store_id GLOB '*[^0-9a-f]*' OR typeof(parent_dev)!='text' OR length(CAST(parent_dev AS BLOB)) NOT BETWEEN 1 AND 20 OR parent_dev GLOB '*[^0-9]*' OR (length(parent_dev)>1 AND substr(parent_dev,1,1)='0') OR typeof(parent_ino)!='text' OR length(CAST(parent_ino AS BLOB)) NOT BETWEEN 1 AND 20 OR parent_ino GLOB '*[^0-9]*' OR (length(parent_ino)>1 AND substr(parent_ino,1,1)='0') OR typeof(root_dev)!='text' OR length(CAST(root_dev AS BLOB)) NOT BETWEEN 1 AND 20 OR root_dev GLOB '*[^0-9]*' OR (length(root_dev)>1 AND substr(root_dev,1,1)='0') OR typeof(root_ino)!='text' OR length(CAST(root_ino AS BLOB)) NOT BETWEEN 1 AND 20 OR root_ino GLOB '*[^0-9]*' OR (length(root_ino)>1 AND substr(root_ino,1,1)='0') OR typeof(state)!='text' OR state NOT IN ('registered','active','stopped','cleanup_pending','cleanup_complete','needs_reconciliation') OR (prior_state IS NOT NULL AND prior_state NOT IN ('registered','active','stopped','cleanup_pending')) OR (state='needs_reconciliation' AND (prior_state IS NULL OR prior_state='cleanup_complete')) OR (state!='needs_reconciliation' AND prior_state IS NOT NULL))",[],|r|r.get(0)).map_err(|_|RegistryError::Storage)?;
+    if malformed {
+        return Err(RegistryError::UnsupportedSchema);
+    }
+    let mut stmt = c
+        .prepare("SELECT parent_dev,parent_ino,root_dev,root_ino FROM verification_stores")
+        .map_err(|_| RegistryError::Storage)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|_| RegistryError::Storage)?;
+    for row in rows {
+        let vals = row.map_err(|_| RegistryError::Storage)?;
+        if [vals.0, vals.1, vals.2, vals.3]
+            .iter()
+            .any(|x| x.parse::<u64>().is_err())
+        {
             return Err(RegistryError::UnsupportedSchema);
         }
     }
@@ -645,6 +846,9 @@ fn validate_database(p: &Path) -> Result<(), RegistryError> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl VerificationStoreRegistry {
     pub fn open(_: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        Err(RegistryError::UnsupportedPlatform)
+    }
+    pub fn reserve(&mut self, _: &str, _: u64, _: u64) -> Result<StoreRecord, RegistryError> {
         Err(RegistryError::UnsupportedPlatform)
     }
     pub fn register(
@@ -755,6 +959,210 @@ mod tests {
             registry.transition(id, StoreState::NeedsReconciliation, StoreState::Active),
             Err(RegistryError::InvalidTransition)
         ));
+    }
+
+    #[test]
+    fn reservations_are_monotonic_bounded_and_survive_reopen() {
+        let (_dir, path) = setup();
+        let id = "cccccccccccccccccccccccccccccccc";
+        let mut r = VerificationStoreRegistry::open(&path).unwrap();
+        r.register(id, 1, 2, 3, 4).unwrap();
+        assert_eq!(r.reserve(id, 0, 1024).unwrap().reserved_bytes, 1024);
+        assert_eq!(r.reserve(id, 1024, 1024).unwrap().reserved_bytes, 1024);
+        assert!(matches!(
+            r.reserve(id, 0, 1024),
+            Err(RegistryError::StaleState)
+        ));
+        assert!(matches!(
+            r.reserve(id, 1024, 0),
+            Err(RegistryError::InvalidInput)
+        ));
+        assert!(matches!(
+            r.reserve(id, 1024, MAX_STORE_RESERVATION + 1),
+            Err(RegistryError::ReservationLimit)
+        ));
+        assert_eq!(r.get(id).unwrap().unwrap().reserved_bytes, 1024);
+        drop(r);
+        let mut r = VerificationStoreRegistry::open(&path).unwrap();
+        assert_eq!(r.get(id).unwrap().unwrap().reserved_bytes, 1024);
+        assert!(matches!(
+            r.reserve(id, 1024, 2048),
+            Err(RegistryError::ReconciliationRequired)
+        ));
+    }
+
+    #[test]
+    fn aggregate_reservation_budget_includes_cleanup_complete_rows() {
+        let (_dir, path) = setup();
+        let a = "dddddddddddddddddddddddddddddddd";
+        let b = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let c = "abababababababababababababababab";
+        let mut r = VerificationStoreRegistry::open(&path).unwrap();
+        for id in [a, b, c] {
+            r.register(id, 1, 2, 3, 4).unwrap();
+        }
+        r.reserve(a, 0, MAX_STORE_RESERVATION).unwrap();
+        for (old, new) in [
+            (StoreState::Registered, StoreState::Active),
+            (StoreState::Active, StoreState::Stopped),
+            (StoreState::Stopped, StoreState::CleanupPending),
+            (StoreState::CleanupPending, StoreState::CleanupComplete),
+        ] {
+            r.transition(a, old, new).unwrap();
+        }
+        r.reserve(b, 0, MAX_STORE_RESERVATION).unwrap();
+        assert!(matches!(
+            r.reserve(c, 0, 1),
+            Err(RegistryError::ReservationLimit)
+        ));
+        assert_eq!(r.get(c).unwrap().unwrap().reserved_bytes, 0);
+        assert_eq!(
+            r.get(a).unwrap().unwrap().reserved_bytes,
+            MAX_STORE_RESERVATION
+        );
+    }
+
+    #[test]
+    fn v1_migration_preserves_lifecycle_and_marks_unknown_usage() {
+        let (_dir, path) = setup();
+        let id = "ffffffffffffffffffffffffffffffff";
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(V1_TABLE_SCHEMA).unwrap();
+            c.execute("INSERT INTO verification_stores VALUES(?1,'1','2','3','4','cleanup_complete',NULL)",[id]).unwrap();
+            c.pragma_update(None, "application_id", APP_ID).unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut r = VerificationStoreRegistry::open(&path).unwrap();
+        let rec = r.get(id).unwrap().unwrap();
+        assert_eq!(rec.state, StoreState::CleanupComplete);
+        assert_eq!(rec.prior_state, None);
+        assert_eq!(rec.root_ino, 4);
+        assert_eq!(rec.reserved_bytes, u64::MAX);
+        let fresh = "abababababababababababababababab";
+        r.register(fresh, 1, 2, 3, 4).unwrap();
+        assert!(matches!(
+            r.reserve(fresh, 0, 1),
+            Err(RegistryError::ReconciliationRequired)
+        ));
+        assert!(matches!(
+            r.reserve(id, 0, 1),
+            Err(RegistryError::ReconciliationRequired)
+        ));
+    }
+
+    #[test]
+    fn malformed_reservations_refuse_before_mutation() {
+        let (_dir, path) = setup();
+        let mut r = VerificationStoreRegistry::open(&path).unwrap();
+        let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        r.register(id, 1, 2, 3, 4).unwrap();
+        r.connection
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        for invalid in ["00", "-1", "18446744073709551616", "2147483649"] {
+            r.connection
+                .execute(
+                    "UPDATE verification_stores SET reserved_bytes=?1",
+                    [invalid],
+                )
+                .unwrap();
+            assert!(matches!(
+                r.reserve(id, 0, 1),
+                Err(RegistryError::UnsupportedSchema)
+            ));
+            let unchanged: String = r
+                .connection
+                .query_row(
+                    "SELECT reserved_bytes FROM verification_stores",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unchanged, invalid);
+        }
+    }
+
+    #[test]
+    fn full_v1_registry_migrates_without_losing_identities_or_prior_state() {
+        let (_dir, path) = setup();
+        {
+            let mut c = Connection::open(&path).unwrap();
+            c.execute_batch(V1_TABLE_SCHEMA).unwrap();
+            c.pragma_update(None, "application_id", APP_ID).unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+            let tx = c.transaction().unwrap();
+            for index in 0..MAX_RECORDS {
+                tx.execute(
+                    "INSERT INTO verification_stores VALUES(?1,?2,'2','3',?3,'active',NULL)",
+                    params![
+                        format!("{index:032x}"),
+                        u64::MAX.to_string(),
+                        index.to_string()
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let r = VerificationStoreRegistry::open(&path).unwrap();
+        for index in [0, MAX_RECORDS - 1] {
+            let row = r.get(&format!("{index:032x}")).unwrap().unwrap();
+            assert_eq!(row.parent_dev, u64::MAX);
+            assert_eq!(row.root_ino, index as u64);
+            assert_eq!(row.state, StoreState::NeedsReconciliation);
+            assert_eq!(row.prior_state, Some(StoreState::Active));
+            assert_eq!(row.reserved_bytes, u64::MAX);
+        }
+        assert_eq!(
+            r.connection
+                .query_row("SELECT count(*) FROM verification_stores", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            MAX_RECORDS
+        );
+    }
+
+    #[test]
+    fn malformed_v1_is_refused_without_migration_or_repair() {
+        let (_dir, path) = setup();
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(V1_TABLE_SCHEMA).unwrap();
+            c.pragma_update(None, "application_id", APP_ID).unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+            c.execute_batch("PRAGMA ignore_check_constraints=ON; INSERT INTO verification_stores VALUES('bad','1','2','3','4','active',NULL);").unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            VerificationStoreRegistry::open(&path),
+            Err(RegistryError::UnsupportedSchema)
+        ));
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(
+            c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT sql FROM sqlite_master WHERE name='verification_stores'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            V1_TABLE_SCHEMA
+        );
+        assert_eq!(
+            c.query_row("SELECT store_id FROM verification_stores", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "bad"
+        );
     }
 
     #[test]
@@ -1024,7 +1432,7 @@ mod tests {
         let tx = registry.connection.transaction().unwrap();
         for index in 0..MAX_RECORDS {
             tx.execute(
-                "INSERT INTO verification_stores VALUES(?1,'1','2','3','4','registered',NULL)",
+                "INSERT INTO verification_stores VALUES(?1,'1','2','3','4','registered',NULL,'0')",
                 [format!("{index:032x}")],
             )
             .unwrap();

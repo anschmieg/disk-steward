@@ -181,6 +181,14 @@ fn run_indexed_store_worker() -> Result<(), String> {
     registry
         .register(FIXTURE_ID, parent.0, parent.1, root.0, root.1)
         .map_err(|e| format!("register store: {e}"))?;
+    // Closed admission-bookkeeping exercise, not a measured store footprint.
+    const RESERVATION: u64 = 128 * 1024;
+    let reserved = registry
+        .reserve(FIXTURE_ID, 0, RESERVATION)
+        .map_err(|e| format!("reserve indexed fixture: {e}"))?;
+    if reserved.reserved_bytes != RESERVATION {
+        return Err("registry reservation mismatch".into());
+    }
     let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(exe)
         .arg("--child")
@@ -258,7 +266,8 @@ fn run_indexed_store_worker() -> Result<(), String> {
         .get(FIXTURE_ID)
         .map_err(|e| format!("read reopened registry: {e}"))?
         .ok_or("registry row disappeared")?;
-    if record.state != RState::NeedsReconciliation
+    if record.reserved_bytes != RESERVATION
+        || record.state != RState::NeedsReconciliation
         || record.prior_state != Some(RState::Stopped)
         || (
             record.parent_dev,
@@ -269,6 +278,15 @@ fn run_indexed_store_worker() -> Result<(), String> {
     {
         return Err("reopened registry identity/state mismatch".into());
     }
+    match reopened.reserve(FIXTURE_ID, RESERVATION, RESERVATION * 2) {
+        Err(RegistryError::ReconciliationRequired) => {}
+        Err(other) => {
+            return Err(format!(
+                "reservation refusal was not reconciliation: {other}"
+            ))
+        }
+        Ok(_) => return Err("reopened registry unexpectedly admitted reservation".into()),
+    }
     match reopened.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
         Err(RegistryError::InvalidTransition) => {}
         Err(other) => {
@@ -278,7 +296,7 @@ fn run_indexed_store_worker() -> Result<(), String> {
         }
         Ok(_) => return Err("reopened reconciliation row unexpectedly became active".into()),
     }
-    println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+    println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
     Ok(())
 }
 
