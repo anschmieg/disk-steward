@@ -75,6 +75,54 @@ impl HttpFramingSnapshot {
     }
 }
 
+/// Result of explicitly consuming the remaining HTTP response framing.
+/// This is transport metadata only; it does not validate Git payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HttpFinalizationReport {
+    framing: HttpFramingSnapshot,
+    observed_ingress_bytes: u64,
+    drain_error_kind: Option<io::ErrorKind>,
+}
+
+impl HttpFinalizationReport {
+    pub fn framing(&self) -> HttpFramingSnapshot {
+        self.framing
+    }
+    pub fn observed_ingress_bytes(&self) -> u64 {
+        self.observed_ingress_bytes
+    }
+    pub fn drain_error_kind(&self) -> Option<io::ErrorKind> {
+        self.drain_error_kind
+    }
+    /// True only when a response existed, all framing completed, and the
+    /// finalizer observed no cancellation, deadline, decoder, or drain error.
+    pub fn is_complete(&self) -> bool {
+        self.drain_error_kind.is_none() && self.framing.all_responses_completed()
+    }
+}
+
+#[derive(Clone, Default)]
+struct RetainedBodies(Arc<Mutex<RetainedState>>);
+
+#[derive(Default)]
+struct RetainedState {
+    bodies: Vec<Body<NetworkBody>>,
+    exhausted: bool,
+}
+
+impl RetainedBodies {
+    fn retain(&self, body: Body<NetworkBody>) {
+        if let Ok(mut state) = self.0.lock() {
+            if state.bodies.len() < MAX_HTTP_RESPONSES {
+                state.bodies.push(body);
+            } else {
+                state.exhausted = true;
+            }
+        }
+        // On poison or capacity failure, unfinished bodies become Abandoned.
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FramingStatus {
     Pending,
@@ -368,6 +416,8 @@ fn assemble(
     let budget = http.budget.clone();
     let framing = http.framing.clone();
     let cancellation = http.cancellation.clone();
+    let deadline = http.deadline;
+    let retained = http.retained.clone();
     let url = gix_url::parse(repository.base())
         .map_err(|_| safe_error(io::ErrorKind::InvalidInput, "invalid repository URL"))?;
     let mut inner = gix_transport::client::blocking_io::http::Transport::new_http(
@@ -395,6 +445,8 @@ fn assemble(
         budget,
         framing,
         cancellation,
+        deadline,
+        retained,
     })
 }
 
@@ -404,6 +456,8 @@ pub struct GitHubTransport {
     budget: Budget,
     framing: ResponseLedger,
     cancellation: CancellationHandle,
+    deadline: Instant,
+    retained: RetainedBodies,
 }
 
 impl GitHubTransport {
@@ -423,6 +477,59 @@ impl GitHubTransport {
             .lock()
             .map(|used| *used)
             .map_err(|_| safe_error(io::ErrorKind::Other, "transport unavailable"))
+    }
+
+    /// Consume the gix transport and explicitly drain retained HTTP bodies.
+    /// This performs bounded network reads through the existing decoder,
+    /// ingress budget, deadline, and cancellation signal.
+    pub fn finalize_http_framing(self) -> io::Result<HttpFinalizationReport> {
+        let Self {
+            inner,
+            budget,
+            framing,
+            cancellation,
+            deadline,
+            retained,
+        } = self;
+        drop(inner); // release gix readers before taking retained response tails
+        let (mut bodies, queue_exhausted) = {
+            let mut state = retained
+                .0
+                .lock()
+                .map_err(|_| safe_error(io::ErrorKind::Other, "transport unavailable"))?;
+            (std::mem::take(&mut state.bodies), state.exhausted)
+        };
+        let mut drain_error_kind = None;
+        if queue_exhausted {
+            drain_error_kind = Some(io::ErrorKind::InvalidData);
+        } else if let Err(error) = cancellation.check().and_then(|_| check_deadline(deadline)) {
+            drain_error_kind = Some(error.kind());
+        }
+        if drain_error_kind.is_none() {
+            for body in &mut bodies {
+                if let Err(error) = io::copy(body, &mut io::sink()) {
+                    drain_error_kind = Some(error.kind());
+                    break;
+                }
+            }
+        }
+        if drain_error_kind.is_none() {
+            if let Err(error) = cancellation.check().and_then(|_| check_deadline(deadline)) {
+                drain_error_kind = Some(error.kind());
+            }
+        }
+        drop(bodies); // remaining tails become Abandoned, without implicit I/O
+        let snapshot = framing.snapshot()?;
+        let observed_ingress_bytes = budget
+            .used
+            .lock()
+            .map(|used| *used)
+            .map_err(|_| safe_error(io::ErrorKind::Other, "transport unavailable"))?;
+        Ok(HttpFinalizationReport {
+            framing: snapshot,
+            observed_ingress_bytes,
+            drain_error_kind,
+        })
     }
 
     pub fn to_url(&self) -> Cow<'_, BStr> {
@@ -897,6 +1004,7 @@ struct RawHttp {
     deadline: Instant,
     budget: Budget,
     framing: ResponseLedger,
+    retained: RetainedBodies,
     cancellation: CancellationHandle,
     config: Arc<rustls::ClientConfig>,
     #[cfg(test)]
@@ -925,6 +1033,7 @@ impl RawHttp {
                 cancellation: cancellation.clone(),
             },
             framing: ResponseLedger::default(),
+            retained: RetainedBodies::default(),
             cancellation,
             config,
             #[cfg(test)]
@@ -1210,6 +1319,14 @@ struct Headers {
 struct Response {
     body: Option<Body<NetworkBody>>,
     pending: Option<Arc<Mutex<PostState>>>,
+    retained: RetainedBodies,
+}
+impl Drop for Response {
+    fn drop(&mut self) {
+        if let Some(body) = self.body.take() {
+            self.retained.retain(body);
+        }
+    }
 }
 struct PostState {
     receiver: mpsc::Receiver<Option<Vec<u8>>>,
@@ -1219,6 +1336,7 @@ struct PostState {
     body: Option<Body<NetworkBody>>,
     failed: Option<io::ErrorKind>,
     evidence: Option<ResponseGuard>,
+    retained: RetainedBodies,
 }
 impl PostState {
     fn fail_response(&mut self, kind: io::ErrorKind) -> io::Error {
@@ -1287,6 +1405,15 @@ impl PostState {
         self.headers = Some(h);
         self.body = Some(b);
         Ok(())
+    }
+}
+impl Drop for PostState {
+    fn drop(&mut self) {
+        if let Some(body) = self.body.take() {
+            self.retained.retain(body);
+        } else if let Some(mut evidence) = self.evidence.take() {
+            let _ = evidence.fail();
+        }
     }
 }
 impl BufRead for Headers {
@@ -1389,6 +1516,7 @@ impl Http for RawHttp {
                 body: Response {
                     body: Some(b),
                     pending: None,
+                    retained: self.retained.clone(),
                 },
             })
         })();
@@ -1419,6 +1547,7 @@ impl Http for RawHttp {
                     deadline: self.deadline,
                     budget: self.budget.clone(),
                     framing: self.framing.clone(),
+                    retained: self.retained.clone(),
                     cancellation: self.cancellation.clone(),
                     config: Arc::clone(&self.config),
                     #[cfg(test)]
@@ -1429,6 +1558,7 @@ impl Http for RawHttp {
                 headers: None,
                 body: None,
                 failed: None,
+                retained: self.retained.clone(),
             }));
             Ok(PostResponse {
                 post_body: LazyPost {
@@ -1444,6 +1574,7 @@ impl Http for RawHttp {
                 body: Response {
                     body: None,
                     pending: Some(state),
+                    retained: self.retained.clone(),
                 },
             })
         })();
@@ -2791,6 +2922,9 @@ mod tests {
         assert!(server_result.is_ok(), "chunked TLS fixture server failed");
         // This gix reader preserves the sideband channel byte.
         assert_eq!(operation.unwrap(), b"\x01PACK");
+        let report = transport.finalize_http_framing().unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.framing().completed(), 2);
     }
 
     #[test]
@@ -2870,6 +3004,221 @@ mod tests {
         let after_drop = ledger.snapshot().unwrap();
         assert_eq!(after_drop.abandoned(), 1);
         assert!(!after_drop.all_responses_completed());
+    }
+
+    #[test]
+    fn explicit_finalization_drains_chunk_terminator_after_git_flush() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let config = Arc::clone(&tls.server);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, config).unwrap();
+            let (method, _, _, _) = read_request(&mut stream).unwrap();
+            assert_eq!(method, "GET");
+            let payload = b"000eversion 2\n000cagent=x\n0000";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", payload.len()).unwrap();
+            stream.write_all(payload).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            stream.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            stream
+                .write_all(b"0\r\nX-fixture: complete\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+        let mut transport =
+            transport_at(address, Arc::clone(&tls.trusted), AttemptLimits::default());
+        assert!(transport.handshake(Service::UploadPack, &[]).is_ok());
+        let before = transport.observed_ingress_bytes().unwrap();
+        release_tx.send(()).unwrap();
+        let report = transport.finalize_http_framing().unwrap();
+        assert!(server.join().is_ok());
+        assert_eq!(report.drain_error_kind(), None);
+        assert!(report.is_complete());
+        assert_eq!(report.framing().completed(), 1);
+        assert_eq!(report.framing().pending(), 0);
+        assert!(report.observed_ingress_bytes() > before);
+    }
+
+    #[test]
+    fn canceled_finalization_reports_incomplete_framing() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let config = Arc::clone(&tls.server);
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, config).unwrap();
+            let (method, _, _, _) = read_request(&mut stream).unwrap();
+            assert_eq!(method, "GET");
+            let payload = b"000eversion 2\n000cagent=x\n0000";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", payload.len()).unwrap();
+            stream.write_all(payload).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            stream.flush().unwrap();
+        });
+        let mut transport =
+            transport_at(address, Arc::clone(&tls.trusted), AttemptLimits::default());
+        assert!(transport.handshake(Service::UploadPack, &[]).is_ok());
+        let cancellation = transport.cancellation_handle();
+        cancellation.cancel();
+        let report = transport.finalize_http_framing().unwrap();
+        assert!(server.join().is_ok());
+        assert_eq!(
+            report.drain_error_kind(),
+            Some(io::ErrorKind::ConnectionAborted)
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.framing().pending(), 0);
+        assert_eq!(report.framing().abandoned(), 1);
+    }
+
+    fn transport_with_finalization_tail(
+        tail: &'static [u8],
+    ) -> (GitHubTransport, thread::JoinHandle<()>) {
+        transport_with_finalization_tail_and_limits(tail.to_vec(), AttemptLimits::default())
+    }
+
+    fn transport_with_finalization_tail_and_limits(
+        tail: Vec<u8>,
+        limits: AttemptLimits,
+    ) -> (GitHubTransport, thread::JoinHandle<()>) {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let server = thread::spawn(move || {
+            let socket = accept_until(&listener).unwrap();
+            let mut stream = tls_stream(socket, tls.server).unwrap();
+            read_request(&mut stream).unwrap();
+            let payload = b"000eversion 2\n000cagent=x\n0000";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", payload.len()).unwrap();
+            stream.write_all(payload).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            // A budget-limited client may close before the entire tail is sent.
+            let _ = stream.write_all(&tail).and_then(|_| stream.flush());
+        });
+        let mut transport = transport_at(address, tls.trusted, limits);
+        assert!(transport.handshake(Service::UploadPack, &[]).is_ok());
+        (transport, server)
+    }
+
+    #[test]
+    fn finalization_rejects_missing_terminator_and_forbidden_trailer() {
+        for tail in [
+            b"".as_slice(),
+            b"0\r\nAuthorization: fixture\r\n\r\n".as_slice(),
+        ] {
+            let (transport, server) = transport_with_finalization_tail(tail);
+            let before = transport.observed_ingress_bytes().unwrap();
+            let report = transport.finalize_http_framing().unwrap();
+            server.join().unwrap();
+            assert!(!report.is_complete());
+            assert!(report.drain_error_kind().is_some());
+            assert_eq!(report.framing().failed(), 1);
+            assert_eq!(report.framing().pending(), 0);
+            assert!(report.observed_ingress_bytes() >= before);
+        }
+    }
+
+    #[test]
+    fn finalization_remains_inside_raw_ingress_cap() {
+        let mut tail = b"0\r\nX-fixture: ".to_vec();
+        tail.extend(std::iter::repeat_n(b'a', 6000));
+        tail.extend_from_slice(b"\r\n\r\n");
+        let limits = AttemptLimits::new(4096, Duration::from_secs(5)).unwrap();
+        let (transport, server) = transport_with_finalization_tail_and_limits(tail, limits);
+        let report = transport.finalize_http_framing().unwrap();
+        server.join().unwrap();
+        assert!(!report.is_complete());
+        assert_eq!(report.observed_ingress_bytes(), 4096);
+        assert_eq!(report.drain_error_kind(), Some(io::ErrorKind::InvalidData));
+        assert_eq!(report.framing().failed(), 1);
+    }
+
+    #[test]
+    fn expired_finalizer_abandons_pending_tail() {
+        let (mut transport, server) = transport_with_finalization_tail(b"0\r\n\r\n");
+        transport.deadline = Instant::now();
+        let report = transport.finalize_http_framing().unwrap();
+        server.join().unwrap();
+        assert_eq!(report.drain_error_kind(), Some(io::ErrorKind::TimedOut));
+        assert!(!report.is_complete());
+        assert_eq!(report.framing().abandoned(), 1);
+    }
+
+    fn unconnected_finalizer_fixture() -> GitHubTransport {
+        connect(
+            RepositoryUrl::parse("https://github.com/a/b").unwrap(),
+            AttemptLimits::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn finalizer_zero_attempts_and_exhaustion_cannot_succeed() {
+        let report = unconnected_finalizer_fixture()
+            .finalize_http_framing()
+            .unwrap();
+        assert!(!report.is_complete());
+        assert_eq!(report.observed_ingress_bytes(), 0);
+        let transport = unconnected_finalizer_fixture();
+        transport.framing.reserve().unwrap().complete().unwrap();
+        transport.retained.0.lock().unwrap().exhausted = true;
+        let report = transport.finalize_http_framing().unwrap();
+        assert!(report.framing().all_responses_completed());
+        assert_eq!(report.drain_error_kind(), Some(io::ErrorKind::InvalidData));
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn poisoned_finalizer_queue_returns_error() {
+        let transport = unconnected_finalizer_fixture();
+        let retained = transport.retained.clone();
+        assert!(thread::spawn(move || {
+            let _guard = retained.0.lock().unwrap();
+            panic!("poison private queue fixture");
+        })
+        .join()
+        .is_err());
+        assert!(transport.finalize_http_framing().is_err());
+    }
+
+    #[test]
+    fn finalization_does_not_send_uninitialized_post() {
+        let tls = fixture_tls();
+        let (listener, address) = listener();
+        let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+        let mut http = RawHttp::for_test(
+            repository.clone(),
+            AttemptLimits::default(),
+            tls.trusted,
+            address,
+            "localhost",
+        )
+        .unwrap();
+        let response = http
+            .post(
+                &format!("{}/git-upload-pack", repository.base()),
+                repository.base(),
+                [
+                    "Content-Type: application/x-git-upload-pack-request",
+                    "Accept: application/x-git-upload-pack-result",
+                ],
+                PostBodyDataKind::BoundedAndFitsIntoMemory,
+            )
+            .unwrap();
+        drop(response);
+        let report = assemble(repository, http, None)
+            .unwrap()
+            .finalize_http_framing()
+            .unwrap();
+        assert!(!report.is_complete());
+        assert_eq!(report.framing().failed(), 1);
+        assert_eq!(report.observed_ingress_bytes(), 0);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]

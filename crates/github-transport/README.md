@@ -80,11 +80,34 @@ counts: pending, completed, failed, and abandoned. At most 64 responses are
 tracked per transport; an over-limit attempt fails before connecting and
 permanently makes `all_responses_completed()` false. Completion means the
 adapter observed the HTTP framing terminator while reading the response body.
-A gix packet flush alone does not complete that framing. Dropping a body before
-its terminator records it as abandoned without draining or performing other I/O;
-setup and read errors record failure. A snapshot is point-in-time metadata only.
-Even when all tracked bodies completed, it is not evidence of a complete Git
-fetch, repository verification, cleanup authorization, or worker termination.
+A gix packet flush alone does not complete that framing. When gix drops a
+response reader, the adapter retains its body without reading it, so its ledger
+entry remains pending while the transport lives. Uninitialized lazy POSTs are
+marked failed when their state is dropped; finalization never sends an
+unwritten request. Dropping the transport without finalizing releases retained
+bodies without I/O and records them as abandoned. Setup/read errors record
+failure. A snapshot is point-in-time metadata only.
+
+Call `GitHubTransport::finalize_http_framing(self)` to explicitly consume the
+transport and drain retained response tails. It first drops gix's reader, then
+drains retained bodies through the same chunk decoder, raw socket ingress
+budget, deadline, and cancellation signal. Each response keeps its existing
+fixed-size decoder buffer; no response payload is accumulated by the drain.
+At most 64 response bodies/connections can be retained. The returned
+`HttpFinalizationReport` contains the final framing snapshot, observed ingress
+bytes, and an optional static `io::ErrorKind` for a drain/cancellation/deadline
+failure. A failed drain returns a report with incomplete framing where
+observable; remaining bodies are abandoned when released. Its `is_complete()`
+predicate requires no drain error and at least one response with every tracked
+response completed. Historical `HttpFramingSnapshot::all_responses_completed`
+does not include a later finalizer error, so use the report predicate for this
+operation.
+
+Finalization may read/discard bytes that gix has not consumed. It checks HTTP
+framing only: it does not parse the discarded Git payload, prove a complete Git
+fetch, establish repository integrity, authorize cleanup, or prove worker
+termination. Even a complete report is transport metadata, not a Git
+correctness receipt.
 
 Chunk extensions and trailer values use this candidate's bounded ASCII policy.
 Framing validation applies as the response body is consumed; callers must not
