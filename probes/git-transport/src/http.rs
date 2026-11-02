@@ -585,4 +585,28 @@ mod tests {
             &[RequestKind::Get, RequestKind::Post]
         );
     }
+
+    #[test]
+    fn malformed_and_truncated_advertisement_packet_lines_fail_handshake() {
+        // Keep the HTTP status and media type valid so this specifically tests
+        // gix's packet-line advertisement parser at the transport boundary.
+        for (case, advertisement) in [
+            ("wrong protocol text", b"0009\x01PACK0000".to_vec()),
+            ("truncated packet", b"000fversion 2\n".to_vec()),
+            ("missing flush", b"000eversion 2\n".to_vec()),
+            ("non-hex length", b"zzzzversion 2\n".to_vec()),
+        ] {
+            let response =
+                FixtureResponse::ok("application/x-git-upload-pack-advertisement", advertisement);
+            let (mut transport, _budget, requests) = make_transport([response], 128);
+            assert!(
+                transport.handshake(Service::UploadPack, &[]).is_err(),
+                "{case} must not produce a successful handshake"
+            );
+            assert_eq!(
+                requests.lock().expect("request log").as_slice(),
+                &[RequestKind::Get]
+            );
+        }
+    }
 }
