@@ -93,6 +93,13 @@ pub enum LifecycleError {
     InvalidSession,
 }
 
+/// Internal measurement result; deliberately has no serialization contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeSample {
+    pub free_bytes: u64,
+    pub binding: Vec<u8>,
+}
+
 impl From<std::io::Error> for LifecycleError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -141,6 +148,34 @@ pub struct FixtureLifecycle {
 }
 
 impl FixtureLifecycle {
+    /// Best-effort read-only free-space sample for the opened holding directory's volume.
+    /// Available only on the initially supported macOS adapter.
+    #[cfg(target_os = "macos")]
+    pub fn observed_volume_sample(&self) -> Option<VolumeSample> {
+        use rustix::fs::{fstat, fstatvfs};
+        self.verify_directories().ok()?;
+        let stat = fstatvfs(&self.holding_dir).ok()?;
+        if stat.f_frsize == 0 {
+            return None;
+        }
+        let free_bytes = stat.f_bavail.checked_mul(stat.f_frsize)?;
+        let dev = fstat(&self.holding_dir).ok()?.st_dev;
+        let mut binding = Vec::new();
+        binding.extend_from_slice(b"disk-steward-volume-binding-v1\0");
+        binding.extend_from_slice(&dev.to_le_bytes());
+        binding.extend_from_slice(&stat.f_fsid.to_le_bytes());
+        binding.extend_from_slice(b"fstatvfs_bavail_v1");
+        Some(VolumeSample {
+            free_bytes,
+            binding: Sha256::digest(binding).to_vec(),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn observed_volume_sample(&self) -> Option<VolumeSample> {
+        None
+    }
+
     /// Create exactly five fixed-size synthetic regular files under a fresh
     /// private session directory beneath an app-owned parent.
     pub fn create(
@@ -1638,6 +1673,24 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn volume_sample_reads_open_holding_directory_volume() {
+        let parent = tempfile::tempdir().unwrap();
+        let (life, _) = FixtureLifecycle::create(parent.path(), bindings()).unwrap();
+        let sample = life.observed_volume_sample().expect("native volume sample");
+        assert!(sample.free_bytes > 0);
+        assert!(!sample.binding.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_volume_measurement_returns_no_observation() {
+        let parent = tempfile::tempdir().unwrap();
+        let (life, _) = FixtureLifecycle::create(parent.path(), bindings()).unwrap();
+        assert!(life.observed_volume_sample().is_none());
+    }
 
     const PURGE_CRASH_CHILD: &str = "tests::purge_crash_child_runs_real_purge";
 

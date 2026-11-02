@@ -22,7 +22,7 @@ HOME="$probe_home" "$target_dir/debug/desktop_migration_harness" status
 HOME="$probe_home" "$target_dir/debug/desktop_migration_harness" verify
 ```
 
-Use the status step only for a disposable HOME freshly seeded by this helper. It calls `DemoExecutionService::status`, which lazily reopens and migrates the fixture session. `verify` is read-only with respect to the lifecycle DB and refuses to run before the version is already 2. The helper itself never deletes fixture or user files. Keep the temporary HOME until evidence has been inspected; remove only that exact disposable directory afterward.
+Use the status step only for a disposable HOME freshly seeded by this helper. It calls `DemoExecutionService::status`, which lazily reopens and migrates the fixture session. `verify` is read-only with respect to the lifecycle DB and refuses to run before the version is already 2. These three migration modes do not delete fixture files. The explicit measurement modes below remove only their own calibration file or registered staged demo receipt; no mode removes user files. Keep the temporary HOME until evidence has been inspected; remove only that exact disposable directory afterward.
 
 ## Desktop integration boundary
 
@@ -67,3 +67,12 @@ CARGO_TARGET_DIR=/private/tmp/disk-steward-migration-target cargo test --manifes
 The probe bundle was built with `--debug --bundles app` and the override above. Its `Info.plist` identifier was verified as `com.disksteward.migration-probe`; its title and product name were `Disk Steward Migration Probe`. The exact bundle executable was launched with a fresh marked HOME. The recorded PID's command matched that bundle, and `lsof` showed that PID holding control stores beneath the seeded probe app-data root. The CUA inventory showed the unique identifier running and the ordinary `com.disksteward.desktop` app stopped. CUA then selected the unique identifier, not a display name.
 
 Before opening **Fixture demo**, a read-only SQLite query found `user_version=1`. After the panel mounted and showed the staged Compiler output fixture, the same database reported version 2. The recorded process was terminated by its verified PID; the verifier then passed all row/rowid and fixture-byte/digest comparisons and prepared a restore review using the preserved receipt. Stderr was empty. No `status` helper call was used between seeding and desktop verification. This proves the real desktop status-triggered migration boundary for the isolated probe build; installed production data was not needed for this pass. The earlier ambiguous attempt remains inconclusive historical evidence.
+
+
+## Native observation measurement modes (0.0.16)
+
+Build the helper under the ordinary developer HOME before running `python3 -m probes.volume.native_observation_probe`. The runner creates and owns the image, mountpoint and marked probe HOME; it accepts no arbitrary image, device, helper or data path. A live run requires `--run --confirm-own-demo-purge --confirm-own-calibration-unlink` before any image creation. Host reserve and exact returned-device detach rules are shared with the existing volume probe.
+
+`calibrate-own-volume --confirm-own-calibration-unlink` requires the seeded probe root on a distinct mounted filesystem. It exclusively creates a fixed calibration filename, writes and syncs 256 MiB of OS-random data, verifies allocation and identity, removes that exact file, and observes the actual lifecycle Rust sampler for at most 30 seconds. It refuses the host temporary filesystem. It does not change fixture eligibility or use a registered fixture as the large calibration file.
+
+`purge-own-staged-demo --confirm-own-demo-purge` reads only the receipt saved by `seed`, requires that exact receipt still staged, prepares its exact current review and supplies the trusted test confirmation only after the explicit CLI flag. It invokes the real coordinator and emits its result, including any optional volume observation. It does not add a production command, bypass native confirmation in the app, or accept a user-file path. See the [native observation runner](../volume/README.md#native-product-observation-probe) and its normalized evidence for the controlled-volume check.

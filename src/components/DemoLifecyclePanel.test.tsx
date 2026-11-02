@@ -191,59 +191,107 @@ describe("DemoLifecyclePanel purge safety", () => {
     ).toBeInTheDocument();
   });
 
-  it("confirms only the prepared review and displays refreshed successful status", async () => {
-    const result: PurgeExecutionResult = {
-      executionId: "execution-1",
-      reviewId: "review-1",
-      state: "finished",
-      items: [
-        {
-          attemptId: "attempt-1",
-          outcome: {
-            permanentlyRemoved: {
-              receiptId: "receipt-1",
-              logicalBytes: 2048,
+  it.each([
+    [1800, "+2 KiB"],
+    [0, "0 bytes"],
+    [-128, "−128 bytes"],
+    [undefined, null],
+  ] as const)(
+    "shows the finished volume observation independently from logical bytes (%s)",
+    async (observedFreeSpaceDeltaBytes, expectedObservation) => {
+      const result: PurgeExecutionResult = {
+        executionId: "execution-1",
+        reviewId: "review-1",
+        state: "finished",
+        items: [
+          {
+            attemptId: "attempt-1",
+            outcome: {
+              permanently_removed: {
+                receipt_id: "receipt-1",
+                logical_bytes: 2048,
+              },
             },
           },
-        },
-      ],
-      selectedLogicalBytes: 2048,
-      durablyUnlinkedLogicalBytes: 2048,
-    };
-    const refreshedStatus: DemoStatus = {
-      ...readyStatus,
-      fixtures: readyStatus.fixtures.map((fixture) => ({
-        ...fixture,
-        status: "permanently_removed",
-        receiptId: null,
-      })),
-    };
-    let statusCalls = 0;
-    mockedInvoke.mockImplementation(async (command) => {
-      if (command === "get_fixture_demo_status") {
-        statusCalls += 1;
-        return statusCalls === 1
-          ? (readyStatus as never)
-          : (refreshedStatus as never);
+        ],
+        selectedLogicalBytes: 2048,
+        durablyUnlinkedLogicalBytes: 2048,
+        ...(observedFreeSpaceDeltaBytes === undefined
+          ? {}
+          : {
+              volumeObservation: {
+                observedFreeSpaceDeltaBytes,
+                method: "internal-measurement-token",
+                volumeBindingSha256: "f".repeat(64),
+              },
+            }),
+      };
+      const refreshedStatus: DemoStatus = {
+        ...readyStatus,
+        fixtures: readyStatus.fixtures.map((fixture) => ({
+          ...fixture,
+          status: "permanently_removed",
+          receiptId: null,
+        })),
+      };
+      let statusCalls = 0;
+      mockedInvoke.mockImplementation(async (command) => {
+        if (command === "get_fixture_demo_status") {
+          statusCalls += 1;
+          return statusCalls === 1
+            ? (readyStatus as never)
+            : (refreshedStatus as never);
+        }
+        if (command === "prepare_purge_review") return prepared as never;
+        if (command === "confirm_purge_execution") return result as never;
+        throw new Error(String(command));
+      });
+      mount();
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Prepare permanent removal",
+        }),
+      );
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Confirm permanent removal",
+        }),
+      );
+      expect(
+        await screen.findByText("Removed permanently"),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          expectedObservation
+            ? `Observed volume free-space change: ${expectedObservation}`
+            : "Observed volume free-space change unavailable.",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/2048 of 2048 logical bytes removed/i),
+      ).toBeInTheDocument();
+      if (observedFreeSpaceDeltaBytes !== undefined) {
+        expect(
+          screen.getByText(
+            /Volume-wide observation; other writers, snapshots/i,
+          ),
+        ).toBeInTheDocument();
+        expect(
+          screen.queryByText(/internal-measurement-token/),
+        ).not.toBeInTheDocument();
+        expect(screen.queryByText("f".repeat(64))).not.toBeInTheDocument();
+      } else {
+        expect(
+          screen.queryByText(/Volume-wide observation; other writers/i),
+        ).not.toBeInTheDocument();
       }
-      if (command === "prepare_purge_review") return prepared as never;
-      if (command === "confirm_purge_execution") return result as never;
-      throw new Error(String(command));
-    });
-    mount();
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Prepare permanent removal" }),
-    );
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Confirm permanent removal" }),
-    );
-    expect(await screen.findByText("Removed permanently")).toBeInTheDocument();
-    expect(screen.getAllByText("Permanently removed")).toHaveLength(2);
-    expect(mockedInvoke).toHaveBeenCalledWith("confirm_purge_execution", {
-      request: { reviewId: "review-1" },
-    });
-    expect(statusCalls).toBe(2);
-  });
+      expect(screen.getAllByText("Permanently removed")).toHaveLength(2);
+      expect(mockedInvoke).toHaveBeenCalledWith("confirm_purge_execution", {
+        request: { reviewId: "review-1" },
+      });
+      expect(statusCalls).toBe(2);
+    },
+  );
 
   it("invalidates prepared purge review when the plan revision changes", async () => {
     const view = mount();
@@ -289,11 +337,16 @@ describe("DemoLifecyclePanel purge safety", () => {
         items: [
           {
             attemptId: "attempt-1",
-            outcome: { uncertain: { receiptId: "receipt-1" } },
+            outcome: { uncertain: { receipt_id: "receipt-1" } },
           },
         ],
         selectedLogicalBytes: 2048,
         durablyUnlinkedLogicalBytes: 0,
+        volumeObservation: {
+          observedFreeSpaceDeltaBytes: 2048,
+          method: "hidden-method",
+          volumeBindingSha256: "f".repeat(64),
+        },
       };
       mockedInvoke.mockImplementation(async (command) => {
         if (command === "get_fixture_demo_status") return readyStatus as never;
@@ -329,6 +382,9 @@ describe("DemoLifecyclePanel purge safety", () => {
           /permanent removal requires separate review and native confirmation/i,
         ),
       ).toBeInTheDocument();
+      expect(
+        screen.queryByText(/Observed volume free-space change/i),
+      ).not.toBeInTheDocument();
       expect(
         screen.queryByText(/no permanent deletion/i),
       ).not.toBeInTheDocument();

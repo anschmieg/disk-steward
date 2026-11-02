@@ -2,11 +2,12 @@
 
 [package]
 name = "fixture-lifecycle-migration-probe"
-version = "0.0.15"
+version = "0.0.16"
 edition = "2021"
 publish = false
 
 [dependencies]
+disk-steward-fixture-purge = { path = "../../crates/fixture-purge" }
 disk-steward-fixture-lifecycle = { path = "../../crates/fixture-lifecycle" }
 disk-steward-demo-execution = { path = "../../crates/demo-execution" }
 disk-steward-review-plan = { path = "../../crates/review-plan" }

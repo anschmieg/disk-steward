@@ -36,6 +36,56 @@ const REVIEWS_SCHEMA: &str = "CREATE TABLE prepared_reviews(review_id TEXT PRIMA
 const EXEC_SCHEMA: &str = "CREATE TABLE executions(execution_id TEXT PRIMARY KEY,review_id TEXT NOT NULL UNIQUE,approval_id TEXT NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('stage','restore')),state TEXT NOT NULL CHECK(state IN ('started','finished','partial','uncertain')),batch_json TEXT NOT NULL,started_at_ms INTEGER NOT NULL,finished_at_ms INTEGER) STRICT";
 const ATTEMPTS_SCHEMA: &str = "CREATE TABLE child_attempts(attempt_id TEXT PRIMARY KEY,execution_id TEXT NOT NULL,action_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','staged','restored','collision','uncertain')),receipt_id TEXT) STRICT";
 
+#[cfg(test)]
+thread_local! {
+    static VOLUME_SAMPLE_TEST_SEAM: std::cell::RefCell<Option<std::collections::VecDeque<Option<disk_steward_fixture_lifecycle::VolumeSample>>>> = const { std::cell::RefCell::new(None) };
+    static VOLUME_SAMPLE_TEST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn sample_volume(
+    lifecycle: &FixtureLifecycle,
+) -> Option<disk_steward_fixture_lifecycle::VolumeSample> {
+    #[cfg(test)]
+    {
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| count.set(count.get() + 1));
+        if let Some(sample) = VOLUME_SAMPLE_TEST_SEAM.with(|seam| {
+            seam.borrow_mut()
+                .as_mut()
+                .and_then(std::collections::VecDeque::pop_front)
+        }) {
+            return sample;
+        }
+    }
+    lifecycle.observed_volume_sample()
+}
+
+fn volume_observation(
+    execution_id: ExecutionId,
+    before: Option<disk_steward_fixture_lifecycle::VolumeSample>,
+    after: Option<disk_steward_fixture_lifecycle::VolumeSample>,
+) -> Option<disk_steward_fixture_purge::VolumeObservation> {
+    const JS_SAFE: i128 = 9_007_199_254_740_991;
+    let before = before?;
+    let after = after?;
+    if before.binding != after.binding {
+        return None;
+    }
+    let delta = i128::from(after.free_bytes) - i128::from(before.free_bytes);
+    if delta.abs() > JS_SAFE {
+        return None;
+    }
+    let delta = i64::try_from(delta).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(b"disk-steward-execution-volume-observation-v1\0");
+    digest.update(serde_json::to_vec(&execution_id).ok()?);
+    digest.update(&before.binding);
+    Some(disk_steward_fixture_purge::VolumeObservation {
+        observed_free_space_delta_bytes: delta,
+        method: "fstatvfs_bavail_v1".into(),
+        volume_binding_sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DemoFixture {
@@ -610,10 +660,16 @@ impl DemoExecutionService {
         };
         let _ = execution_time;
         let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
-        let result = self
+        let volume_before = sample_volume(lifecycle);
+        let mut result = self
             .purge
             .execute_claimed_batch(lifecycle, execution_id, &prepared, attempts)
             .map_err(map_purge)?;
+        let volume_after = sample_volume(lifecycle);
+        if result.state == "finished" {
+            result.volume_observation =
+                volume_observation(execution_id, volume_before, volume_after);
+        }
         Ok(result)
     }
 
@@ -1838,6 +1894,36 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    #[test]
+    fn volume_observation_is_signed_bound_and_fail_closed() {
+        let execution = ExecutionId::new();
+        let sample = |free_bytes, binding: &[u8]| disk_steward_fixture_lifecycle::VolumeSample {
+            free_bytes,
+            binding: binding.to_vec(),
+        };
+        for (before, after, expected) in [(100, 140, 40), (100, 100, 0), (140, 100, -40)] {
+            let observed = volume_observation(
+                execution,
+                Some(sample(before, b"v")),
+                Some(sample(after, b"v")),
+            )
+            .unwrap();
+            assert_eq!(observed.observed_free_space_delta_bytes, expected);
+            assert_eq!(observed.method, "fstatvfs_bavail_v1");
+            assert_eq!(observed.volume_binding_sha256.len(), 64);
+        }
+        assert!(
+            volume_observation(execution, Some(sample(1, b"a")), Some(sample(2, b"b"))).is_none()
+        );
+        assert!(volume_observation(execution, Some(sample(1, b"a")), None).is_none());
+        assert!(volume_observation(
+            execution,
+            Some(sample(0, b"a")),
+            Some(sample(u64::MAX, b"a"))
+        )
+        .is_none());
+    }
+
     fn fixture_service() -> (tempfile::TempDir, DemoExecutionService, PlanView) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().expect("owned test root");
@@ -2476,10 +2562,40 @@ mod tests {
         let purge_review = service
             .prepare_purge_review(revision, targets)
             .expect("purge review");
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| count.set(0));
+        assert_eq!(
+            service
+                .confirm_purge_execution(purge_review.review_id, |_| false)
+                .unwrap_err(),
+            DemoError::ConfirmationCancelled
+        );
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| assert_eq!(count.get(), 0));
+        VOLUME_SAMPLE_TEST_SEAM.with(|seam| {
+            *seam.borrow_mut() = Some(std::collections::VecDeque::from([
+                Some(disk_steward_fixture_lifecycle::VolumeSample {
+                    free_bytes: 1000,
+                    binding: b"same-volume".to_vec(),
+                }),
+                Some(disk_steward_fixture_lifecycle::VolumeSample {
+                    free_bytes: 1007,
+                    binding: b"same-volume".to_vec(),
+                }),
+            ]));
+        });
         let result = service
             .confirm_purge_execution(purge_review.review_id, |_| true)
             .expect("purge executed");
+        VOLUME_SAMPLE_TEST_SEAM.with(|seam| *seam.borrow_mut() = None);
+        VOLUME_SAMPLE_TEST_COUNT.with(|count| assert_eq!(count.get(), 2));
         assert_eq!(result.state, "finished");
+        assert_eq!(
+            result
+                .volume_observation
+                .as_ref()
+                .unwrap()
+                .observed_free_space_delta_bytes,
+            7
+        );
         assert_eq!(result.items.len(), 1);
         assert!(matches!(
             result.items[0].outcome,
@@ -2512,6 +2628,67 @@ mod tests {
             intents, 2,
             "the stage and purge execution intents are durably recorded"
         );
+    }
+
+    #[test]
+    fn unavailable_or_mismatched_volume_samples_preserve_finished_purge_result() {
+        for mismatch in [true, false] {
+            let (dir, mut service, plan) = fixture_service();
+            let plan = include_one(&mut service, &plan);
+            let stage = service.prepare_stage(plan.revision_id).unwrap();
+            service
+                .confirm_and_execute(stage.review_id, |_| true)
+                .unwrap();
+            let entry = std::fs::read_dir(dir.path())
+                .unwrap()
+                .find_map(|e| {
+                    let name = e.unwrap().file_name().into_string().unwrap();
+                    name.starts_with(".disk-steward-fixtures-").then_some(name)
+                })
+                .unwrap();
+            let db = Connection::open(dir.path().join(entry).join("lifecycle.sqlite3")).unwrap();
+            let (action, receipt): (String, String) = db
+                .query_row(
+                    "SELECT action_id,receipt_id FROM fixtures WHERE status='staged'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let target = disk_steward_fixture_purge::PurgeTarget {
+                action_id: serde_json::from_str(&action).unwrap(),
+                receipt_id: serde_json::from_str(&receipt).unwrap(),
+            };
+            let review = service
+                .prepare_purge_review(plan.revision_id, vec![target])
+                .unwrap();
+            let samples = if mismatch {
+                [
+                    Some(disk_steward_fixture_lifecycle::VolumeSample {
+                        free_bytes: 100,
+                        binding: b"volume-a".to_vec(),
+                    }),
+                    Some(disk_steward_fixture_lifecycle::VolumeSample {
+                        free_bytes: 120,
+                        binding: b"volume-b".to_vec(),
+                    }),
+                ]
+            } else {
+                [None, None]
+            };
+            VOLUME_SAMPLE_TEST_SEAM.with(|seam| {
+                *seam.borrow_mut() = Some(std::collections::VecDeque::from(samples));
+            });
+            let result = service
+                .confirm_purge_execution(review.review_id, |_| true)
+                .unwrap();
+            VOLUME_SAMPLE_TEST_SEAM.with(|seam| *seam.borrow_mut() = None);
+            assert_eq!(result.state, "finished");
+            assert!(result.volume_observation.is_none());
+            assert_eq!(
+                result.durably_unlinked_logical_bytes,
+                result.selected_logical_bytes
+            );
+        }
     }
 
     #[test]

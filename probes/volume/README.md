@@ -39,3 +39,33 @@ evidence; it does not close M1C's product-adapter measurement gate.
 The reviewed probe ran successfully on macOS 27.0 arm64 with its own 768 MiB APFS image and 256 MiB random fixture. The fixture's allocated size was 268,435,456 bytes. The signed free-space change after exact-fixture purge was 268,443,648 bytes, within the 26,843,545-byte tolerance; stage, restore and restage each produced zero measured free-space change. The configured observation window was at most 30 seconds, not a claim that reclamation took 30 seconds. The transient device returned for this run was detached, and the owned image and temporary root were removed; a separate `hdiutil info` check confirmed no matching image remained.
 
 The normalized [evidence record](evidence/2026-11-02-macos-arm64.json) omits temporary filesystem paths and records measurement method and platform. The original report was retained outside the repository for local inspection. This is calibration evidence for filesystem semantics, not an implementation of observed-space reporting in the product adapter, nor a human usability or external-volume validation pass.
+
+## Native product observation probe
+
+`python3 -m probes.volume.native_observation_probe` prints a dry-run plan by
+default. On macOS, a live run requires both `--run
+--confirm-own-demo-purge --confirm-own-calibration-unlink` before it creates a
+private 768 MiB APFS image. It uses only the fixed
+`probes/fixture-migration/target/debug/desktop_migration_harness` helper, with
+a fresh marked HOME on the mounted volume. The helper seeds its own demo,
+calibrates the native `fstatvfs_bavail_v1` sampler with an exclusive 256 MiB
+file, and purges only its own staged demo selection through the real product
+coordinator. The probe requires a finished result whose selected logical
+bytes all reached durable unlink, plus a product volume observation with the
+expected method and a 64-character binding digest. It records platform,
+calibration JSON and product JSON. The purge observation is evidence about the
+owned volume; its measured delta is not attributed to the purge's logical
+bytes. Host free space must be at least 3 GiB before image creation.
+
+The probe detaches only the device returned for its exact mountpoint. Unknown
+attach state and failed detach retain the image and root for inspection. A
+successful detach permits removal of the named image and empty directories.
+This is development-only feasibility evidence and does not authorize ordinary
+volume cleanup or unattended deletion. No live run is performed by tests.
+
+
+### Verified native method and product path — 2026-11-02
+
+The 0.0.16 native runner passed on macOS 27.0 arm64. Its 256 MiB allocation was measured through the actual opened-directory Rust sampler; the native calibration met tolerance immediately in the first sampled interval (reported elapsed milliseconds rounded to zero). The real demo coordinator then returned a finished purge result with complete logical unlink and a separate signed observation. These numbers are independent: the observation spans volume activity and control-store writes as well as file unlink.
+
+The [normalized evidence](evidence/2026-11-02-native-observation-macos-arm64.json) preserves both calibration and product results, omits temporary paths, and records independent detach/root-removal checks. The fixed demo files were not enlarged to perform calibration. Missing authorization and calibration on the host temporary filesystem were separately refused before calibration writes. Runtime probe artifacts were removed after the passing run; failure cases retain evidence without forced detach or recursive cleanup.

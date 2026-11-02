@@ -297,16 +297,132 @@ fn service_status() {
     );
 }
 
-fn main() {
-    let mut args = env::args().skip(1);
-    let command = args.next();
-    if args.next().is_some() {
-        panic!("usage: desktop_migration_harness seed|status|verify");
+/// Explicit test-only authorization for a session seeded by this helper.
+fn purge_own_staged_demo() {
+    let root = app_root();
+    let receipt: disk_steward_core::ReceiptId =
+        serde_json::from_slice(&fs::read(root.join("fixture-migration-receipt.json")).unwrap())
+            .unwrap();
+    let mut service = DemoExecutionService::open(&root).unwrap();
+    let status = service.status().unwrap();
+    let target = status
+        .fixtures
+        .iter()
+        .find(|f| {
+            f.receipt_id == Some(receipt)
+                && f.status == disk_steward_fixture_lifecycle::FixtureStatus::Staged
+        })
+        .unwrap();
+    let plan = ReviewPlanStore::open(root.join("review-example-v1.sqlite3"))
+        .unwrap()
+        .get_plan()
+        .unwrap();
+    let review = service
+        .prepare_purge_review(
+            plan.revision_id,
+            vec![disk_steward_fixture_purge::PurgeTarget {
+                action_id: target.action_id,
+                receipt_id: receipt,
+            }],
+        )
+        .unwrap();
+    eprintln!(
+        "Exact disposable review: {} target(s), {} logical bytes",
+        review.targets.len(),
+        review.selected_logical_bytes
+    );
+    let result = service
+        .confirm_purge_execution(review.review_id, |_| true)
+        .unwrap();
+    assert_eq!(result.state, "finished");
+    assert_eq!(
+        result.durably_unlinked_logical_bytes,
+        review.selected_logical_bytes
+    );
+    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+}
+
+#[cfg(target_os = "macos")]
+fn calibrate_own_volume() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+    const BYTES: u64 = 256 * 1024 * 1024;
+    let root = app_root();
+    assert_ne!(
+        fs::metadata(&root).unwrap().dev(),
+        fs::metadata(env::temp_dir()).unwrap().dev(),
+        "calibration requires an isolated mounted volume, not the host temporary filesystem"
+    );
+    let mut service = DemoExecutionService::open(&root).unwrap();
+    let session = service.status().unwrap().session_id.unwrap();
+    drop(service);
+    let (life, _) =
+        disk_steward_fixture_lifecycle::FixtureLifecycle::reopen(&root, session).unwrap();
+    assert!(life.observed_volume_sample().unwrap().free_bytes >= BYTES + 64 * 1024 * 1024);
+    let path = root.join("native-sampler-calibration.bin");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let mut random = fs::File::open("/dev/urandom").unwrap();
+    let mut buffer = vec![0; 1024 * 1024];
+    for _ in 0..256 {
+        random.read_exact(&mut buffer).unwrap();
+        file.write_all(&buffer).unwrap();
     }
-    match command.as_deref() {
-        Some("seed") => seed(),
-        Some("status") => service_status(),
-        Some("verify") => verify(),
-        _ => panic!("usage: desktop_migration_harness seed|status|verify"),
+    file.sync_all().unwrap();
+    let identity = file.metadata().unwrap();
+    assert_eq!(identity.len(), BYTES);
+    let allocated = identity.blocks().checked_mul(512).unwrap();
+    assert!(allocated >= BYTES, "fixture must be fully allocated");
+    drop(file);
+    let before = life.observed_volume_sample().unwrap();
+    let current = fs::symlink_metadata(&path).unwrap();
+    assert!(current.is_file() && current.nlink() == 1);
+    assert_eq!(
+        (current.dev(), current.ino(), current.len()),
+        (identity.dev(), identity.ino(), BYTES)
+    );
+    fs::remove_file(&path).unwrap(); // only this invocation's exclusive-created calibration file
+    fs::File::open(&root).unwrap().sync_all().unwrap();
+    let started = Instant::now();
+    let tolerance = std::cmp::max(16 * 1024 * 1024, allocated / 10);
+    let (delta, elapsed) = loop {
+        let after = life.observed_volume_sample().unwrap();
+        assert_eq!(before.binding, after.binding, "volume must not change");
+        let delta = i128::from(after.free_bytes) - i128::from(before.free_bytes);
+        if (delta - i128::from(allocated)).abs() <= i128::from(tolerance) {
+            break (delta, started.elapsed());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "native sampler recovery outside tolerance: {delta}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "method": "fstatvfs_bavail_v1", "fixtureBytes": BYTES,
+        "allocatedBytes": allocated, "observedFreeSpaceDeltaBytes": i64::try_from(delta).unwrap(),
+        "toleranceBytes": tolerance, "elapsedMs": elapsed.as_millis(),
+        "scope": "native sampler calibration on owned volume; no per-file attribution on ordinary volumes"
+    })).unwrap());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn calibrate_own_volume() {
+    panic!("native sampler calibration is macOS-only");
+}
+
+fn main() {
+    let args: Vec<_> = env::args().skip(1).collect();
+    match args.as_slice() {
+        [command] if command == "seed" => seed(),
+        [command] if command == "status" => service_status(),
+        [command] if command == "verify" => verify(),
+        [command, confirmation] if command == "purge-own-staged-demo" && confirmation == "--confirm-own-demo-purge" => purge_own_staged_demo(),
+        [command, confirmation] if command == "calibrate-own-volume" && confirmation == "--confirm-own-calibration-unlink" => calibrate_own_volume(),
+        _ => panic!("usage: desktop_migration_harness seed|status|verify OR purge-own-staged-demo --confirm-own-demo-purge OR calibrate-own-volume --confirm-own-calibration-unlink"),
     }
 }
