@@ -49,7 +49,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "approval-ledger"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "rusqlite",
 ]
@@ -400,9 +400,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.3"
+version = "1.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
+checksum = "5f97d3416d5337d15c4b0d78c8c91df922ca143f57ec20e2d1c188333047ef04"
 dependencies = [
  "cfg-if",
 ]
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-core"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "serde",
  "uuid",
@@ -608,11 +608,12 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-demo-execution"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "approval-ledger",
  "disk-steward-core",
  "disk-steward-fixture-lifecycle",
+ "disk-steward-fixture-purge",
  "disk-steward-review-plan",
  "rusqlite",
  "rustix",
@@ -623,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-desktop"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "disk-steward-core",
  "disk-steward-demo-execution",
@@ -645,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-exclusion-store"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "disk-steward-core",
  "rusqlite",
@@ -656,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-fixture-lifecycle"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "disk-steward-core",
  "rusqlite",
@@ -667,8 +668,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-steward-fixture-purge"
+version = "0.0.12"
+dependencies = [
+ "disk-steward-core",
+ "disk-steward-fixture-lifecycle",
+ "disk-steward-review-plan",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "disk-steward-plan-model"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "disk-steward-core",
  "serde",
@@ -678,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-plan-store"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "disk-steward-core",
  "disk-steward-plan-model",
@@ -690,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "disk-steward-review-plan"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "disk-steward-core",
  "rusqlite",

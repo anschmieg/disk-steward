@@ -11,6 +11,7 @@ disk-steward-core = { path = "../disk-steward-core" }
 disk-steward-review-plan = { path = "../review-plan" }
 disk-steward-approval-ledger = { package = "approval-ledger", path = "../approval-ledger" }
 disk-steward-fixture-lifecycle = { path = "../fixture-lifecycle" }
+disk-steward-fixture-purge = { path = "../fixture-purge" }
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
