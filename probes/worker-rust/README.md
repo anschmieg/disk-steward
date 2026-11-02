@@ -65,6 +65,17 @@ no-follow private-directory and journal identity checks. It reports
 `cleanup=not_authorized`. This is ordinary process death, not power-loss or
 crash-durability evidence. It does not adopt the store or create a stop receipt.
 
+`--run-indexed-store-worker` integrates the local verification-store registry
+with a fresh private store. It creates the registry database only inside that
+store's generated private parent and uses one fixed 32-hex fixture ID. It binds
+the identity as `registered` before spawning one actual `stall` child, then
+records `active` after spawn and binding. After readiness, the bounded one-byte read, stop, reap and reader
+join proof, it records `stopped` in both live store and registry. It drops the
+registry lease and reopens only the generated registry path, then verifies the
+same parent/root identities with `NeedsReconciliation` and prior state
+`Stopped`; retrying `Active` is refused. The index grants no inspection or
+cleanup authority, and the command accepts no paths or IDs.
+
 Descriptor-relative checks constrain the operation to this fixture, but they
 cannot eliminate races from a hostile process running as the same user between
 validation and unlink. Directory and file synchronization requests also do not
@@ -85,6 +96,7 @@ cargo run -p disk-steward-worker-probe
 cargo run -p disk-steward-worker-probe -- --run
 cargo run -p disk-steward-worker-probe -- --run-store-worker
 cargo run -p disk-steward-worker-probe -- --run-store-reinspect
+cargo run -p disk-steward-worker-probe -- --run-indexed-store-worker
 cargo run -p disk-steward-worker-probe -- --run-store-cleanup --confirm-own-store-cleanup
 cargo test -p disk-steward-worker-probe --locked
 ```
