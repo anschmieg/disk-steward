@@ -1,0 +1,7 @@
+# M0 local TLS ingress boundary
+
+Purpose: charge socket bytes before rustls reads encrypted handshake/application records, rather than relying on an HTTP response-body counter above TLS buffering. Test-only generated localhost certificate with normal certificate/hostname verification; numeric IPv4 loopback connection only. One shared budget spans fixed Git advertisement GET and upload-pack POST when wired through the existing pinned gix HTTP trait.
+
+Test cap-before-read, handshake accounting, untrusted/name-mismatched certificate refusal, stalled TLS peer deadline, bounded server lifetime. Every accepted read is charged even if it finishes after deadline. Counter measures socket bytes returned to rustls, not NIC traffic or data waiting in OS buffers. No production backend selection, DNS cancellation, credential/Keychain, remote request, stores, renderer or cleanup. No M0 completion claim.
+
+Branch atop PR35 head1a18069; main remains final baseline. Root owns dev dependency pins/lock/module wiring, bounded Luna agent owns new test module only; root source review before test execution. Exact cached rustls0.23.45 and rcgen0.14.9, ring provider; no disabled verifier/default AWS build. Require targeted tests, strictClippy, formatting, version0.0.17, diff and current-head CI before merge. Existing33/34/35watches notpolled. Reserve9.6GiB observed before implementation; no user cache removal.

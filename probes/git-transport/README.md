@@ -108,3 +108,24 @@ credential helper, environment credential, Keychain item or real token is
 consulted by these fixtures. This does not prove production credential broker
 integration, secure memory lifetime/zeroization, private GitHub access or
 revocation behavior.
+
+The private `tls_ingress_tests` module places a socket reader beneath
+`rustls::StreamOwned` and shares its ingress budget across the actual gix GET
+and POST fixture connections. Generated localhost certificates are explicitly
+trusted for the success fixture; the negative cases use an empty trust store
+or a mismatched hostname. Certificate verification is not disabled. A small
+cap interrupts encrypted handshake traffic before another socket byte can be
+returned, and a non-responsive local TLS peer exercises the attempt deadline.
+The local adapter ignores caller URLs in favor of its fixed loopback endpoint
+and is not a production HTTP client. It does not implement remote DNS,
+credentials, general request bodies, or store writes.
+
+This count includes encrypted TLS records returned from socket reads, including
+handshake traffic and HTTP headers. It excludes bytes buffered in the operating
+system or arriving at the network interface before the program reads them. The
+small fixture limits do not calibrate the 2 GiB production budget or establish
+a five-minute production timeout. Production backend selection, worker
+composition, private GitHub/Keychain authentication and full M0 remain open.
+The fixture accepts POST request data into an in-memory sink, as the earlier
+HTTP fixture does; it proves incoming response accounting, not upload-pack
+request-body transmission or a complete fetch protocol implementation.

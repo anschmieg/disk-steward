@@ -218,3 +218,6 @@ pub mod http;
 
 #[cfg(test)]
 mod loopback_http_tests;
+
+#[cfg(test)]
+mod tls_ingress_tests;
