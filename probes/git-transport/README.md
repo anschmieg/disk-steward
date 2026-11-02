@@ -118,7 +118,7 @@ cap interrupts encrypted handshake traffic before another socket byte can be
 returned, and a non-responsive local TLS peer exercises the attempt deadline.
 The local adapter ignores caller URLs in favor of its fixed loopback endpoint
 and is not a production HTTP client. It does not implement remote DNS,
-credentials, general request bodies, or store writes.
+credentials, general streaming request bodies, or store writes.
 
 This count includes encrypted TLS records returned from socket reads, including
 handshake traffic and HTTP headers. It excludes bytes buffered in the operating
@@ -126,6 +126,13 @@ system or arriving at the network interface before the program reads them. The
 small fixture limits do not calibrate the 2 GiB production budget or establish
 a five-minute production timeout. Production backend selection, worker
 composition, private GitHub/Keychain authentication and full M0 remain open.
-The fixture accepts POST request data into an in-memory sink, as the earlier
-HTTP fixture does; it proves incoming response accounting, not upload-pack
-request-body transmission or a complete fetch protocol implementation.
+
+The bounded POST-body fixture extends that response path to transmit a fixed
+synthetic request packet and its gix flush marker over TLS. It buffers only the
+small fixture upload, then lazily sends an explicit Content-Length request
+after gix drops the upload writer. The local server consumes and validates the
+whole body before returning the synthetic response. This supersedes the
+in-memory POST sink for these TLS tests; the earlier plain HTTP fixture remains
+a response-accounting experiment. The hard fixture upload cap and poisoned
+oversize path are not a production streaming implementation or proof of a
+complete Git fetch. No repository/object-store operations follow.

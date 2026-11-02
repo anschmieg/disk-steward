@@ -4,7 +4,10 @@ use std::{
     any::Any,
     io::{self, BufRead, Cursor, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{
+        mpsc::{sync_channel, Receiver, SyncSender},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +18,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
 const IO_SLICE_TIMEOUT: Duration = Duration::from_millis(100);
 const HTTP_HEADER_LIMIT: usize = 8192;
+const POST_BODY_LIMIT: usize = 8192;
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -185,6 +189,299 @@ impl Read for TlsBody {
     }
 }
 
+enum PostPayload {
+    Body(Vec<u8>),
+    TooLarge,
+}
+
+struct TlsPostBody {
+    sender: SyncSender<PostPayload>,
+    buffered: Vec<u8>,
+    failed: bool,
+}
+
+impl Write for TlsPostBody {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "synthetic TLS POST body already failed",
+            ));
+        }
+        if self.buffered.len().saturating_add(input.len()) > POST_BODY_LIMIT {
+            self.failed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "synthetic TLS POST body limit exceeded",
+            ));
+        }
+        self.buffered.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.failed {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "synthetic TLS POST body failed",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for TlsPostBody {
+    fn drop(&mut self) {
+        let payload = if self.failed {
+            PostPayload::TooLarge
+        } else {
+            PostPayload::Body(std::mem::take(&mut self.buffered))
+        };
+        // The bounded one-slot channel is empty until this unique writer drops.
+        // try_send keeps Drop nonblocking on every path.
+        let _ = self.sender.try_send(payload);
+    }
+}
+
+struct InitializedPost {
+    headers: Vec<u8>,
+    body: Option<TlsBody>,
+}
+
+struct TlsPostState {
+    receiver: Receiver<PostPayload>,
+    requester: TlsHttp,
+    request_headers: Vec<String>,
+    initialized: Option<InitializedPost>,
+    failed: bool,
+}
+
+impl TlsPostState {
+    fn initialize(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other("synthetic TLS POST initialization failed"));
+        }
+        if self.initialized.is_some() {
+            return Ok(());
+        }
+        let remaining = self
+            .requester
+            .deadline
+            .saturating_duration_since(Instant::now());
+        let payload = match self.receiver.recv_timeout(remaining) {
+            Ok(PostPayload::Body(payload)) => payload,
+            Ok(PostPayload::TooLarge) => {
+                self.failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "synthetic TLS POST body limit exceeded",
+                ));
+            }
+            Err(_) => {
+                self.failed = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "synthetic TLS POST body unavailable before deadline",
+                ));
+            }
+        };
+        let request_headers = self.request_headers.clone();
+        match self.requester.request_with_body(
+            "POST",
+            "/git-upload-pack",
+            request_headers.iter(),
+            Some(&payload),
+        ) {
+            Ok((headers, body)) => {
+                self.initialized = Some(InitializedPost {
+                    headers: headers.into_inner(),
+                    body: Some(body),
+                });
+                Ok(())
+            }
+            Err(_) => {
+                self.failed = true;
+                Err(io::Error::other("synthetic TLS POST transport failed"))
+            }
+        }
+    }
+
+    fn response_headers(&mut self) -> io::Result<Vec<u8>> {
+        self.initialize()?;
+        self.initialized
+            .as_ref()
+            .map(|response| response.headers.clone())
+            .ok_or_else(|| io::Error::other("synthetic TLS POST headers unavailable"))
+    }
+
+    fn take_response_body(&mut self) -> io::Result<TlsBody> {
+        self.initialize()?;
+        self.initialized
+            .as_mut()
+            .and_then(|response| response.body.take())
+            .ok_or_else(|| io::Error::other("synthetic TLS POST body unavailable"))
+    }
+}
+
+struct TlsPostHeaders {
+    state: Arc<Mutex<TlsPostState>>,
+    cursor: Option<Cursor<Vec<u8>>>,
+}
+
+enum TlsResponseHeaders {
+    Immediate(Cursor<Vec<u8>>),
+    Post(TlsPostHeaders),
+}
+
+impl BufRead for TlsResponseHeaders {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        match self {
+            Self::Immediate(cursor) => cursor.fill_buf(),
+            Self::Post(headers) => headers.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Self::Immediate(cursor) => cursor.consume(amount),
+            Self::Post(headers) => headers.consume(amount),
+        }
+    }
+}
+
+impl Read for TlsResponseHeaders {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        output[0] = bytes[0];
+        self.consume(1);
+        Ok(1)
+    }
+}
+
+impl BufRead for TlsPostHeaders {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.cursor.is_none() {
+            let headers = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("synthetic TLS POST state unavailable"))?
+                .response_headers()?;
+            self.cursor = Some(Cursor::new(headers));
+        }
+        self.cursor
+            .as_mut()
+            .ok_or_else(|| io::Error::other("synthetic TLS POST headers unavailable"))?
+            .fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        if let Some(cursor) = &mut self.cursor {
+            cursor.consume(amount);
+        }
+    }
+}
+
+impl Read for TlsPostHeaders {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        output[0] = bytes[0];
+        self.consume(1);
+        Ok(1)
+    }
+}
+
+struct TlsPostResponseBody {
+    state: Arc<Mutex<TlsPostState>>,
+    body: Option<TlsBody>,
+}
+
+enum TlsResponseBody {
+    Immediate(TlsBody),
+    Post(TlsPostResponseBody),
+}
+
+impl BufRead for TlsResponseBody {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        match self {
+            Self::Immediate(body) => body.fill_buf(),
+            Self::Post(body) => body.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Self::Immediate(body) => body.consume(amount),
+            Self::Post(body) => body.consume(amount),
+        }
+    }
+}
+
+impl Read for TlsResponseBody {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        output[0] = bytes[0];
+        self.consume(1);
+        Ok(1)
+    }
+}
+
+impl BufRead for TlsPostResponseBody {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.body.is_none() {
+            self.body = Some(
+                self.state
+                    .lock()
+                    .map_err(|_| io::Error::other("synthetic TLS POST state unavailable"))?
+                    .take_response_body()?,
+            );
+        }
+        self.body
+            .as_mut()
+            .ok_or_else(|| io::Error::other("synthetic TLS POST body unavailable"))?
+            .fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        if let Some(body) = &mut self.body {
+            body.consume(amount);
+        }
+    }
+}
+
+impl Read for TlsPostResponseBody {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.fill_buf()?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        output[0] = bytes[0];
+        self.consume(1);
+        Ok(1)
+    }
+}
+
 struct TlsHttp {
     endpoint: SocketAddr,
     server_name: &'static str,
@@ -216,6 +513,16 @@ impl TlsHttp {
         method: &str,
         path: &str,
         headers: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> io::Result<(Cursor<Vec<u8>>, TlsBody)> {
+        self.request_with_body(method, path, headers, None)
+    }
+
+    fn request_with_body(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: impl IntoIterator<Item = impl AsRef<str>>,
+        body: Option<&[u8]>,
     ) -> io::Result<(Cursor<Vec<u8>>, TlsBody)> {
         let timeout = self
             .deadline
@@ -251,8 +558,15 @@ impl TlsHttp {
             request.push_str(header);
             request.push_str("\r\n");
         }
+        if let Some(body) = body {
+            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
         request.push_str("\r\n");
         stream.write_all(request.as_bytes())?;
+        if let Some(body) = body {
+            stream.write_all(body)?;
+            stream.flush()?;
+        }
 
         let mut response_headers = Vec::new();
         let mut byte = [0u8; 1];
@@ -298,9 +612,9 @@ impl TlsHttp {
 }
 
 impl Http for TlsHttp {
-    type Headers = Cursor<Vec<u8>>;
-    type ResponseBody = TlsBody;
-    type PostBody = io::Sink;
+    type Headers = TlsResponseHeaders;
+    type ResponseBody = TlsResponseBody;
+    type PostBody = TlsPostBody;
 
     fn get(
         &mut self,
@@ -311,7 +625,10 @@ impl Http for TlsHttp {
         let (headers, body) = self
             .request("GET", "/info/refs?service=git-upload-pack", headers)
             .map_err(tls_error)?;
-        Ok(GetResponse { headers, body })
+        Ok(GetResponse {
+            headers: TlsResponseHeaders::Immediate(headers),
+            body: TlsResponseBody::Immediate(body),
+        })
     }
 
     fn post(
@@ -321,13 +638,35 @@ impl Http for TlsHttp {
         headers: impl IntoIterator<Item = impl AsRef<str>>,
         _body: PostBodyDataKind,
     ) -> ExnMessageResult<PostResponse<Self::Headers, Self::ResponseBody, Self::PostBody>> {
-        let (headers, body) = self
-            .request("POST", "/git-upload-pack", headers)
-            .map_err(tls_error)?;
+        let request_headers = headers
+            .into_iter()
+            .map(|header| header.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        let (sender, receiver) = sync_channel(1);
+        let state = Arc::new(Mutex::new(TlsPostState {
+            receiver,
+            requester: TlsHttp {
+                endpoint: self.endpoint,
+                server_name: self.server_name,
+                config: Arc::clone(&self.config),
+                budget: self.budget.clone(),
+                deadline: self.deadline,
+            },
+            request_headers,
+            initialized: None,
+            failed: false,
+        }));
         Ok(PostResponse {
-            post_body: io::sink(),
-            headers,
-            body,
+            post_body: TlsPostBody {
+                sender,
+                buffered: Vec::new(),
+                failed: false,
+            },
+            headers: TlsResponseHeaders::Post(TlsPostHeaders {
+                state: Arc::clone(&state),
+                cursor: None,
+            }),
+            body: TlsResponseBody::Post(TlsPostResponseBody { state, body: None }),
         })
     }
 
@@ -457,17 +796,53 @@ fn server_accept(listener: &TcpListener, deadline: Instant) -> io::Result<TcpStr
     }
 }
 
+#[derive(Default)]
+struct ServerObservation {
+    completed: usize,
+    post_body_matches: Option<bool>,
+    post_body_nonempty: Option<bool>,
+}
+
+fn request_content_length(headers: &[u8]) -> io::Result<usize> {
+    let text = std::str::from_utf8(headers)
+        .map_err(|_| io::Error::other("invalid synthetic request headers"))?;
+    let mut length = None;
+    for line in text.split("\r\n").skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                if length.is_some() {
+                    return Err(io::Error::other("duplicate synthetic content length"));
+                }
+                length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| io::Error::other("invalid synthetic content length"))?,
+                );
+            }
+        }
+    }
+    let length = length.unwrap_or(0);
+    if length > POST_BODY_LIMIT {
+        return Err(io::Error::other(
+            "synthetic request body exceeds fixture bound",
+        ));
+    }
+    Ok(length)
+}
+
 fn serve_gix_responses(
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
     requests: usize,
-) -> thread::JoinHandle<usize> {
+    expected_post_body: Option<Vec<u8>>,
+) -> thread::JoinHandle<ServerObservation> {
     thread::spawn(move || {
         let deadline = Instant::now() + FIXTURE_TIMEOUT;
-        let mut completed = 0;
+        let mut observation = ServerObservation::default();
         for index in 0..requests {
             let Ok(socket) = server_accept(&listener, deadline) else {
-                return completed;
+                return observation;
             };
             let socket = CountedSocket {
                 stream: socket,
@@ -476,17 +851,17 @@ fn serve_gix_responses(
             };
             let connection = match rustls::ServerConnection::new(Arc::clone(&config)) {
                 Ok(connection) => connection,
-                Err(_) => return completed,
+                Err(_) => return observation,
             };
             let mut stream = rustls::StreamOwned::new(connection, socket);
             let mut request = Vec::new();
             let mut byte = [0u8; 1];
             loop {
                 if Instant::now() >= deadline || request.len() >= HTTP_HEADER_LIMIT {
-                    return completed;
+                    return observation;
                 }
                 match stream.read(&mut byte) {
-                    Ok(0) => return completed,
+                    Ok(0) => return observation,
                     Ok(_) => {
                         request.push(byte[0]);
                         if request.ends_with(b"\r\n\r\n") {
@@ -501,8 +876,16 @@ fn serve_gix_responses(
                     {
                         continue;
                     }
-                    Err(_) => return completed,
+                    Err(_) => return observation,
                 }
+            }
+            let body_length = match request_content_length(&request) {
+                Ok(length) => length,
+                Err(_) => return observation,
+            };
+            let mut request_body = vec![0u8; body_length];
+            if stream.read_exact(&mut request_body).is_err() {
+                return observation;
             }
             let expected_path: &[u8] = if index == 0 {
                 b"GET /info/refs?service=git-upload-pack HTTP/1.1\r\n"
@@ -510,7 +893,18 @@ fn serve_gix_responses(
                 b"POST /git-upload-pack HTTP/1.1\r\n"
             };
             if !request.starts_with(expected_path) {
-                return completed;
+                return observation;
+            }
+            if index == 1 {
+                observation.post_body_nonempty = Some(!request_body.is_empty());
+                observation.post_body_matches = expected_post_body
+                    .as_ref()
+                    .map(|expected| expected.as_slice() == request_body.as_slice());
+                if observation.post_body_nonempty != Some(true)
+                    || observation.post_body_matches != Some(true)
+                {
+                    return observation;
+                }
             }
             let body = if index == 0 {
                 crate::http::v2_advertisement()
@@ -529,11 +923,11 @@ fn serve_gix_responses(
             if write_tls_until(&mut stream, reply.as_bytes(), deadline).is_err()
                 || write_tls_until(&mut stream, &body, deadline).is_err()
             {
-                return completed;
+                return observation;
             }
-            completed += 1;
+            observation.completed += 1;
         }
-        completed
+        observation
     })
 }
 
@@ -590,9 +984,12 @@ fn run_gix_transfer(
     if transport.handshake(Service::UploadPack, &[]).is_err() {
         return (false, budget.used());
     }
-    let Ok(request) = transport.request(WriteMode::Binary, MessageKind::Flush, false) else {
+    let Ok(mut request) = transport.request(WriteMode::Binary, MessageKind::Flush, false) else {
         return (false, budget.used());
     };
+    if request.write_all(b"synthetic-command\n").is_err() {
+        return (false, budget.used());
+    }
     let Ok(mut body) = request.into_read() else {
         return (false, budget.used());
     };
@@ -657,7 +1054,14 @@ fn client_certificate_verification_error(
 fn actual_gix_get_and_post_are_counted_below_rustls() {
     let fixture = tls_fixture();
     let (listener, address) = loopback_listener();
-    let server = serve_gix_responses(listener, Arc::clone(&fixture.server_config), 2);
+    let mut expected_post_body = crate::http::packetline(b"synthetic-command\n");
+    expected_post_body.extend_from_slice(b"0000");
+    let server = serve_gix_responses(
+        listener,
+        Arc::clone(&fixture.server_config),
+        2,
+        Some(expected_post_body),
+    );
     let advertisement = crate::http::v2_advertisement();
     let pack = crate::http::synthetic_pack_response();
     let plaintext_len = advertisement.len() + pack.len();
@@ -669,7 +1073,17 @@ fn actual_gix_get_and_post_are_counted_below_rustls() {
     );
     let served = server.join().expect("bounded TLS fixture server joined");
     assert!(success, "trusted synthetic gix transfer should complete");
-    assert_eq!(served, 2, "TLS fixture should serve GET and POST");
+    assert_eq!(served.completed, 2, "TLS fixture should serve GET and POST");
+    assert_eq!(
+        served.post_body_matches,
+        Some(true),
+        "POST packet body mismatch"
+    );
+    assert_eq!(
+        served.post_body_nonempty,
+        Some(true),
+        "POST body should be nonempty"
+    );
     assert!(
         ingress > plaintext_len,
         "raw TLS ingress should include TLS records as well as response payloads"
@@ -677,10 +1091,206 @@ fn actual_gix_get_and_post_are_counted_below_rustls() {
 }
 
 #[test]
+fn oversized_gix_post_body_is_rejected_before_second_connection() {
+    use gix_transport::{
+        client::blocking_io::Transport as _,
+        client::{MessageKind, WriteMode},
+        Protocol, Service,
+    };
+
+    let fixture = tls_fixture();
+    let (listener, address) = loopback_listener();
+    let mut expected_post_body = crate::http::packetline(b"synthetic-command\n");
+    expected_post_body.extend_from_slice(b"0000");
+    let server = serve_gix_responses(
+        listener,
+        Arc::clone(&fixture.server_config),
+        2,
+        Some(expected_post_body),
+    );
+    let http = TlsHttp::new(
+        address,
+        "localhost",
+        Arc::clone(&fixture.trusted_client_config),
+        64 * 1024,
+        FIXTURE_TIMEOUT,
+    );
+    let budget = http.budget.clone();
+    let url = gix_url::parse("https://localhost/synthetic.git").expect("fixture URL");
+    let mut transport = gix_transport::client::blocking_io::http::Transport::new_http(
+        http,
+        url,
+        Protocol::V2,
+        false,
+    );
+    let handshake_ok = transport.handshake(Service::UploadPack, &[]).is_ok();
+    let mut post_rejected = false;
+    if handshake_ok {
+        if let Ok(mut request) = transport.request(WriteMode::Binary, MessageKind::Flush, false) {
+            let oversized_write_rejected =
+                request.write_all(&vec![b'x'; POST_BODY_LIMIT + 1]).is_err();
+            let into_read_rejected = request.into_read().is_err();
+            post_rejected = oversized_write_rejected && into_read_rejected;
+        }
+    }
+    let ingress = budget.used();
+    drop(transport);
+    let observation = server
+        .join()
+        .expect("bounded oversize fixture server joined");
+    assert!(handshake_ok, "synthetic TLS GET handshake should succeed");
+    assert!(post_rejected, "oversized request body should fail closed");
+    assert_eq!(
+        observation.completed, 1,
+        "only the initial GET may reach the loopback server"
+    );
+    assert_eq!(
+        observation.post_body_matches, None,
+        "oversized POST reached server"
+    );
+    assert!(ingress > 0, "GET response bytes should remain accounted");
+}
+
+#[test]
+fn ignored_oversize_write_poison_reaches_lazy_headers_without_connecting() {
+    let (listener, address) = loopback_listener();
+    let fixture = tls_fixture();
+    let mut http = TlsHttp::new(
+        address,
+        "localhost",
+        fixture.trusted_client_config,
+        4096,
+        FIXTURE_TIMEOUT,
+    );
+    let PostResponse {
+        mut post_body,
+        mut headers,
+        body,
+    } = match http.post(
+        "https://localhost/synthetic.git/git-upload-pack",
+        "https://localhost/synthetic.git",
+        std::iter::empty::<&str>(),
+        PostBodyDataKind::Unbounded,
+    ) {
+        Ok(response) => response,
+        Err(_) => panic!("synthetic POST setup should succeed"),
+    };
+    assert!(post_body
+        .write_all(&vec![b'x'; POST_BODY_LIMIT + 1])
+        .is_err());
+    assert!(
+        post_body.buffered.is_empty(),
+        "oversize input must not enter the buffer"
+    );
+    assert!(
+        post_body.write_all(b"partial").is_err(),
+        "poison must persist"
+    );
+    drop(post_body);
+    assert!(
+        headers.fill_buf().is_err(),
+        "ignored upload error must reach the response"
+    );
+    assert!(
+        headers.fill_buf().is_err(),
+        "failed initialization must not retry"
+    );
+    assert!(matches!(listener.accept(), Err(ref error)
+        if error.kind() == io::ErrorKind::WouldBlock));
+    drop(body);
+}
+
+#[test]
+fn dropping_empty_post_body_is_nonblocking_and_starts_no_connection() {
+    let (listener, address) = loopback_listener();
+    let fixture = tls_fixture();
+    let mut http = TlsHttp::new(
+        address,
+        "localhost",
+        fixture.trusted_client_config,
+        4096,
+        FIXTURE_TIMEOUT,
+    );
+    let start = Instant::now();
+    let response = http.post(
+        "https://localhost/synthetic.git/git-upload-pack",
+        "https://localhost/synthetic.git",
+        std::iter::empty::<&str>(),
+        PostBodyDataKind::Unbounded,
+    );
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => panic!("synthetic POST setup should succeed"),
+    };
+    let PostResponse {
+        post_body,
+        headers,
+        body,
+    } = response;
+    drop(post_body);
+    drop(headers);
+    drop(body);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "dropping fixture writer blocked"
+    );
+    assert!(matches!(
+        listener.accept(),
+        Err(ref error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+}
+
+#[test]
+fn held_post_writer_times_out_before_lazy_headers_open_a_connection() {
+    let (listener, address) = loopback_listener();
+    let fixture = tls_fixture();
+    let mut http = TlsHttp::new(
+        address,
+        "localhost",
+        fixture.trusted_client_config,
+        4096,
+        Duration::from_millis(120),
+    );
+    let response = http.post(
+        "https://localhost/synthetic.git/git-upload-pack",
+        "https://localhost/synthetic.git",
+        std::iter::empty::<&str>(),
+        PostBodyDataKind::Unbounded,
+    );
+    let PostResponse {
+        post_body,
+        mut headers,
+        body,
+    } = match response {
+        Ok(response) => response,
+        Err(_) => panic!("synthetic POST setup should succeed"),
+    };
+    let started = Instant::now();
+    let header_result = headers.fill_buf();
+    let elapsed = started.elapsed();
+    assert!(
+        header_result.is_err(),
+        "lazy header read should honor deadline"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(110) && elapsed < Duration::from_secs(1),
+        "lazy header receive should be bounded by its attempt deadline"
+    );
+    assert!(matches!(
+        listener.accept(),
+        Err(ref error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    drop(post_body);
+    drop(headers);
+    drop(body);
+}
+
+#[test]
 fn tls_ingress_budget_stops_at_limit_without_lookahead() {
     let fixture = tls_fixture();
     let (listener, address) = loopback_listener();
-    let server = serve_gix_responses(listener, Arc::clone(&fixture.server_config), 1);
+    let server = serve_gix_responses(listener, Arc::clone(&fixture.server_config), 1, None);
     let limit = 256;
     let (success, ingress) = run_gix_transfer(
         address,
@@ -697,7 +1307,7 @@ fn tls_ingress_budget_stops_at_limit_without_lookahead() {
 fn rustls_rejects_untrusted_certificate_and_wrong_hostname() {
     let fixture = tls_fixture();
     let (listener, address) = loopback_listener();
-    let server = serve_gix_responses(listener, Arc::clone(&fixture.server_config), 1);
+    let server = serve_gix_responses(listener, Arc::clone(&fixture.server_config), 1, None);
     let empty_roots = rustls::RootCertStore::empty();
     let untrusted_config = Arc::new(
         rustls::ClientConfig::builder()
@@ -713,7 +1323,7 @@ fn rustls_rejects_untrusted_certificate_and_wrong_hostname() {
     );
 
     let (listener, address) = loopback_listener();
-    let server = serve_gix_responses(listener, Arc::clone(&fixture.server_config), 1);
+    let server = serve_gix_responses(listener, Arc::clone(&fixture.server_config), 1, None);
     let (wrong_name_success, _) = run_gix_transfer(
         address,
         Arc::clone(&fixture.trusted_client_config),
