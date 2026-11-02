@@ -30,7 +30,17 @@ sanitized and do not include input URLs, headers, bodies, or credentials.
 
 The synchronous system DNS lookup happens outside a cancellable socket read;
 checking the deadline before and after it does not make DNS itself bounded. A
-production caller must run the attempt in an outer worker with a hard deadline.
+caller can obtain an attempt-scoped, cloneable `CancellationHandle` from
+`GitHubTransport::cancellation_handle()` and cancel the attempt from another
+thread. Cancellation is one-way and affects only that transport attempt. It is
+checked around setup, reads, writes, flushes, buffered response payload access,
+and the lazy POST body wait. Socket I/O and POST waits use timeout slices of at
+most 100 ms to recheck the signal; this is not a hard wall-clock latency bound.
+The synchronous resolver and operating-system connect call are not cancellable
+and have no cancellation latency guarantee. A production caller still needs an
+outer worker with a hard deadline. Cancellation errors use
+`ErrorKind::ConnectionAborted` so standard `read_exact` implementations do not
+silently retry them as transient `Interrupted` errors.
 This crate is an implementation candidate, not a completed Git fetch, M0
 validation, or production-readiness claim. Its fixture endpoint and trust roots
 are private test-only seams.
