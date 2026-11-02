@@ -1,6 +1,6 @@
 # M1C validation — disposable removal lifecycle
 
-Current checkpoint: 0.0.15, 2026-11-02. Batches A–E implement the disposable stage/restore/purge path and native confirmation. The sections below preserve evidence from each batch; their “next batch” statements describe the state at that checkpoint. Controlled-volume free-space measurement and M0/M1B human gates remain open. No supported release or user-file cleanup is enabled.
+Current checkpoint: 0.0.15, 2026-11-02. Batches A–E implement the disposable stage/restore/purge path and native confirmation. The sections below preserve evidence from each batch; their “next batch” statements describe the state at that checkpoint. Controlled-volume product measurement and M0/M1B human gates remain open. The uniquely identified desktop migration pass is recorded below. No supported release or user-file cleanup is enabled.
 
 ## Frontend validation follow-up (0.0.15)
 
@@ -72,3 +72,17 @@ A real child process (`purge_crash_helper`) now proves the contract's subprocess
 On the disposable home, seed reported lifecycle `user_version=1`. Calling the helper's public-service `status` mode migrated that same DB; `verify` then observed version 2, exact equality of every table row and rowid, unchanged fixture bytes/digests, and successful preparation of a restore review from the preserved staged receipt. The helper does not execute the review. Strict Clippy passed and all five migration-probe tests passed.
 
 The Tauri integration result is **inconclusive**. A debug executable was launched with the disposable HOME, but UI automation selected “Disk Steward” by display name, which can resolve the installed bundle rather than that debug process. The UI showed the fixture panel, while the seeded database remained at version 1 afterward. No desktop migration claim is made, and this attempt cannot establish which app-data path the UI read. Code inspection confirms the trigger: `DemoExecutionService::open` initializes control stores but does not reopen the fixture DB; migration occurs when `status()` calls `ready_session()`, reached through `get_fixture_demo_status` when the fixture panel mounts. Repeat against the exact debug process, then require version 2 in the marked HOME before running the verifier. This supersedes the earlier unseeded-startup open-gate note above.
+
+
+## Exact-instance desktop migration — 2026-11-02 (0.0.15)
+
+The external migration harness now uses the fixed identifier `com.disksteward.migration-probe`, matching a probe-local Tauri config override. Production runtime code, startup behavior, renderer commands and the normal app identifier are unchanged. Built a real debug `.app` bundle with unique product name/window title; checked the Info.plist identifier, launched its exact executable under a newly seeded marked HOME, and matched its recorded PID to that executable and open control-store paths using `ps` and `lsof`. CUA inventory showed the unique app running and ordinary Disk Steward stopped; CUA selected only the unique bundle identifier.
+
+The seeded lifecycle DB was v1 before the fixture panel mounted and v2 afterward. The panel showed five fixtures with Compiler output staged. After terminating the exact verified PID, the external verifier passed complete row/rowid equality, unchanged source/holding bytes and SHA-256 digests, and preserved staged-receipt restore-review preparation. Stderr was empty. No helper `status` call migrated the session before verification. This closes the seeded real-desktop status-path migration evidence gap within the isolated probe-build scope; the earlier ambiguous attempt is not reclassified as a pass.
+
+
+## Controlled APFS measurement probe — 2026-11-02
+
+The existing development-only volume probe now requires separate explicit purge authorization before image creation, verifies the staged fixture's regular-file/link-count/device/inode/size identity, preserves signed free-space observations, and rejects both too-small and implausibly large recovery deltas. The image budget is 768 MiB, with a 2 GiB host reserve and a separate 64 MiB margin inside the isolated experiment volume. This margin is not the production free-space policy. Ten unit tests and Ruff pass, including missing-approval/no-create, insufficient volume capacity/no-write, wrong-device/path receipts, failed-detach retention, and noisy/negative recovery refusal.
+
+A live run on a freshly created APFS image passed with a fully allocated random 256 MiB fixture. Stage/restore/restage produced no measured space recovery; after exact-fixture purge the signed free-space delta met the proposed tolerance within the bounded observation window. The exact image was detached and removed, with no matching image left in `hdiutil info`. See the [normalized measurement evidence](../probes/volume/evidence/2026-11-02-macos-arm64.json). This establishes standalone filesystem calibration evidence. Product-adapter observed-space integration, external-volume behavior, and M0/M1B human gates remain open; M1C is not declared complete.

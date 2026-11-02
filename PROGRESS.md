@@ -159,3 +159,8 @@ Autonomous work paused at the requested quota boundary: Codex usage reached76% (
 ## M1C follow-up — 0.0.15
 
 Batches A–E implement selective receipt-based purge, backend-owned approval and native confirmation, conservative cross-store recovery, subprocess persistence tests, and the demo UI. PR15 merged with all five checks passing. Main still needs the D/E integration and the validation follow-up. M1C is not complete: controlled-volume measurement and the seeded real-app migration check remain open; M0 and M1B human/credential gates remain open as recorded in their validation documents. The earlier quota-pause entries are historical; Adrian authorized continued implementation and automatic merging of green PRs on 2026-11-02. No release or user-file cleanup is authorized.
+
+
+## M1C verification probes — 0.0.15, 2026-11-02
+
+PR16 is merged to main. The seeded migration gap is now verified through a uniquely identified real debug app: exact bundle/PID/open-store checks preceded the fixture-panel status request, schema advanced 1→2, and complete row/rowid/fixture-byte/receipt verification passed after that process exited. A standalone controlled APFS measurement run also passed on its own fully allocated 256 MiB fixture; ten probe tests and Ruff cover approval, space-margin, noisy-result and cleanup refusal paths. Evidence and remaining limitations are in docs/M1C-VALIDATION.md. Product-adapter observed-space reporting and human gates remain open. Recurring autonomous continuation is active; no release or user-file cleanup is enabled.

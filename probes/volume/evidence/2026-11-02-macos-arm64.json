@@ -1,0 +1,35 @@
+{
+  "status": "complete",
+  "device": "/dev/disk5s1",
+  "host_free_bytes_before": 5321908224,
+  "volume_free_bytes": {
+    "before": 802140160,
+    "after_fixture": 533700608,
+    "after_stage": 533700608,
+    "after_restore": 533700608,
+    "after_restage": 533700608,
+    "after_purge": 802144256
+  },
+  "signed_recovered_bytes": 268443648,
+  "fixture_bytes": 268435456,
+  "fixture_allocated_bytes": 268435456,
+  "recovery_tolerance_bytes": 26843545,
+  "recovery_observation_seconds": 30,
+  "recovery_meets_tolerance": true,
+  "signed_free_space_delta_bytes": {
+    "after_fixture": -268439552,
+    "after_stage": 0,
+    "after_restore": 0,
+    "after_restage": 0,
+    "after_purge": 268443648,
+    "total_from_initial": 4096
+  },
+  "date": "2026-11-02",
+  "platform": "macOS 27.0 arm64",
+  "method": "shutil.disk_usage free bytes and stat.st_blocks * 512 on fresh owned APFS disk image",
+  "image_budget_bytes": 805306368,
+  "device_receipt_scope": "transient device returned by this run hdiutil attach",
+  "image_detached": true,
+  "temporary_root_removed": true,
+  "scope": "standalone filesystem probe; not product-adapter observed-space reporting"
+}
