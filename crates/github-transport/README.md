@@ -128,3 +128,13 @@ integration still needs to establish response completion before issuing a
 verification receipt. The decoder's fixed 8 KiB payload buffer is independent
 of declared chunk sizes, and its framing bytes remain charged by the socket
 counter beneath TLS.
+
+Prefer `GitHubTransport::observe_refs(self)` for a combined observation. It
+performs bounded `ls-refs` parsing and then explicitly finalizes HTTP framing,
+including after a protocol error. The immutable `RefObservationReport` exposes
+refs only when both stages complete; a valid empty list is `Some(&[])`, while
+incomplete observations have no exposed refs. Protocol error kinds and HTTP
+framing/ingress/error evidence remain separately available. Poisoned evidence
+returns an error. Even a complete ref observation is not object verification,
+a guarantee of future remote retention, or cleanup authority. The low-level
+stages remain available for callers that explicitly assess both outcomes.
