@@ -1,0 +1,2 @@
+# Optional isolated development fixture environment; never an app runtime dependency.
+pytest==9.2.0

@@ -1,6 +1,6 @@
 # Disk Steward implementation roadmap
 
-Status: all milestones **Planned**; application implementation has not started. Concepts use synthetic data. This roadmap authorizes no cleanup, repository changes, remote access, or model requests.
+Status: **M0 In progress; M1A Complete (five-file disposable macOS debug slice)**; M1B In progress; M1C In progress (bounded migration preparation); M2–M6 and post-MVP tracks remain Planned. Work proceeds on stacked feature branches; see [PROGRESS.md](PROGRESS.md). General review plans use synthetic examples and optional blocked selected-item metadata. File operations remain limited to app-created disposable fixtures. This roadmap authorizes no cleanup, repository changes, remote access, or model requests.
 
 ## Delivery approach and forecasting
 
@@ -88,4 +88,4 @@ These are independent prioritizable tracks, outside the initial macOS forecast. 
 
 ## Tracking
 
-Track Planned → In progress → Validation → Complete. Use Blocked for a concrete unresolved dependency. Each checkpoint closes with a demo/build, verification results, supported-scope matrix, known limitations, measured effort and forecast impact. All implementation tasks remain unstarted until separately requested.
+Track Planned → In progress → Validation → Complete. Use Blocked for a concrete unresolved dependency. Each checkpoint closes with a demo/build, verification results, supported-scope matrix, known limitations, measured effort and forecast impact. Implementation is authorized and M0 is in progress; no milestone gate is complete merely because a scaffold exists.

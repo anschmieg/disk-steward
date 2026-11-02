@@ -1,0 +1,33 @@
+fn main() {
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "foundation_status",
+            "check_selected_folder_access",
+            "preview_native_review",
+            "get_example_plan",
+            "edit_example_plan",
+            "freeze_example_review",
+            "preview_saved_example_review",
+            "get_fixture_demo_status",
+            "start_fixture_demo",
+            "prepare_fixture_stage",
+            "prepare_fixture_restore",
+            "request_fixture_execution",
+            "prepare_purge_review",
+            "confirm_purge_execution",
+            "get_general_plan",
+            "edit_general_plan",
+            "undo_general_plan",
+            "redo_general_plan",
+            "freeze_general_review",
+            "get_general_review",
+            "list_general_reviews",
+            "add_selected_general_item",
+            "add_selected_general_folder",
+            "get_exclusion_registry",
+            "add_global_exclusion",
+            "remove_global_exclusion",
+        ]),
+    ))
+    .expect("failed to generate application permission manifest");
+}

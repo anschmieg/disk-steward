@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-example-plan"
+description = "Enables the get_example_plan command without any pre-configured scope."
+commands.allow = ["get_example_plan"]
+
+[[permission]]
+identifier = "deny-get-example-plan"
+description = "Denies the get_example_plan command without any pre-configured scope."
+commands.deny = ["get_example_plan"]

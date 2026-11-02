@@ -1,0 +1,9 @@
+# M1C runtime schema adoption boundary
+
+This isolated branch adopts the reviewed lifecycle schema migration without adding deletion. It follows the five-test migration experiment and proposed purge contract, while keeping the primary0.0.8 checkpoint intact. Runtime migration must preserve old sessions, files, receipts, fixture/attempt rowids and history atomically. Existing stage/restore behavior must continue. Unknown/malformed data is retained and refused; the old schema is not reset.
+
+The trusted lease-owning coordinator opens the session before migration. Reopen uses no-follow database access, verifies exact v1 schema and registered data plus existing directory/session bindings, rebuilds only fixture/attempt CHECK tables under an immediate transaction with explicit rowid/column/order preservation, validates and commits schema2 last. New sessions use schema2. Reserved future purge vocabulary must still be rejected by runtime operation/row validation until a separately reviewed purge API exists. No purge method, native command, unlink, UI change, general-plan authority or actual-space claim is introduced.
+
+Tests use disposable fixtures only: legacy session with empty and stage/restore/restage history, old staged receipt restore after migration, rowid gaps/order, injected rollback, unsupported/tampered schema preservation, fresh schema checks before stage/restore/snapshot, and unchanged files. Current running0.0.7app/user data must not be opened by tests. Actual native startup integration remains a later gate.
+
+Worktree /Users/adrian/Projects/disk-steward-worktrees/m1c-lifecycle-schema, branch feat/m1c-lifecycle-schema baseded49cd8/PR7, matching0.0.9 versions. No release. Keep the batch bounded near the user quota threshold; unfinished work is preserved here without modifying the primary worktree.

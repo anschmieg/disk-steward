@@ -1,0 +1,44 @@
+[package]
+name = "disk-steward-desktop"
+version = "0.0.13"
+description = "Disk Steward desktop application"
+authors = ["Disk Steward"]
+edition = "2021"
+
+[lib]
+name = "disk_steward_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+disk-steward-exclusion-store = { path = "../crates/exclusion-store" }
+disk-steward-plan-model = { path = "../crates/plan-model" }
+disk-steward-plan-store = { path = "../crates/plan-store" }
+disk-steward-core = { path = "../crates/disk-steward-core" }
+disk-steward-review-plan = { path = "../crates/review-plan" }
+disk-steward-demo-execution = { path = "../crates/demo-execution" }
+disk-steward-fixture-purge = { path = "../crates/fixture-purge" }
+serde = { version = "1.0.229", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2.8.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSValue", "NSString", "NSURL"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3.27.0"
+
+# Keep native development artifacts bounded; application line tables remain.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = 0

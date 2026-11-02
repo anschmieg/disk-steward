@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-edit-general-plan"
+description = "Enables the edit_general_plan command without any pre-configured scope."
+commands.allow = ["edit_general_plan"]
+
+[[permission]]
+identifier = "deny-edit-general-plan"
+description = "Denies the edit_general_plan command without any pre-configured scope."
+commands.deny = ["edit_general_plan"]
