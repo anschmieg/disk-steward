@@ -27,6 +27,8 @@ pub enum BlockReason {
     ArithmeticOverflow,
     AttemptTimedOut,
     JobNotRunning,
+    /// A caller could not finish a store operation or observe its outcome.
+    StoreIncomplete,
     CleanupNotPending,
 }
 
@@ -165,6 +167,52 @@ impl BudgetController {
                 };
             }
             return Err(BudgetError::Blocked(reason));
+        }
+        Ok(())
+    }
+
+    /// Check whether a running job may attempt a proposed store growth delta.
+    /// This is advisory only: it reserves no capacity and does not change job
+    /// state or usage. Callers must still account bytes actually observed with
+    /// `record_store`, including partial writes and growth that exceeds limits.
+    /// `free_bytes_before` is the observed free space before the proposed write.
+    pub fn check_store_admission(
+        &self,
+        id: JobId,
+        proposed_growth_delta: u64,
+        free_bytes_before: u64,
+    ) -> Result<(), BudgetError> {
+        let job = self.jobs.get(&id).ok_or(BudgetError::UnknownJob(id))?;
+        if job.state != JobState::Running {
+            return Err(BudgetError::Blocked(BlockReason::JobNotRunning));
+        }
+
+        let repository_next = job
+            .usage
+            .stored_bytes
+            .checked_add(proposed_growth_delta)
+            .ok_or(BudgetError::Blocked(BlockReason::ArithmeticOverflow))?;
+        if repository_next > PER_REPOSITORY_TEMP_LIMIT {
+            return Err(BudgetError::Blocked(BlockReason::RepositoryStorageLimit));
+        }
+
+        let aggregate_before = self.jobs.values().try_fold(0u64, |sum, j| {
+            sum.checked_add(j.usage.stored_bytes)
+                .ok_or(BudgetError::Blocked(BlockReason::ArithmeticOverflow))
+        })?;
+        let aggregate_next = aggregate_before
+            .checked_add(proposed_growth_delta)
+            .ok_or(BudgetError::Blocked(BlockReason::ArithmeticOverflow))?;
+        if aggregate_next > AGGREGATE_STORE_LIMIT {
+            return Err(BudgetError::Blocked(BlockReason::AggregateStorageLimit));
+        }
+
+        let required_free = MINIMUM_FREE_RESERVE
+            .checked_add(self.limits.headroom_bytes)
+            .and_then(|reserve| reserve.checked_add(proposed_growth_delta))
+            .ok_or(BudgetError::Blocked(BlockReason::ArithmeticOverflow))?;
+        if free_bytes_before < required_free {
+            return Err(BudgetError::Blocked(BlockReason::FreeSpaceReserve));
         }
         Ok(())
     }
@@ -448,6 +496,123 @@ mod tests {
             Err(BudgetError::Blocked(BlockReason::FreeSpaceReserve))
         );
         assert_eq!(b.snapshot(id).unwrap().usage.stored_bytes, 77);
+    }
+
+    #[test]
+    fn store_admission_allows_repository_limit_and_accounts_completed_jobs_in_aggregate() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        assert_eq!(
+            b.check_store_admission(id, PER_REPOSITORY_TEMP_LIMIT, u64::MAX),
+            Ok(())
+        );
+        b.record_store(id, PER_REPOSITORY_TEMP_LIMIT, u64::MAX)
+            .unwrap();
+        b.complete(id).unwrap();
+
+        let second = b.start(free()).unwrap();
+        assert_eq!(
+            b.check_store_admission(second, PER_REPOSITORY_TEMP_LIMIT, u64::MAX),
+            Ok(())
+        );
+        b.record_store(second, PER_REPOSITORY_TEMP_LIMIT, u64::MAX)
+            .unwrap();
+        b.complete(second).unwrap();
+
+        let third = b.start(free()).unwrap();
+        assert_eq!(
+            b.check_store_admission(third, 1, free()),
+            Err(BudgetError::Blocked(BlockReason::AggregateStorageLimit))
+        );
+        assert_eq!(b.snapshot(third).unwrap().usage.stored_bytes, 0);
+    }
+
+    #[test]
+    fn store_admission_checks_limits_and_free_space_without_mutation() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        let snapshot = b.snapshot(id).unwrap().clone();
+        let aggregate = b.aggregate_stored().unwrap();
+        assert_eq!(
+            b.check_store_admission(id, PER_REPOSITORY_TEMP_LIMIT + 1, free()),
+            Err(BudgetError::Blocked(BlockReason::RepositoryStorageLimit))
+        );
+        let needed = MINIMUM_FREE_RESERVE + b.limits.headroom_bytes + 77;
+        assert_eq!(b.check_store_admission(id, 77, needed), Ok(()));
+        assert_eq!(
+            b.check_store_admission(id, 77, needed - 1),
+            Err(BudgetError::Blocked(BlockReason::FreeSpaceReserve))
+        );
+        assert_eq!(b.snapshot(id).unwrap(), &snapshot);
+        assert_eq!(b.aggregate_stored().unwrap(), aggregate);
+    }
+
+    #[test]
+    fn store_admission_rejects_overflow_without_mutation() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        b.jobs.get_mut(&id).unwrap().usage.stored_bytes = u64::MAX;
+        let snapshot = b.snapshot(id).unwrap().clone();
+        let aggregate = b.aggregate_stored().unwrap();
+        assert_eq!(
+            b.check_store_admission(id, 1, free()),
+            Err(BudgetError::Blocked(BlockReason::ArithmeticOverflow))
+        );
+        assert_eq!(b.snapshot(id).unwrap(), &snapshot);
+        assert_eq!(b.aggregate_stored().unwrap(), aggregate);
+
+        let mut b = BudgetController::new(Limits { headroom_bytes: 0 });
+        let id = b.start(MINIMUM_FREE_RESERVE).unwrap();
+        b.limits.headroom_bytes = u64::MAX;
+        let snapshot = b.snapshot(id).unwrap().clone();
+        assert_eq!(
+            b.check_store_admission(id, 1, u64::MAX),
+            Err(BudgetError::Blocked(BlockReason::ArithmeticOverflow))
+        );
+        assert_eq!(b.snapshot(id).unwrap(), &snapshot);
+    }
+
+    #[test]
+    fn store_admission_rejects_nonrunning_or_unknown_jobs_without_mutation() {
+        let mut b = controller();
+        let running = b.start(free()).unwrap();
+        let failed = b.start(free()).unwrap_err();
+        assert_eq!(
+            failed,
+            BudgetError::Blocked(BlockReason::AlreadyAtConcurrencyLimit)
+        );
+        b.fail(running, BlockReason::AttemptTimedOut).unwrap();
+        let failed_snapshot = b.snapshot(running).unwrap().clone();
+        assert_eq!(
+            b.check_store_admission(running, 10, free()),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(b.snapshot(running).unwrap(), &failed_snapshot);
+        assert_eq!(
+            b.check_store_admission(JobId(999), 10, free()),
+            Err(BudgetError::UnknownJob(JobId(999)))
+        );
+        assert_eq!(b.snapshot(running).unwrap(), &failed_snapshot);
+
+        b.acknowledge_worker_stopped(running).unwrap();
+        let canceled = b.start(free()).unwrap();
+        b.cancel(canceled).unwrap();
+        let canceled_snapshot = b.snapshot(canceled).unwrap().clone();
+        assert_eq!(
+            b.check_store_admission(canceled, 10, free()),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(b.snapshot(canceled).unwrap(), &canceled_snapshot);
+
+        b.acknowledge_worker_stopped(canceled).unwrap();
+        let completed = b.start(free()).unwrap();
+        b.complete(completed).unwrap();
+        let completed_snapshot = b.snapshot(completed).unwrap().clone();
+        assert_eq!(
+            b.check_store_admission(completed, 10, free()),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(b.snapshot(completed).unwrap(), &completed_snapshot);
     }
 
     #[test]

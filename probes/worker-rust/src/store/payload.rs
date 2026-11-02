@@ -6,6 +6,8 @@ use super::{identity, open_parent, require_entries, validate_private_directory};
 use super::{OwnedStore, Phase, StoreError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{fs::File, io::Write, os::fd::AsFd};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use verification_budget::{BlockReason, BudgetController, Limits};
 
 const NAME: &str = "payload.bin";
 const LIMIT: u64 = 32 * 1024;
@@ -50,9 +52,23 @@ fn write_payload(store: OwnedStore) -> Result<PayloadReport, StoreError> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_payload_with(
     store: OwnedStore,
+    sample_free: impl FnMut(&File) -> Result<u64, StoreError>,
+    write_bytes: impl FnMut(&mut File, &[u8]) -> std::io::Result<()>,
+    sync_file: impl FnOnce(&File) -> std::io::Result<()>,
+) -> Result<PayloadReport, StoreError> {
+    let mut budget = BudgetController::new(Limits {
+        headroom_bytes: RESERVE_HEADROOM,
+    });
+    write_payload_accounted(store, sample_free, write_bytes, sync_file, &mut budget)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_payload_accounted(
+    store: OwnedStore,
     mut sample_free: impl FnMut(&File) -> Result<u64, StoreError>,
     mut write_bytes: impl FnMut(&mut File, &[u8]) -> std::io::Result<()>,
     sync_file: impl FnOnce(&File) -> std::io::Result<()>,
+    budget: &mut BudgetController,
 ) -> Result<PayloadReport, StoreError> {
     use rustix::fs::{openat, OFlags};
 
@@ -60,45 +76,79 @@ fn write_payload_with(
         return Err(StoreError::InvalidJournal);
     }
     validate_store(&store, false, None)?;
-    ensure_space_with(LIMIT, || sample_free(&store.root))?;
-    let fd = openat(
-        &store.root,
-        NAME,
-        OFlags::RDWR
-            | OFlags::CREATE
-            | OFlags::EXCL
-            | OFlags::NOFOLLOW
-            | OFlags::NONBLOCK
-            | OFlags::CLOEXEC,
-        rustix::fs::Mode::from_bits(0o600).unwrap(),
-    )?;
-    let mut payload = File::from(fd);
-    let metadata = payload.metadata()?;
-    validate_payload_metadata(&metadata, None, 0)?;
-    let payload_id = identity(&payload)?;
-    validate_store(&store, true, Some(payload_id))?;
+    let free_before = sample_free(&store.root)?;
+    let job = budget
+        .start(free_before)
+        .map_err(|_| StoreError::InvalidJournal)?;
+    let outcome = (|| {
+        budget
+            .check_store_admission(job, LIMIT, free_before)
+            .map_err(|_| StoreError::InvalidJournal)?;
+        let fd = openat(
+            &store.root,
+            NAME,
+            OFlags::RDWR
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            rustix::fs::Mode::from_bits(0o600).unwrap(),
+        )?;
+        let mut payload = File::from(fd);
+        let metadata = payload.metadata()?;
+        validate_payload_metadata(&metadata, None, 0)?;
+        let payload_id = identity(&payload)?;
+        validate_store(&store, true, Some(payload_id))?;
 
-    let (written, cap_reached) = write_chunks(&mut payload, |file, offset, next| {
+        let (written, cap_reached) = write_chunks(&mut payload, |file, offset, next| {
+            validate_store(&store, true, Some(payload_id))?;
+            let free_before = sample_free(&store.root)?;
+            budget
+                .check_store_admission(job, next as u64, free_before)
+                .map_err(|_| StoreError::InvalidJournal)?;
+            validate_store(&store, true, Some(payload_id))?;
+            validate_named_payload(&store, file, payload_id, offset)?;
+            let mut chunk = [0u8; CHUNK];
+            for (index, byte) in chunk[..next].iter_mut().enumerate() {
+                *byte = (((offset as usize + index) * 31 + 17) % 251 + 1) as u8;
+            }
+            let write_result = write_bytes(file, &chunk[..next]);
+            // Observe and charge even when write_all left only part of this chunk.
+            // An unreadable size leaves an uncertain retained fixture, never cleanup.
+            let actual_size = file.metadata()?.len();
+            let growth = actual_size
+                .checked_sub(offset)
+                .ok_or(StoreError::InvalidIdentity)?;
+            let free_after = sample_free(&store.root);
+            let charge_result =
+                budget.record_store(job, growth, free_after.as_ref().copied().unwrap_or(0));
+            write_result?;
+            free_after?;
+            charge_result.map_err(|_| StoreError::InvalidJournal)?;
+            validate_store(&store, true, Some(payload_id))?;
+            validate_named_payload(&store, file, payload_id, offset + next as u64)?;
+            Ok(())
+        })?;
+        sync_payload(&payload, sync_file)?;
+        store.root.sync_all()?;
         validate_store(&store, true, Some(payload_id))?;
-        ensure_space_with(next as u64, || sample_free(&store.root))?;
-        validate_store(&store, true, Some(payload_id))?;
-        validate_named_payload(&store, file, payload_id, offset)?;
-        let mut chunk = [0u8; CHUNK];
-        for (index, byte) in chunk[..next].iter_mut().enumerate() {
-            *byte = (((offset as usize + index) * 31 + 17) % 251 + 1) as u8;
-        }
-        write_bytes(file, &chunk[..next])?;
-        Ok(())
-    })?;
-    sync_payload(&payload, sync_file)?;
-    store.root.sync_all()?;
-    validate_store(&store, true, Some(payload_id))?;
-    validate_named_payload(&store, &payload, payload_id, written)?;
-    Ok(PayloadReport {
-        written_bytes: written,
-        limit_bytes: LIMIT,
-        cap_reached,
-    })
+        validate_named_payload(&store, &payload, payload_id, written)?;
+        Ok(PayloadReport {
+            written_bytes: written,
+            limit_bytes: LIMIT,
+            cap_reached,
+        })
+    })();
+    if outcome.is_err() {
+        // fail() only accepts Running; an earlier budget failure keeps its reason.
+        let _ = budget.fail(job, BlockReason::StoreIncomplete);
+    } else {
+        budget
+            .complete(job)
+            .map_err(|_| StoreError::InvalidJournal)?;
+    }
+    outcome
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -254,28 +304,10 @@ fn sampled_free_bytes(root: &impl AsFd) -> Result<u64, StoreError> {
     free_bytes(stat.f_bavail, stat.f_frsize)
 }
 
-fn ensure_space_with(
-    next_bytes: u64,
-    sample: impl FnOnce() -> Result<u64, StoreError>,
-) -> Result<(), StoreError> {
-    ensure_free_space(sample()?, next_bytes)
-}
-
 fn free_bytes(available_blocks: u64, fragment_size: u64) -> Result<u64, StoreError> {
     available_blocks
         .checked_mul(fragment_size)
         .ok_or(StoreError::InvalidJournal)
-}
-
-fn ensure_free_space(free: u64, next_bytes: u64) -> Result<(), StoreError> {
-    let required = verification_budget::MINIMUM_FREE_RESERVE
-        .checked_add(RESERVE_HEADROOM)
-        .and_then(|value| value.checked_add(next_bytes))
-        .ok_or(StoreError::InvalidJournal)?;
-    if free < required {
-        return Err(StoreError::InvalidJournal);
-    }
-    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -330,10 +362,104 @@ mod tests {
     }
 
     #[test]
-    fn free_space_arithmetic_refuses_low_space_and_overflow() {
-        let required = verification_budget::MINIMUM_FREE_RESERVE + RESERVE_HEADROOM + LIMIT;
-        assert!(ensure_free_space(required - 1, LIMIT).is_err());
-        assert!(ensure_free_space(required, LIMIT).is_ok());
+    fn partial_writes_remain_charged_and_do_not_authorize_cleanup() {
+        use verification_budget::{JobId, JobState};
+        let store = OwnedStore::create().unwrap();
+        let root = store.root.try_clone().unwrap();
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        let result = write_payload_accounted(
+            store,
+            |_| Ok(u64::MAX),
+            |file, bytes| {
+                file.write_all(&bytes[..2048])?;
+                Err(std::io::Error::other("injected partial write"))
+            },
+            File::sync_all,
+            &mut budget,
+        );
+        assert!(result.is_err());
+        assert_eq!(payload_length(&root), 2048);
+        let job = budget.snapshot(JobId(1)).unwrap();
+        assert_eq!(job.usage.stored_bytes, 2048);
+        assert_eq!(
+            job.state,
+            JobState::Failed {
+                reason: BlockReason::StoreIncomplete,
+                worker_stopped: false
+            }
+        );
+        assert!(budget.confirm_cleanup(JobId(1)).is_err());
+        assert_eq!(budget.aggregate_stored().unwrap(), 2048);
+    }
+
+    #[test]
+    fn postwrite_reserve_failure_charges_growth_and_keeps_first_reason() {
+        use verification_budget::{JobId, JobState};
+        let store = OwnedStore::create().unwrap();
+        let root = store.root.try_clone().unwrap();
+        let mut samples = 0;
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        let result = write_payload_accounted(
+            store,
+            |_| {
+                samples += 1;
+                Ok(if samples <= 2 { u64::MAX } else { 0 })
+            },
+            |file, bytes| file.write_all(bytes),
+            File::sync_all,
+            &mut budget,
+        );
+        assert!(result.is_err());
+        assert_eq!(payload_length(&root), CHUNK as u64);
+        let job = budget.snapshot(JobId(1)).unwrap();
+        assert_eq!(job.usage.stored_bytes, CHUNK as u64);
+        assert_eq!(
+            job.state,
+            JobState::Failed {
+                reason: BlockReason::FreeSpaceReserve,
+                worker_stopped: false
+            }
+        );
+    }
+
+    #[test]
+    fn aggregate_admission_refuses_creation_with_simulated_retained_totals() {
+        use verification_budget::{JobId, PER_REPOSITORY_TEMP_LIMIT};
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        for _ in 0..2 {
+            let id = budget.start(u64::MAX).unwrap();
+            // Model retained stores; this test never writes GiB-sized fixtures.
+            budget
+                .record_store(id, PER_REPOSITORY_TEMP_LIMIT, u64::MAX)
+                .unwrap();
+            budget.complete(id).unwrap();
+        }
+        let store = OwnedStore::create().unwrap();
+        let root = store.root.try_clone().unwrap();
+        let result = write_payload_accounted(
+            store,
+            |_| Ok(u64::MAX),
+            |_, _| panic!("denied admission must not write"),
+            File::sync_all,
+            &mut budget,
+        );
+        assert!(result.is_err());
+        require_entries(&root, &["owner.journal"]).unwrap();
+        assert_eq!(budget.snapshot(JobId(3)).unwrap().usage.stored_bytes, 0);
+        assert_eq!(
+            budget.aggregate_stored().unwrap(),
+            2 * PER_REPOSITORY_TEMP_LIMIT
+        );
+    }
+
+    #[test]
+    fn free_space_multiplication_refuses_overflow() {
         assert!(free_bytes(u64::MAX, 2).is_err());
     }
 
