@@ -95,3 +95,16 @@ An early handshake return fails rather than being hidden by a server join.
 This proves outer termination of this blocked local gix read. It does not
 integrate the separate store worker, exercise DNS/TLS or credentials, establish
 an OS kill/wait latency guarantee, or complete the production transport gate.
+
+Local credential-injection fixtures exercise gix's `set_identity` directly:
+GET and POST must carry exactly one expected Authorization header for an
+explicit synthetic account, anonymous requests must carry none, and a 401 must
+remain a failed handshake. Assertions expose only boolean observations, not
+account/header contents. A separate test requires gix to refuse credentials
+on an `http://` logical URL before invoking its backend. The authenticated
+fixture uses an HTTPS-labelled logical URL routed by the test backend to plain
+IPv4 loopback; this tests gix header construction and policy, not TLS. No
+credential helper, environment credential, Keychain item or real token is
+consulted by these fixtures. This does not prove production credential broker
+integration, secure memory lifetime/zeroization, private GitHub access or
+revocation behavior.

@@ -496,6 +496,248 @@ fn listener() -> (TcpListener, SocketAddr) {
     (listener, address)
 }
 
+fn serve_auth_fixture(
+    listener: TcpListener,
+    expected_authorization: Option<&'static [u8]>,
+    status: u16,
+) -> thread::JoinHandle<Vec<bool>> {
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observations = Vec::new();
+        let request_count = if status == 401 { 1 } else { 2 };
+        for index in 0..request_count {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => return observations,
+                }
+            };
+            let _ = stream.set_write_timeout(Some(IO_SLICE_TIMEOUT));
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                if Instant::now() >= deadline || request.len() >= HEADER_LIMIT {
+                    return observations;
+                }
+                let timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(IO_SLICE_TIMEOUT);
+                if stream.set_read_timeout(Some(timeout)).is_err() {
+                    return observations;
+                }
+                match stream.read(&mut byte) {
+                    Ok(0) => return observations,
+                    Ok(_) => {
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) && Instant::now() < deadline =>
+                    {
+                        continue;
+                    }
+                    Err(_) => return observations,
+                }
+            }
+
+            let method_ok = if index == 0 {
+                request.starts_with(b"GET /info/refs?service=git-upload-pack HTTP/1.1\r\n")
+            } else {
+                request.starts_with(b"POST /git-upload-pack HTTP/1.1\r\n")
+            };
+            let mut authorization_count = 0usize;
+            let mut authorization_matches = true;
+            for line in request.split(|byte| *byte == b'\n') {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                if let Some(separator) = line.iter().position(|byte| *byte == b':') {
+                    let (name, rest) = line.split_at(separator);
+                    let value = &rest[1..];
+                    if name.eq_ignore_ascii_case(b"authorization") {
+                        authorization_count += 1;
+                        let value = value.strip_prefix(b" ").unwrap_or(value);
+                        authorization_matches &=
+                            expected_authorization.is_some_and(|expected| value == expected);
+                    }
+                }
+            }
+            observations.push(
+                method_ok
+                    && (authorization_count == usize::from(expected_authorization.is_some()))
+                    && authorization_matches,
+            );
+
+            let reply = if status == 401 {
+                b"HTTP/1.1 401 Synthetic\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            } else if index == 0 {
+                response(
+                    200,
+                    "application/x-git-upload-pack-advertisement",
+                    &crate::http::v2_advertisement(),
+                )
+            } else {
+                response(
+                    200,
+                    "application/x-git-upload-pack-result",
+                    &crate::http::synthetic_pack_response(),
+                )
+            };
+            if write_all_until(&mut stream, &reply, deadline).is_err() {
+                return observations;
+            }
+            let _ = stream.shutdown(Shutdown::Both);
+            if status == 401 {
+                let retry_deadline = Instant::now() + Duration::from_millis(100);
+                loop {
+                    match listener.accept() {
+                        Ok(_) => {
+                            observations.push(false);
+                            break;
+                        }
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < retry_deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        _ => break,
+                    }
+                }
+                return observations;
+            }
+        }
+        observations
+    })
+}
+
+fn run_auth_fixture(
+    account: Option<gix_transport::client::Account>,
+    status: u16,
+) -> (bool, Vec<bool>) {
+    use gix_transport::{
+        client::blocking_io::Transport as _,
+        client::{MessageKind, TransportWithoutIO, WriteMode},
+        Protocol, Service,
+    };
+
+    let (listener, address) = listener();
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking auth fixture listener");
+    let expected = account
+        .as_ref()
+        .map(|_| &b"Basic Zml4dHVyZS11c2VyOmZpeHR1cmUtaW52YWxpZC10b2tlbg=="[..]);
+    let server = serve_auth_fixture(listener, expected, status);
+    let client = SocketHttp::new(address, 4096, Duration::from_secs(2));
+    let url = gix_url::parse("https://fixture.invalid/synthetic.git").expect("fixture URL");
+    let mut transport = gix_transport::client::blocking_io::http::Transport::new_http(
+        client,
+        url,
+        Protocol::V2,
+        false,
+    );
+    let identity_ok = match account {
+        Some(account) => transport.set_identity(account).is_ok(),
+        None => true,
+    };
+    let handshake_ok = identity_ok && transport.handshake(Service::UploadPack, &[]).is_ok();
+    let mut operation_ok = handshake_ok;
+    if operation_ok && status != 401 {
+        operation_ok = match transport.request(WriteMode::Binary, MessageKind::Flush, false) {
+            Ok(request) => match request.into_read() {
+                Ok(mut body) => body.read_to_end(&mut Vec::new()).is_ok(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+    }
+    let observations = server.join().expect("auth fixture server joined");
+    (operation_ok, observations)
+}
+
+#[test]
+fn app_supplied_synthetic_identity_reaches_gix_get_and_post_only() {
+    let account = gix_transport::client::Account {
+        username: "fixture-user".into(),
+        password: "fixture-invalid-token".into(),
+        oauth_refresh_token: None,
+    };
+    let (operation_ok, observations) = run_auth_fixture(Some(account), 200);
+    assert!(
+        operation_ok,
+        "synthetic gix fixture transfer should succeed"
+    );
+    assert_eq!(
+        observations,
+        [true, true],
+        "GET and POST auth checks failed"
+    );
+}
+
+#[test]
+fn anonymous_gix_get_and_post_have_no_authorization_header() {
+    let (operation_ok, observations) = run_auth_fixture(None, 200);
+    assert!(
+        operation_ok,
+        "anonymous gix fixture transfer should succeed"
+    );
+    assert_eq!(observations, [true, true], "anonymous header checks failed");
+}
+
+#[test]
+fn rejected_synthetic_identity_fails_at_gix_handshake_without_retry() {
+    let account = gix_transport::client::Account {
+        username: "fixture-user".into(),
+        password: "fixture-invalid-token".into(),
+        oauth_refresh_token: None,
+    };
+    let (operation_ok, observations) = run_auth_fixture(Some(account), 401);
+    assert!(!operation_ok, "synthetic 401 must fail the gix handshake");
+    assert_eq!(observations, [true], "401 request check failed or retried");
+}
+
+#[test]
+fn gix_refuses_identity_on_http_before_backend_request() {
+    use gix_transport::{client::blocking_io::Transport as _, client::TransportWithoutIO, Service};
+
+    let fixture = crate::http::FixtureHttp::new([]);
+    let requests = fixture.request_log();
+    let transport_http = crate::http::BudgetedHttp::new(fixture, 4096);
+    let url = gix_url::parse("http://fixture.invalid/synthetic.git").expect("fixture URL");
+    let mut transport = gix_transport::client::blocking_io::http::Transport::new_http(
+        transport_http,
+        url,
+        gix_transport::Protocol::V2,
+        false,
+    );
+    transport
+        .set_identity(gix_transport::client::Account {
+            username: "fixture-user".into(),
+            password: "fixture-invalid-token".into(),
+            oauth_refresh_token: None,
+        })
+        .expect("install synthetic identity");
+
+    let refused = matches!(
+        transport.handshake(Service::UploadPack, &[]),
+        Err(gix_transport::client::Error::AuthenticationRefused(_))
+    );
+    let request_count = requests.lock().expect("fixture request log").len();
+    assert!(refused, "gix should refuse credentials over HTTP");
+    assert_eq!(request_count, 0, "backend must see no request");
+}
+
 /// Child-only exact test selected by `outer_worker_deadline_kills_blocked_gix_handshake`.
 /// It intentionally keeps the server socket open without a response so the
 /// real gix handshake remains blocked until its long inner deadline.
