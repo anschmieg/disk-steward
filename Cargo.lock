@@ -355,6 +355,7 @@ name = "disk-steward-worker-probe"
 version = "0.0.17"
 dependencies = [
  "rustix",
+ "verification-budget",
  "verification-store-registry",
 ]
 

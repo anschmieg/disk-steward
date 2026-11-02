@@ -1,5 +1,8 @@
 //! Private, app-created Git-worker store fixture with bounded live cleanup.
 
+#[path = "store/payload.rs"]
+mod payload;
+
 use std::{
     fs::File,
     io::{Read, Seek, Write},
