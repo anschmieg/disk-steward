@@ -487,6 +487,7 @@ dependencies = [
  "gix-url",
  "gix-validate",
  "rcgen",
+ "rustix",
  "rustls",
  "verification-budget",
  "webpki-roots",
