@@ -117,6 +117,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [flag] if flag == "--run-store-worker" => run_store_worker(),
+        [flag] if flag == "--run-store-reinspect" => run_store_reinspect(),
         [flag, confirm] if flag == "--run-store-cleanup" && confirm == "--confirm-own-store-cleanup" => run_store_worker_with_cleanup(true),
         [flag] if flag == "--run-store-cleanup" => Err("refusing store cleanup without --confirm-own-store-cleanup".into()),
         [flag] if flag == "--run" => {
@@ -149,7 +150,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, --run-store-worker, or --run-store-cleanup --confirm-own-store-cleanup".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-worker, --run-store-reinspect, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
 }
 
@@ -273,8 +274,138 @@ fn run_child(args: &[String]) -> Result<(), String> {
             thread::sleep(CHILD_HOLD);
             Ok(())
         }
+        [mode] if mode == "store-abandon" => run_store_abandon_child(),
         _ => Err("invalid private child mode".into()),
     }
+}
+
+fn run_store_abandon_child() -> Result<(), String> {
+    let mut store = store::OwnedStore::create().map_err(|e| e.to_string())?;
+    let pid = std::process::id();
+    store.bind_worker(pid).map_err(|e| e.to_string())?;
+    let record = store.abandon_record(pid).map_err(|e| e.to_string())?;
+    let mut out = io::stdout().lock();
+    out.write_all(record.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| e.to_string())?;
+    std::process::exit(86)
+}
+
+fn run_store_reinspect() -> Result<(), String> {
+    let start = Instant::now();
+    let deadline = start + OUTER_DEADLINE;
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let mut child = Command::new(exe)
+        .arg("--child")
+        .arg("store-abandon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let pid = child.id();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let stopped = stop_and_reap(&mut child);
+            return Err(format!("child stdout unavailable; stop/reap={stopped:?}"));
+        }
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    let reader = thread::Builder::new()
+        .name("abandoned-store-record".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout.take(1025).read_to_end(&mut bytes);
+            let _ = tx.send((bytes, result.is_err()));
+        });
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(e) => {
+            let stopped = stop_and_reap(&mut child);
+            return Err(format!("start record reader: {e}; stop/reap={stopped:?}"));
+        }
+    };
+    let record = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let capture_expired = Instant::now() >= deadline;
+    let stopped = stop_and_reap(&mut child);
+    let joined = reader.join().is_ok();
+    if stopped.is_err() || !joined {
+        return Err(format!(
+            "creator shutdown unconfirmed: {stopped:?}; reader_joined={joined}"
+        ));
+    }
+    let waited = child
+        .try_wait()
+        .map_err(|e| format!("confirm creator exit: {e}"))?
+        .ok_or_else(|| "creator exit missing after wait".to_string())?;
+    if capture_expired {
+        return Err("creator record capture exceeded deadline; fixture retained".into());
+    }
+    let (bytes, failed) =
+        record.map_err(|e| format!("creator record unavailable before deadline: {e}"))?;
+    if failed || bytes.is_empty() || bytes.len() > 1024 {
+        return Err("invalid or oversized child record".into());
+    }
+    let snapshot = parse_abandoned_record(&bytes)?;
+    if snapshot.bound_pid != pid {
+        return Err("child record PID mismatch".into());
+    }
+    // A complete validated record plus confirmed wait is sufficient even if the OS reports a signal.
+    let state = store::OwnedStore::inspect_abandoned(&snapshot)
+        .map_err(|e| format!("read-only store inspection refused: {e}"))?;
+    println!("store_state={state:?} token={} creator_stopped=true cleanup=not_authorized child_exit={waited} reader_joined=true process_death_not_power_loss=true", snapshot.token);
+    Ok(())
+}
+
+fn parse_abandoned_record(bytes: &[u8]) -> Result<store::AbandonedSnapshot, String> {
+    if bytes.len() > 1024 {
+        return Err("record exceeds limit".into());
+    }
+    let s = std::str::from_utf8(bytes).map_err(|_| "record is not ASCII")?;
+    if !s.is_ascii() || !s.ends_with('\n') {
+        return Err("malformed record".into());
+    }
+    let lines: Vec<&str> = s[..s.len() - 1].split('\n').collect();
+    if lines.len() != 7 || lines[0] != "v1" {
+        return Err("unsupported record shape or version".into());
+    }
+    let token = lines[1];
+    if !store::valid_token(token) {
+        return Err("invalid token".into());
+    }
+    fn number(s: &str) -> Result<u64, String> {
+        if s.is_empty()
+            || !s.bytes().all(|b| b.is_ascii_digit())
+            || (s.len() > 1 && s.starts_with('0'))
+        {
+            return Err("noncanonical number".into());
+        }
+        s.parse().map_err(|_| "number overflow".into())
+    }
+    fn pair(s: &str) -> Result<(u64, u64), String> {
+        let (a, b) = s.split_once(':').ok_or("bad identity")?;
+        Ok((number(a)?, number(b)?))
+    }
+    let parent_id = pair(lines[2])?;
+    let root_id = pair(lines[3])?;
+    let journal_id = pair(lines[4])?;
+    let bound_pid = u32::try_from(number(lines[5])?).map_err(|_| "bad PID")?;
+    if bound_pid == 0 {
+        return Err("bad PID".into());
+    }
+    // Extra line is not accepted; legacy shape reserves line 6 only if exact sentinel.
+    if lines[6] != "end" {
+        return Err("malformed record terminator".into());
+    }
+    Ok(store::AbandonedSnapshot {
+        token: token.to_owned(),
+        parent_id,
+        root_id,
+        journal_id,
+        bound_pid,
+        version: 1,
+    })
 }
 
 fn supervise(case: Case) -> Result<Report, String> {
@@ -541,5 +672,39 @@ mod store_worker_tests {
         second
             .record_stopped(&StopReceipt::confirmed(second.token(), 41))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod abandon_record_tests {
+    use super::parse_abandoned_record;
+    const VALID: &[u8] = b"v1\na1-b2-c3\n1:2\n3:4\n5:6\n7\nend\n";
+    #[test]
+    fn accepts_closed_record_shape() {
+        assert_eq!(parse_abandoned_record(VALID).unwrap().bound_pid, 7);
+    }
+    #[test]
+    fn rejects_traversal_overflow_oversize_and_future_version() {
+        let valid = std::str::from_utf8(VALID).unwrap();
+        for (original, replacement) in [
+            ("a1-b2-c3", "../x"),
+            ("a1-b2-c3", "a--c"),
+            ("a1-b2-c3", "A1-b2-c3"),
+            ("a1-b2-c3", "a1-b2"),
+            ("1:2", "18446744073709551616:2"),
+            ("1:2", "+1:2"),
+            ("1:2", "01:2"),
+            ("\n7\n", "\n4294967296\n"),
+            ("\n7\n", "\n0\n"),
+            ("v1\n", "v2\n"),
+            ("end\n", "end\nextra\n"),
+        ] {
+            let bad = valid.replace(original, replacement);
+            assert!(
+                parse_abandoned_record(bad.as_bytes()).is_err(),
+                "{replacement}"
+            );
+        }
+        assert!(parse_abandoned_record(&vec![b'a'; 1025]).is_err());
     }
 }
