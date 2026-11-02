@@ -1,5 +1,4 @@
-//! Private, app-created Git-worker store skeleton. This module deliberately
-//! has no cleanup operation: an interrupted store is reconciliation-only.
+//! Private, app-created Git-worker store fixture with bounded live cleanup.
 
 use std::{
     fs::File,
@@ -65,6 +64,9 @@ pub struct OwnedStore {
     journal_id: Option<(u64, u64)>,
     phase: Phase,
     poisoned: bool,
+    cleanup_started: bool,
+    #[cfg(test)]
+    fail_after_marker_unlink: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +169,150 @@ impl OwnedStore {
             return Err(StoreError::InvalidJournal);
         }
         self.update_journal(Phase::Stopped(pid))
+    }
+
+    /// Remove only this fixture's recorded marker and fixed store directory.
+    /// The retained parent journal makes the operation explicitly one-way.
+    pub fn cleanup_after_stopped(
+        &mut self,
+        receipt: &crate::StopReceipt,
+    ) -> Result<(), StoreError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if self.poisoned
+                || self.cleanup_started
+                || self.phase != Phase::Stopped(receipt.pid())
+                || receipt.token() != self.token
+                || receipt.pid() == 0
+            {
+                return Err(StoreError::InvalidJournal);
+            }
+            self.cleanup_started = true;
+            let result = self.cleanup_supported(receipt.pid());
+            if result.is_err() {
+                self.poisoned = true;
+            }
+            result
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = receipt;
+            Err(StoreError::UnsupportedPlatform)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cleanup_supported(&mut self, pid: u32) -> Result<(), StoreError> {
+        use rustix::fs::{openat, unlinkat, AtFlags, OFlags};
+        let named_parent = open_parent(&self.parent_path)?;
+        if identity(&named_parent)? != self.parent_id {
+            return Err(StoreError::InvalidIdentity);
+        }
+        let parent = &self.parent;
+        if identity(parent)? != self.parent_id || identity(&self.root)? != self.root_id {
+            return Err(StoreError::InvalidIdentity);
+        }
+        validate_private_directory(parent)?;
+        validate_private_directory(&self.root)?;
+        let named_root = openat(
+            parent,
+            &self.name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        if identity(&named_root)? != self.root_id {
+            return Err(StoreError::InvalidIdentity);
+        }
+        let marker = openat(
+            &self.root,
+            "owner.journal",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )?;
+        let marker = File::from(marker);
+        let metadata = marker.metadata()?;
+        use std::os::unix::fs::MetadataExt;
+        let marker_id = (metadata.dev(), metadata.ino());
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || Some(marker_id) != self.journal_id
+        {
+            return Err(StoreError::InvalidJournal);
+        }
+        let mut contents = Vec::new();
+        marker.take(512).read_to_end(&mut contents)?;
+        if contents != self.journal_contents().as_bytes() {
+            return Err(StoreError::InvalidJournal);
+        }
+        require_entries(&self.root, &["owner.journal"])?;
+        require_entries(parent, &["store"])?;
+
+        let intent = openat(
+            parent,
+            "cleanup.journal",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::from_bits(0o600).unwrap(),
+        )?;
+        let mut intent = File::from(intent);
+        let pending = format!(
+            "disk-steward-cleanup-v1\n{}\n{}:{}\n{}:{}\n{}\npending\n",
+            self.token, self.parent_id.0, self.parent_id.1, self.root_id.0, self.root_id.1, pid
+        );
+        intent.write_all(pending.as_bytes())?;
+        intent.sync_all()?;
+        parent.sync_all()?;
+
+        // Recheck named identities immediately before each unlink.
+        let marker_check = openat(
+            &self.root,
+            "owner.journal",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )?;
+        let mut marker_check = File::from(marker_check);
+        let mut rechecked = Vec::new();
+        Read::by_ref(&mut marker_check)
+            .take(512)
+            .read_to_end(&mut rechecked)?;
+        if rechecked != self.journal_contents().as_bytes() {
+            return Err(StoreError::InvalidJournal);
+        }
+        require_entries(&self.root, &["owner.journal"])?;
+        require_entries(parent, &["store", "cleanup.journal"])?;
+        if identity(&marker_check)? != marker_id
+            || identity(parent)? != self.parent_id
+            || identity(&self.root)? != self.root_id
+        {
+            return Err(StoreError::InvalidIdentity);
+        }
+        unlinkat(&self.root, "owner.journal", AtFlags::empty())?;
+        self.root.sync_all()?;
+        #[cfg(test)]
+        if self.fail_after_marker_unlink {
+            return Err(StoreError::InvalidJournal);
+        }
+        let root_check = openat(
+            parent,
+            &self.name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        if identity(&root_check)? != self.root_id {
+            return Err(StoreError::InvalidIdentity);
+        }
+        require_entries(&self.root, &[])?;
+        unlinkat(parent, &self.name, AtFlags::REMOVEDIR)?;
+        parent.sync_all()?;
+        let completed = pending.replace("pending\n", "completed\n");
+        intent.set_len(0)?;
+        use std::io::Seek;
+        intent.rewind()?;
+        intent.write_all(completed.as_bytes())?;
+        intent.sync_all()?;
+        parent.sync_all()?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -313,6 +459,9 @@ fn create_supported() -> Result<OwnedStore, StoreError> {
         journal_id,
         phase: Phase::Created,
         poisoned: false,
+        cleanup_started: false,
+        #[cfg(test)]
+        fail_after_marker_unlink: false,
     })
 }
 
@@ -323,6 +472,33 @@ fn validate_private_directory(fd: &impl std::os::fd::AsFd) -> Result<(), StoreEr
         return Err(StoreError::InvalidIdentity);
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn require_entries(fd: &impl std::os::fd::AsFd, expected: &[&str]) -> Result<(), StoreError> {
+    let mut seen = vec![false; expected.len()];
+    for entry in rustix::fs::Dir::read_from(fd)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let Some(index) = expected
+            .iter()
+            .position(|expected| expected.as_bytes() == name)
+        else {
+            return Err(StoreError::InvalidJournal);
+        };
+        if seen[index] {
+            return Err(StoreError::InvalidJournal);
+        }
+        seen[index] = true;
+    }
+    if seen.iter().all(|seen| *seen) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidJournal)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -344,6 +520,7 @@ fn identity(fd: &impl std::os::fd::AsFd) -> Result<(u64, u64), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StopReceipt;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -476,5 +653,126 @@ mod tests {
         assert!(store.bind_worker(41).is_err());
         assert_eq!(std::fs::read(path).unwrap(), expected);
         assert_eq!(std::fs::read(root.join("saved.journal")).unwrap(), expected);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn stopped_owned_store_cleanup_removes_only_root_and_retains_completed_parent_journal() {
+        let mut store = OwnedStore::create().unwrap();
+        store.bind_worker(41).unwrap();
+        let receipt = StopReceipt::confirmed(store.token(), 41);
+        store.record_stopped(&receipt).unwrap();
+        let parent = store.parent_path.clone();
+        let root = parent.join("store");
+        store.cleanup_after_stopped(&receipt).unwrap();
+        assert!(!root.exists());
+        let record = std::fs::read_to_string(parent.join("cleanup.journal")).unwrap();
+        assert!(record.ends_with("completed\n"));
+        assert!(record.contains(store.token()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cleanup_refuses_unknown_root_entry_without_mutation() {
+        let mut store = OwnedStore::create().unwrap();
+        store.bind_worker(41).unwrap();
+        let receipt = StopReceipt::confirmed(store.token(), 41);
+        store.record_stopped(&receipt).unwrap();
+        let unknown = store.parent_path.join("store/unknown");
+        std::fs::write(&unknown, b"keep").unwrap();
+        assert!(store.cleanup_after_stopped(&receipt).is_err());
+        assert!(unknown.exists());
+        assert!(!store.parent_path.join("cleanup.journal").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cleanup_refuses_unknown_parent_entry_without_mutation() {
+        let mut store = OwnedStore::create().unwrap();
+        store.bind_worker(41).unwrap();
+        let receipt = StopReceipt::confirmed(store.token(), 41);
+        store.record_stopped(&receipt).unwrap();
+        let unknown = store.parent_path.join("keep");
+        std::fs::write(&unknown, b"keep").unwrap();
+        assert!(store.cleanup_after_stopped(&receipt).is_err());
+        assert!(unknown.exists());
+        assert!(store.parent_path.join("store/owner.journal").exists());
+        assert!(!store.parent_path.join("cleanup.journal").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cleanup_refuses_before_stopped_phase_and_with_replaced_or_symlink_marker() {
+        let mut prebound = OwnedStore::create().unwrap();
+        prebound.bind_worker(41).unwrap();
+        let receipt = StopReceipt::confirmed(prebound.token(), 41);
+        assert!(prebound.cleanup_after_stopped(&receipt).is_err());
+        assert!(prebound.parent_path.join("store/owner.journal").exists());
+        assert!(!prebound.parent_path.join("cleanup.journal").exists());
+
+        for symlink in [false, true] {
+            let mut store = OwnedStore::create().unwrap();
+            store.bind_worker(41).unwrap();
+            let receipt = StopReceipt::confirmed(store.token(), 41);
+            store.record_stopped(&receipt).unwrap();
+            let root = store.parent_path.join("store");
+            let marker = root.join("owner.journal");
+            let saved = root.join("saved.journal");
+            std::fs::rename(&marker, &saved).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink("saved.journal", &marker).unwrap();
+            } else {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut replacement = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&marker)
+                    .unwrap();
+                replacement
+                    .write_all(&std::fs::read(&saved).unwrap())
+                    .unwrap();
+            }
+            assert!(store.cleanup_after_stopped(&receipt).is_err());
+            assert!(saved.exists());
+            assert!(marker.exists());
+            assert!(!store.parent_path.join("cleanup.journal").exists());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cleanup_refuses_wrong_receipt_and_replay() {
+        let mut store = OwnedStore::create().unwrap();
+        let wrong = StopReceipt::confirmed("wrong-token", 41);
+        assert!(store.cleanup_after_stopped(&wrong).is_err());
+        store.bind_worker(41).unwrap();
+        let receipt = StopReceipt::confirmed(store.token(), 41);
+        store.record_stopped(&receipt).unwrap();
+        assert!(store.cleanup_after_stopped(&wrong).is_err());
+        let wrong_pid = StopReceipt::confirmed(store.token(), 42);
+        assert!(store.cleanup_after_stopped(&wrong_pid).is_err());
+        assert!(!store.parent_path.join("cleanup.journal").exists());
+        store.cleanup_after_stopped(&receipt).unwrap();
+        assert!(store.cleanup_after_stopped(&receipt).is_err());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn partial_cleanup_retains_pending_intent_and_refuses_retry() {
+        let mut store = OwnedStore::create().unwrap();
+        store.bind_worker(41).unwrap();
+        let receipt = StopReceipt::confirmed(store.token(), 41);
+        store.record_stopped(&receipt).unwrap();
+        store.fail_after_marker_unlink = true;
+        assert!(store.cleanup_after_stopped(&receipt).is_err());
+        assert!(store.parent_path.join("store").is_dir());
+        assert!(!store.parent_path.join("store/owner.journal").exists());
+        let path = store.parent_path.join("cleanup.journal");
+        let pending = std::fs::read(&path).unwrap();
+        assert!(pending.ends_with(b"pending\n"));
+        store.fail_after_marker_unlink = false;
+        assert!(store.cleanup_after_stopped(&receipt).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), pending);
+        assert!(store.parent_path.join("store").is_dir());
     }
 }

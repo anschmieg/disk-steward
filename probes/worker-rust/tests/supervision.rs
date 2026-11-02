@@ -77,6 +77,7 @@ fn private_dispatcher_rejects_unknown_modes_and_extra_arguments() {
         vec!["--child", "stall", "unexpected"],
         vec!["--run", "unexpected"],
         vec!["--run-store-worker", "unexpected"],
+        vec!["--run-store-cleanup"],
     ] {
         let output = probe()
             .args(&args)
@@ -85,4 +86,35 @@ fn private_dispatcher_rejects_unknown_modes_and_extra_arguments() {
         assert!(!output.status.success(), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
     }
+}
+
+#[test]
+fn cleanup_requires_both_exact_confirmation_arguments_without_starting_work() {
+    let output = probe()
+        .arg("--run-store-cleanup")
+        .output()
+        .expect("reject unconfirmed cleanup");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing store cleanup"));
+}
+
+#[test]
+fn explicitly_confirmed_cleanup_uses_real_child_shutdown() {
+    let output = probe()
+        .args(["--run-store-cleanup", "--confirm-own-store-cleanup"])
+        .output()
+        .expect("run confirmed own-fixture cleanup");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert!(report.contains("store_removed=true"), "{report}");
+    assert!(
+        report.contains("retained_parent_journal=cleanup.journal"),
+        "{report}"
+    );
+    assert!(report.contains("worker_pid="), "{report}");
 }
