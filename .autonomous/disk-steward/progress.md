@@ -505,3 +505,50 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-02 WIP test/m0-blocked-pack-sink-deadline atop558884fb7/mainb51a2df: actualgit/worktrees/localnotes preserved/host8.2GiBfree/noactivebuilders. RevisitedROADMAP/resource5minattempt/workerstopcontract; actualpackfilesinkintegrationstillrequiresouterworker forblockingWrite. NextclosedproofactualcandidateprivateTLS→memorysinkacceptedPACK4→cancel+blockedsecondwrite; exactchildparentdeadlinekillreapreaderjoin. Luna pack_testschild+parentonly/rootsharedsupervisorrefactor/docs/reviewbeforeexecution. No files/newCLI/renderer/liveGitHub/cleanupauthority, productionworker/store/OSlatency/durability/human/M0gatesopen; existing45–55watchesnotpolled/nooverlappingbuilds/automationenabled.
 
 2026-11-02 test/m0-blocked-pack-sink-deadline atop558884fb7: boundedLuna child+parenttest/rootsharedsupervisorrefactor+concretereview. ActualcandidateprivateTLSdiscovery/lsrefs/fetch entersmemorysink: acceptsPACK4, verifiesnextwritefixturetail, sets+assertscooperativecancel beforefixedreadinessmarker thenparksindefinitely. Parentexactignoredchild remainsliveblockedthrough3secdeadline, kill/waitreap/bounded1024bytestdoutreaderjoin allbeforeassertions. SharedexistingGETsupervisionhelperstillpasses; no newproductionAPI/files/CLI/userpaths/remote/subprocessdescendants. FocusedproofPASS3.00sec; full82testsPASS+2ignoredexactchildentries eachinvokedbyparent, strictClippy/fmt/version0.0.17/diffPASS; host8.3GiBfree/CARGO_INCREMENTAL=0/nooverlappingbuilds/nocachecleanup. This is testprocesssupervision evidence only, notOSkilllatency/durableproductionworkerstore/powerloss/privateauth/human/M0pass. Priorlocalnotificationspreserved; existing45–55watchesnotpolled/automationenabled/currentheadCIrequired.
+2026-11-02 PR35mergedtomain8a2a4f516d7ae39aedb2f212d4331e431bfe00b8 afterhead174a2edfourbuild/testjobsSUCCESS/noinlinefindings(botquota/guide/SourcerySKIPPEDnotapproval). Unwatched35/retargeted36main. Integratedmaininto36; progress/READMEappend-onlysquashconflictsresolvedretainingHEADsupersetaftercomparison, noimplementationdiff. DiffcheckPASS, prior25transporttestsunchanged; new36headrequiresCI/existingwatchactive. PR37/38andstashedcheckpointpreserved; automationenabled.
+
+2026-11-02 PR36mergedtomainf7a5991a544dba37bcd41932b301384dadb014b0 afterhead2031069fourbuild/testjobsSUCCESS/noinlinefindings(botquota/guide/SourcerySKIPPEDnotapproval). Unwatched36/retargeted37main. Integratedmaininto37; additivePOSTsource/README/progresssquashconflictsresolvedretainingreviewed37implementationandallmainprogressentries. Stageddiffonlyprogress(noimplementationchange); diffcheckPASS/prior29transporttestsunchanged, new37headCIrequired/existingwatchactive. PR38/39andstashedcheckpointpreserved; automationenabled.
+
+2026-11-02 PR38conflictwake: integrated37headc335a6e/mainf7a5991baseline; ONLYappend-onlyprogressconflict, bothhistoriesretained/noimplementationchanges. DiffcheckPASS/prior37workertestsunchanged; fresh38headCIrequired/existingwatchactive. PR39/40preserved; automationenabled.
+
+2026-11-02 PR37mergedtomainc91bce9578b2003d4af13595705de96d0a265bbd afterheadc335a6efourbuild/testjobsSUCCESS/noinlinefindings(botquota/guide/SourcerySKIPPEDnotapproval). Unwatched37/retargeted38main. Integratedmaininto38; ONLYprogresssquashconflictresolvedretainingHEADsupersetaftercomparison(allmainentriespresent), noimplementationchanges. DiffcheckPASS/prior37workertestsunchanged; new38headCIrequired/existingwatchactive. PR39/40andstashedlocalcheckpointpreserved; automationenabled.
+
+2026-11-02 PR39parentconflictwake: integrated38headb14b765/mainc91bce9 baseline; only append-only progress conflict, both histories retained. No implementation changes; staged diff verified progress-only and diffcheck PASS, prior55 focused tests unchanged. New39head requires current-headCI before merge; existing watch persists. Current45/local40review checkpoint stashed safely for restoration; automation enabled.
+
+2026-11-02 PR38merged mainb9c80d3 after headb14b765 four current-head build/test SUCCESS/no inline or blocking review findings; botquota/SourcerySKIPPED not approval. Unwatched38/retargeted39 main. Verified main payload+README identical to38head; resolved39 squash conflicts retaining reviewed39 source/docs/progress superset, no implementation changes. Fresh39head CI required; existingwatch persists. Current45/local checkpoint preserved; automation enabled.
+
+2026-11-02 PR40parentconflictwake: integrated39head aae9909/mainb9c80d3 baseline. Only append-only progress conflict, both histories retained; staged diff progress-only/no implementation change, diffcheck PASS. Prior12 candidate tests unchanged; new40head requires fresh current-head CI/existingwatch persists. Current46/local44/43 notes stashed safely for restoration; automationenabled.
+
+2026-11-02 PR39mergedmainafba4f6 after head aae9909 four current-head build/test jobs SUCCESS/no inline or blocking reviewfindings; botquota/SourcerySKIPPED not approval. Unwatched39/retargeted40main. Integratedmaininto40; only progress squash conflict, HEAD already includes all datedmainentries, retainedsuperset/no implementationchange. Stageddiffprogress-only/diffcheck PASS; fresh40headCI required/existingwatch persists. Current47/local45green checkpoint preserved; automationenabled.
+
+2026-11-02 PR41parentconflictwake: integrated40head2a30c09/mainafba4f6 baseline. Only append-only progress conflict, both histories retained; stageddiff progress-only/no implementationchange, diffcheck PASS. Prior19candidate tests unchanged; fresh41currentheadCI required/existingwatch persists. Current47/local45green/39mergecheckpoint preserved; automationenabled.
+
+2026-11-02 PR42parentconflictwake: integrated41head70dbced/mainafba4f6 baseline. Only append-only progress conflict, both histories retained; stageddiffprogress-only/no implementationchange/diffcheckPASS. Prior26candidate tests unchanged; fresh42currentheadCIrequired/existingwatchpersists. Current48/local46green+47reviewcheckpoint stashedsafe; automationenabled.
+
+2026-11-02 PR43parentconflictwake: integrated42headcf31913/mainafba4f6 baseline. Only append-only progress conflict, all datedentries from both histories retained; stageddiffprogress-only/no implementationchange/diffcheckPASS. Prior31candidate tests unchanged; fresh43currentheadCIrequired/existingwatchpersists. Current49/local47green+48reviewcheckpoint stashedsafe; automationenabled.
+
+2026-11-02 PR44parentconflictwake: integrated43head38055ef/mainafba4f6 baseline. Only append-only progressconflict/alldatedentriesretained; stageddiffprogress-only/no implementationchange/diffcheckPASS. Prior38candidate testsunchanged; fresh44currentheadCIrequired/existingwatchpersists. Current50/local42parentcheckpoint stashedsafe; automationenabled.
+
+2026-11-02 PR45parentconflictwake: integrated44head2b2e508/mainafba4f6 baseline. Only append-onlyprogressconflict/alldatedentriesretained/stageddiffprogress-only/noimplementationchange/diffcheckPASS. Prior39candidate testsunchanged; fresh45currentheadCIrequired/existingwatchpersists. Current51cleancheckpointpreserved/automationenabled.
+
+2026-11-02 lateststack: PR46 integrates45f875069; only append-only progress conflict, all dated entries from both parents retained, no implementation change. Current-head CI required; existing watch persists. Current52branch132f8e3 preserved; automationenabled/no overlappingbuilds or watchedPRpolling.
+
+2026-11-02 lateststack: PR47 integrates46ed8ef44; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, currentheadCIrequired/existingwatchpersists. Current53/localnotes preserved/automationenabled.
+
+2026-11-02 lateststack: PR48 integrates4728e146a; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current54/localnotes preserved/automationenabled.
+
+2026-11-02 lateststack: PR49 integrates48b7df5f2; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, currentheadCIrequired/existingwatchpersists. Current55/localnotes preserved/automationenabled.
+
+2026-11-02 lateststack: PR50 integrates49c34fbbc; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current56/localnotes preserved/automationenabled.
+
+2026-11-03 lateststack: PR51 integrates50b7b5914; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current57/localnotes preserved/automationenabled.
+
+2026-11-03 lateststack: PR52 integrates5135a81a7; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current58/localnotes preserved/automationenabled.
+
+2026-11-03 lateststack: PR53 integrates5230daee3; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current59/localnotes preserved/automationenabled.
+
+2026-11-03 lateststack: PR54 integrates539917e33; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current60/localnotes preserved/automationenabled.
+
+2026-11-03 PR55 integrates updated54e530ff6; conflict limited to appended progress, every dated entry retained. No implementation changes; diff check PASS required, fresh current-head CI required before merge. Existing watch persists.
+
+2026-11-03 PR56 integrates updated55 head63d62c4; conflict limited to appended progress, every dated entry retained. No implementation changes; fresh current-head CI required before merge. Existing watch persists.
