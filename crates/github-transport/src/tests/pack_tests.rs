@@ -656,3 +656,120 @@ fn transfer_decode_and_coverage_require_the_expected_repository_context() {
         io::ErrorKind::InvalidInput
     );
 }
+
+#[test]
+fn named_ref_coverage_retains_names_needing_disposition_and_binds_attempt() {
+    use super::graph_tests::{hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let a = b"a".to_vec();
+    let b = b"b".to_vec();
+    let a_id = oid(K::Blob, &a);
+    let b_id = oid(K::Blob, &b);
+    let bytes = pack_bytes(&[(K::Blob, a), (K::Blob, b)]);
+    let refs = format!(
+        "{} refs/tags/exact\n{} refs/tags/moved\n",
+        hex(&a_id),
+        hex(&b_id)
+    )
+    .into_bytes();
+    let report = advertised_decode_fixture(refs.clone(), &bytes);
+    let checked = decode_report(&report, &bytes).unwrap();
+    let expected = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let inputs = [
+        RequiredRefInput {
+            name: b"refs/tags/exact",
+            oid: a_id,
+            kind: K::Blob,
+        },
+        RequiredRefInput {
+            name: b"refs/tags/local",
+            oid: a_id,
+            kind: K::Blob,
+        },
+        RequiredRefInput {
+            name: b"refs/tags/moved",
+            oid: a_id,
+            kind: K::Blob,
+        },
+    ];
+    let manifest = RequiredRefManifest::capture(
+        &inputs,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let coverage = checked
+        .check_required_refs(
+            &expected,
+            &report,
+            &manifest,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(coverage.manifest().digest(), manifest.digest());
+    assert_eq!(coverage.coverage().required_object_count(), 3);
+    assert_eq!(
+        coverage
+            .unmatched_remote_refs()
+            .map(|(e, r)| (e.name(), r))
+            .collect::<Vec<_>>(),
+        [
+            (
+                b"refs/tags/local".as_slice(),
+                RemoteRefMismatch::MissingName
+            ),
+            (
+                b"refs/tags/moved".as_slice(),
+                RemoteRefMismatch::DifferentTarget
+            )
+        ]
+    );
+    let cloned = report.clone();
+    assert!(checked
+        .check_required_refs(
+            &expected,
+            &cloned,
+            &manifest,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .is_ok());
+    let different_attempt = advertised_decode_fixture(refs, &bytes);
+    assert_eq!(
+        checked
+            .check_required_refs(
+                &expected,
+                &different_attempt,
+                &manifest,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    let missing = RequiredRefManifest::capture(
+        &[RequiredRefInput {
+            name: b"refs/tags/missing",
+            oid: [1; 20],
+            kind: K::Blob,
+        }],
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        checked
+            .check_required_refs(
+                &expected,
+                &report,
+                &missing,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}

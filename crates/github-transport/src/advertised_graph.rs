@@ -47,7 +47,106 @@ impl RequiredObjectCoverageReport {
     }
 }
 
+/// How a caller-supplied local ref name differs from this advertisement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteRefMismatch {
+    MissingName,
+    DifferentTarget,
+}
+
+/// Reachable typed objects plus names that still need explicit disposition.
+/// Matching remote names do not promise retention or preserve local symref state.
+#[derive(Debug)]
+pub struct NamedRefCoverageReport<'a> {
+    manifest: &'a crate::RequiredRefManifest,
+    coverage: RequiredObjectCoverageReport,
+    unmatched: Vec<(usize, RemoteRefMismatch)>,
+}
+impl<'a> NamedRefCoverageReport<'a> {
+    pub fn manifest(&self) -> &'a crate::RequiredRefManifest {
+        self.manifest
+    }
+    pub fn coverage(&self) -> RequiredObjectCoverageReport {
+        self.coverage
+    }
+    pub fn unmatched_remote_refs(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&crate::RequiredRefEntry, RemoteRefMismatch)> {
+        self.unmatched
+            .iter()
+            .map(|(index, reason)| (&self.manifest.entries()[*index], *reason))
+    }
+}
+
 impl AdvertisedPackReport {
+    /// Check all manifest IDs and retain names not identically advertised by
+    /// the same attempt. Caller claims are not a stable local inventory or backup.
+    pub fn check_required_refs<'a>(
+        &self,
+        expected_repository: &crate::RepositoryUrl,
+        transfer: &PackTransferReport,
+        manifest: &'a crate::RequiredRefManifest,
+        cancellation: &CancellationHandle,
+        deadline: Instant,
+    ) -> io::Result<NamedRefCoverageReport<'a>> {
+        check_attempt(cancellation, deadline)?;
+        transfer.check_context(expected_repository)?;
+        self.check_context(expected_repository)?;
+        if &self.context != transfer.context() {
+            return Err(invalid("verification attempt mismatch"));
+        }
+        let mut required = Vec::new();
+        required
+            .try_reserve_exact(manifest.entries().len())
+            .map_err(|_| {
+                safe_error(io::ErrorKind::OutOfMemory, "required ref allocation failed")
+            })?;
+        for entry in manifest.entries() {
+            check_attempt(cancellation, deadline)?;
+            required.push((*entry.oid(), entry.kind()));
+        }
+        let coverage =
+            self.check_required_objects(expected_repository, &required, cancellation, deadline)?;
+        let refs = transfer
+            .advertised_refs()
+            .ok_or_else(|| invalid("advertised refs unavailable"))?;
+        let mut unmatched = Vec::new();
+        unmatched
+            .try_reserve_exact(manifest.entries().len())
+            .map_err(|_| {
+                safe_error(
+                    io::ErrorKind::OutOfMemory,
+                    "required name allocation failed",
+                )
+            })?;
+        for (index, entry) in manifest.entries().iter().enumerate() {
+            check_attempt(cancellation, deadline)?;
+            let mut found = None;
+            for advertised in refs {
+                check_attempt(cancellation, deadline)?;
+                if advertised.name() == entry.name() {
+                    found = Some(advertised);
+                    break;
+                }
+            }
+            match found {
+                None => unmatched.push((index, RemoteRefMismatch::MissingName)),
+                Some(advertised) if advertised.oid() != entry.oid() => {
+                    unmatched.push((index, RemoteRefMismatch::DifferentTarget))
+                }
+                _ => {}
+            }
+        }
+        check_attempt(cancellation, deadline)?;
+        self.check_context(expected_repository)?;
+        transfer.check_context(expected_repository)?;
+        Ok(NamedRefCoverageReport {
+            manifest,
+            coverage,
+            unmatched,
+        })
+    }
+
     pub fn repository(&self) -> &crate::RepositoryUrl {
         self.context.repository()
     }

@@ -591,6 +591,76 @@ fn run_real_git_verification() {
     assert_eq!(coverage.required_object_count(), 4);
     assert_eq!(coverage.graph().reachable_objects(), 4);
 
+    let source_repo = root.repo().to_str().unwrap().to_owned();
+    // This local name has covered history but did not exist in the advertisement.
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "refs/heads/local-only",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    let current_refs = checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(objecttype)",
+        ],
+        b"",
+    )
+    .unwrap();
+    let inputs = current_refs
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let parts: Vec<_> = line.split(|b| *b == b' ').collect();
+            assert_eq!(parts.len(), 3);
+            let kind = match parts[2] {
+                b"commit" => GitObjectKind::Commit,
+                b"tag" => GitObjectKind::Tag,
+                _ => panic!("unexpected fixture ref kind"),
+            };
+            RequiredRefInput {
+                name: parts[0],
+                oid: hex_oid(std::str::from_utf8(parts[1]).unwrap()),
+                kind,
+            }
+        })
+        .collect::<Vec<_>>();
+    let manifest = RequiredRefManifest::capture(
+        &inputs,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let named = advertised_closure
+        .check_required_refs(
+            &RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
+            &fetch_report,
+            &manifest,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(named.coverage().required_object_count(), 3);
+    assert_eq!(
+        named
+            .unmatched_remote_refs()
+            .map(|(entry, reason)| (entry.name(), reason))
+            .collect::<Vec<_>>(),
+        [(
+            b"refs/heads/local-only".as_slice(),
+            RemoteRefMismatch::MissingName
+        )]
+    );
+
     let closure = check_pack_graph_closure(
         &decoded_pack,
         &[

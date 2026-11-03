@@ -570,3 +570,29 @@ not a clock-tampering guarantee. Persisted receipts, local manifest revalidation
 ref-name preservation, authentication, remote retention, worker/store lifecycle
 and cleanup eligibility remain separate gates. Tests exercise clock boundaries
 without sleeps and require the expected endpoint through the private TLS flow.
+
+### Required ref names and manifest identity
+
+`RequiredRefManifest` captures caller-supplied raw ref names, typed IDs and a
+canonical SHA-256 digest. It preserves distinct names pointing to the same ID,
+rejects duplicate names and validates the supported Git name subset. Names are
+copied with fallible allocation, sorted byte-for-byte and never converted into
+paths or commands. Bounds are 1–1,024 entries, 1,024 bytes per name and 64 KiB of
+name bytes in total. `check_unchanged` compares the full canonical entry sequence;
+changed names, targets, kinds or membership require renewed verification.
+
+`check_required_refs` requires a current expected-repository context and the same
+transfer attempt as the decoded report. It checks typed object reachability and
+returns manifest-backed entries whose names are absent remotely or whose remote
+names point elsewhere. A local branch can need preservation even when its commit
+is covered by another remote branch. Matching remote names do not promise future
+retention. The report borrows the immutable manifest and exposes no cleanup flag.
+
+The manifest is a caller claim, not discovery of all local refs, symref/detached
+HEAD state, working files, configuration, stashes or recoverable objects. It is
+not a backup or an explicit discard decision, and it does not replace native
+source revalidation or a persisted receipt. Existing clock, worker/store,
+authentication, platform and cleanup gates remain. Tests include an independent
+Python hashlib digest, canonical ordering and raw names, limits, changed claims,
+same-attempt binding and an actual Git local alias whose history is covered but
+whose name was not advertised.

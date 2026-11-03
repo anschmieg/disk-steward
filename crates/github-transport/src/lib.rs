@@ -6,9 +6,12 @@
 
 mod advertised_graph;
 mod attempt_context;
+mod required_refs;
 pub use advertised_graph::{
-    decode_advertised_pack, AdvertisedPackReport, RequiredObjectCoverageReport,
+    decode_advertised_pack, AdvertisedPackReport, NamedRefCoverageReport, RemoteRefMismatch,
+    RequiredObjectCoverageReport,
 };
+pub use required_refs::{RequiredRefEntry, RequiredRefInput, RequiredRefManifest};
 mod graph;
 pub use graph::{check_pack_graph_closure, PackGraphReport};
 mod tag;
@@ -2156,6 +2159,7 @@ mod tests {
     mod inflate_tests;
     mod object_identity_tests;
     mod pack_tests;
+    mod required_refs_tests;
     mod tag_tests;
     mod tree_tests;
 
