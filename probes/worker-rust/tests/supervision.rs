@@ -4,6 +4,33 @@ fn probe() -> Command {
     Command::new(env!("CARGO_BIN_EXE_disk-steward-worker-probe"))
 }
 
+fn assert_five_object_accounting(report: &str) {
+    for evidence in [
+        "parent_accounting_scope=fixed_five_objects",
+        "parent_elapsed_checked=true",
+        "parent_budget_incomplete=true",
+        "parent_worker_stopped=true",
+        "fixture_objects=5",
+        "fixture_snapshot=before_registry_reopen",
+    ] {
+        assert!(report.contains(evidence), "{report}");
+    }
+    let observed = report
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("fixture_observed_bytes="))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let accounted = report
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("parent_observed_accounted_bytes="))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(observed, accounted);
+    assert!((1..=131072).contains(&observed));
+}
+
 #[test]
 fn default_is_dry_run_and_starts_no_child() {
     let output = probe().output().expect("run dry-run probe");
@@ -109,6 +136,7 @@ fn indexed_store_worker_reopens_as_reconciliation_without_cleanup_authority() {
     ] {
         assert!(report.contains(evidence), "{report}");
     }
+    assert_five_object_accounting(&report);
     let refused = probe()
         .args(["--run-indexed-store-worker", "extra"])
         .output()
@@ -304,6 +332,7 @@ fn indexed_store_descriptor_handoff_requires_exact_capability_and_arguments() {
     ] {
         assert!(report.contains(evidence), "{report}");
     }
+    assert_five_object_accounting(&report);
     assert!(!report.contains("synthetic-handoff-parent-only"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-handoff-parent-only"));
 }

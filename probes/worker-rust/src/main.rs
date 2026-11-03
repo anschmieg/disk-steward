@@ -518,41 +518,51 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     } else {
         None
     };
-    let fixture_footprint = if mode == IndexedWorkerMode::Payload {
-        let observation = store
-            .observe_stopped_fixture_footprint(&registry, &receipt)
-            .map_err(|_| "complete stopped fixture footprint observation refused".to_owned())?;
-        if observation.object_count != 6 {
-            return Err("fixed fixture footprint object count mismatch".into());
-        }
-        Some(observation)
-    } else {
-        None
+    let fixture_footprint = match mode {
+        IndexedWorkerMode::Payload => Some(
+            store
+                .observe_stopped_fixture_footprint(&registry, &receipt)
+                .map_err(|_| "complete stopped fixture footprint observation refused".to_owned())?,
+        ),
+        IndexedWorkerMode::PartialPayload => Some(
+            store
+                .observe_stopped_partial_fixture_footprint(&registry, &receipt)
+                .map_err(|_| "partial stopped fixture footprint observation refused".to_owned())?,
+        ),
+        IndexedWorkerMode::Stall | IndexedWorkerMode::DescriptorOnly => Some(
+            store
+                .observe_stopped_control_fixture_footprint(&registry, &receipt)
+                .map_err(|_| "stopped control fixture footprint observation refused".to_owned())?,
+        ),
     };
-    let parent_observed_accounted_bytes = if let Some(observation) = payload_observation {
+    let parent_observed_accounted_bytes = if let Some(footprint) = fixture_footprint {
         let free_after = store
             .sample_free_space_bytes()
             .map_err(|_| "sample stopped fixture free space refused".to_owned())?;
-        let observed_bytes = fixture_footprint
-            .ok_or("complete fixture footprint observation missing")?
-            .observed_bytes;
-        if observed_bytes < observation.high_water_bytes {
+        let expected_objects = if payload_observation.is_some() { 6 } else { 5 };
+        if footprint.object_count != expected_objects {
+            return Err("fixed fixture footprint object count mismatch".into());
+        }
+        if payload_observation
+            .map(|payload| footprint.observed_bytes < payload.high_water_bytes)
+            .unwrap_or(false)
+        {
             return Err("fixed fixture observation is below payload high-water".into());
         }
         let accounted = settle_parent_store_budget(
             &mut admission_budget,
             admission.job_id,
-            observed_bytes,
+            footprint.observed_bytes,
             free_after,
             elapsed_millis(attempt_started),
         )
         .map_err(|_| "parent fixture accounting refused".to_owned())?;
-        if accounted != observed_bytes
-            || observed_bytes > store::WORKER_PAYLOAD_RESERVATION
+        if accounted != footprint.observed_bytes
+            || footprint.observed_bytes > store::WORKER_PAYLOAD_RESERVATION
             || admission_budget
                 .snapshot(admission.job_id)
                 .map(|job| {
-                    job.usage.stored_bytes != observed_bytes
+                    job.usage.stored_bytes != footprint.observed_bytes
                         || job.state
                             != (JobState::Failed {
                                 reason: verification_budget::BlockReason::StoreIncomplete,
@@ -617,10 +627,17 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         let accounted =
             parent_observed_accounted_bytes.ok_or("parent fixture accounting missing")?;
         println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
-    } else if descriptor_handoff {
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+    } else if let Some(footprint) = fixture_footprint {
+        let accounted =
+            parent_observed_accounted_bytes.ok_or("parent control fixture accounting missing")?;
+        let handoff = if descriptor_handoff {
+            " descriptor_handoff=true"
+        } else {
+            ""
+        };
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true{handoff} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_five_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
     } else {
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+        return Err("stopped fixture accounting observation missing".into());
     }
     Ok(())
 }
