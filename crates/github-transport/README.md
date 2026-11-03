@@ -449,3 +449,22 @@ local-work preservation evidence. The caller supplies root types; this stage doe
 not infer which roots are required. It remains inactive and grants no cleanup
 eligibility. Logical work limits do not establish a total process-memory bound;
 cooperative controls still require an outer supervised worker.
+
+### Advertised-root decode and closure
+
+`decode_advertised_pack` composes a completed pack-transfer report with decoding
+and graph closure of caller-supplied bytes. It requires an exact accepted-byte
+count, resolves every advertised tip, requires commit objects for HEAD and branch
+refs, and uses decoded kinds for other namespaces. Symref targets must appear in
+the same advertisement with the same ID. Peeled tag claims must match the terminal
+non-tag object reached through typed tag links. Repeated peel claims share a
+16,384-step budget. Existing decoder, graph and parser caps remain in force;
+there are at most 1,024 advertised refs and 64 distinct roots.
+
+The caller must provide bytes actually captured from that report's sink. Length
+and matching roots do not prove stream provenance. The operation remains inactive
+and does not establish an atomic remote snapshot, required local-state coverage,
+full fsck, signatures, practical private authentication, production worker/RSS
+limits or cleanup eligibility. Strict supported-subset refusals remain incomplete
+verification. Tests use bounded private TLS fixtures and the isolated real-Git
+fetch/strict receiver fixture; no user repository is accessed.
