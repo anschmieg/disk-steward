@@ -8,7 +8,11 @@
 //! are experimental, not product scope.
 
 use sha2::{Digest, Sha256};
-use std::{io, time::Instant};
+use std::{
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use crate::{
     check_deadline, check_pack_graph_closure, decode_sha1_pack, parse_sha1_tag, safe_error,
@@ -61,6 +65,8 @@ pub struct NamedRefCoverageReport<'a> {
     manifest: &'a crate::RequiredRefManifest,
     coverage: RequiredObjectCoverageReport,
     unmatched: Vec<(usize, RemoteRefMismatch)>,
+    context: crate::attempt_context::AttemptContext,
+    manifest_changed: AtomicBool,
 }
 impl<'a> NamedRefCoverageReport<'a> {
     pub fn manifest(&self) -> &'a crate::RequiredRefManifest {
@@ -75,6 +81,40 @@ impl<'a> NamedRefCoverageReport<'a> {
         self.unmatched
             .iter()
             .map(|(index, reason)| (&self.manifest.entries()[*index], *reason))
+    }
+
+    /// Recheck this report's immutable required-ref claims against a caller's
+    /// current manifest. The supplied manifest remains a claim; this does not
+    /// read native repository refs or create a persisted receipt, atomic
+    /// snapshot, backup, or cleanup authorization. A changed source requires
+    /// new analysis and evidence; this report cannot be automatically retried.
+    pub fn recheck_manifest(
+        &self,
+        expected_repository: &crate::RepositoryUrl,
+        current: &crate::RequiredRefManifest,
+        cancellation: &CancellationHandle,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        check_attempt(cancellation, deadline)?;
+        self.context.check(expected_repository)?;
+        if self.manifest_changed.load(Ordering::Acquire) {
+            return Err(invalid("required ref manifest changed"));
+        }
+        if let Err(error) = self
+            .manifest
+            .check_unchanged(current, cancellation, deadline)
+        {
+            if error.kind() == io::ErrorKind::InvalidData {
+                self.manifest_changed.store(true, Ordering::Release);
+            }
+            return Err(error);
+        }
+        check_attempt(cancellation, deadline)?;
+        self.context.check(expected_repository)?;
+        if self.manifest_changed.load(Ordering::Acquire) {
+            return Err(invalid("required ref manifest changed"));
+        }
+        Ok(())
     }
 }
 
@@ -144,6 +184,8 @@ impl AdvertisedPackReport {
             manifest,
             coverage,
             unmatched,
+            context: self.context.clone(),
+            manifest_changed: AtomicBool::new(false),
         })
     }
 

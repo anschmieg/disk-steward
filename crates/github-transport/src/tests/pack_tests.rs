@@ -773,3 +773,148 @@ fn named_ref_coverage_retains_names_needing_disposition_and_binds_attempt() {
         io::ErrorKind::NotFound
     );
 }
+
+#[test]
+fn named_coverage_recheck_refuses_changed_claims_without_reviving_old_evidence() {
+    use super::graph_tests::{hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let bytes = pack_bytes(&[(K::Blob, b"x".to_vec())]);
+    let id = oid(K::Blob, b"x");
+    let report =
+        advertised_decode_fixture(format!("{} refs/tags/a\n", hex(&id)).into_bytes(), &bytes);
+    let checked = decode_report(&report, &bytes).unwrap();
+    let expected = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let capture = |input: &[RequiredRefInput<'_>]| {
+        RequiredRefManifest::capture(
+            input,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let original = capture(&[RequiredRefInput {
+        name: b"refs/tags/a",
+        oid: id,
+        kind: K::Blob,
+    }]);
+    let controls = checked
+        .check_required_refs(
+            &expected,
+            &report,
+            &original,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    let wrong = RepositoryUrl::parse("https://github.com/other/repo.git").unwrap();
+    assert_eq!(
+        controls
+            .recheck_manifest(
+                &wrong,
+                &original,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let cancel = CancellationHandle::new();
+    cancel.cancel();
+    assert_eq!(
+        controls
+            .recheck_manifest(
+                &expected,
+                &original,
+                &cancel,
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    assert_eq!(
+        controls
+            .recheck_manifest(
+                &expected,
+                &original,
+                &CancellationHandle::new(),
+                Instant::now()
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    controls
+        .recheck_manifest(
+            &expected,
+            &original,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    for claims in [
+        vec![RequiredRefInput {
+            name: b"refs/tags/renamed",
+            oid: id,
+            kind: K::Blob,
+        }],
+        vec![RequiredRefInput {
+            name: b"refs/tags/a",
+            oid: [1; 20],
+            kind: K::Blob,
+        }],
+        vec![RequiredRefInput {
+            name: b"refs/tags/a",
+            oid: id,
+            kind: K::Tree,
+        }],
+        vec![
+            RequiredRefInput {
+                name: b"refs/tags/a",
+                oid: id,
+                kind: K::Blob,
+            },
+            RequiredRefInput {
+                name: b"refs/tags/new",
+                oid: id,
+                kind: K::Blob,
+            },
+        ],
+    ] {
+        let current = capture(&claims);
+        let coverage = checked
+            .check_required_refs(
+                &expected,
+                &report,
+                &original,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            coverage
+                .recheck_manifest(
+                    &expected,
+                    &current,
+                    &CancellationHandle::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            coverage
+                .recheck_manifest(
+                    &expected,
+                    &original,
+                    &CancellationHandle::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}

@@ -596,3 +596,14 @@ authentication, platform and cleanup gates remain. Tests include an independent
 Python hashlib digest, canonical ordering and raw names, limits, changed claims,
 same-attempt binding and an actual Git local alias whose history is covered but
 whose name was not advertised.
+
+Named coverage also retains its original context for `recheck_manifest`. This
+compares a later caller manifest with the immutable verified claims under the
+same repository/expiry checks. Once that named result observes changed claims,
+it stays stale even if an older manifest is later supplied; new analysis and
+evidence are required. Repository mismatch, cancellation and deadline errors
+refuse the call without falsely recording a source change. Getters remain
+historical evidence, not a current-validity flag. The real-Git fixture recaptures
+native refs, accepts an unchanged observation, then rejects a name-only rename
+that leaves the covered object IDs unchanged. These observations are not atomic
+and do not establish a comprehensive user-repository inventory.
