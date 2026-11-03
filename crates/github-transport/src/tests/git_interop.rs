@@ -525,6 +525,32 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let fetch_report = fetch_result.unwrap();
     pack_sink.sync_and_observe().unwrap();
     let pack = pack_sink.contents().unwrap();
+    let checksum = check_sha1_pack_checksum(
+        &mut std::io::Cursor::new(&pack),
+        pack.len() as u64,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(checksum.version(), 2);
+    assert_eq!(checksum.declared_object_count(), 4);
+    assert_eq!(checksum.checksum().as_slice(), &pack[pack.len() - 20..]);
+    let mut damaged_pack = pack.clone();
+    *damaged_pack.last_mut().unwrap() ^= 1;
+    assert!(check_sha1_pack_checksum(
+        &mut std::io::Cursor::new(&damaged_pack),
+        damaged_pack.len() as u64,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5)
+    )
+    .is_err());
+    assert!(check_sha1_pack_checksum(
+        &mut std::io::Cursor::new(&pack[..pack.len() - 1]),
+        pack.len() as u64,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5)
+    )
+    .is_err());
     assert_eq!(pack_sink.reservation_bytes().unwrap(), RESERVATION);
     let pack_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
     assert!(
