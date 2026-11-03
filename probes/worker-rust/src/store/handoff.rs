@@ -108,7 +108,7 @@ pub(super) fn write_stdin_payload() -> Result<super::payload::PayloadReport, Sto
 fn write_payload_from_root(root: &File) -> Result<super::payload::PayloadReport, StoreError> {
     validate_root_descriptor(root)?;
     let binding = capture_bound_journal(root)?;
-    super::payload::write_worker_payload(root, |has_payload, payload_id| {
+    super::payload::write_worker_payload(root, binding.reservation, |has_payload, payload_id| {
         verify_bound_root(root, &binding, has_payload, payload_id)
     })
 }
@@ -135,9 +135,11 @@ fn write_partial_payload_from_root(
 ) -> Result<super::payload::PayloadReport, StoreError> {
     validate_root_descriptor(root)?;
     let binding = capture_bound_journal(root)?;
-    super::payload::write_worker_payload_partial(root, |has_payload, payload_id| {
-        verify_bound_root(root, &binding, has_payload, payload_id)
-    })
+    super::payload::write_worker_payload_partial(
+        root,
+        binding.reservation,
+        |has_payload, payload_id| verify_bound_root(root, &binding, has_payload, payload_id),
+    )
 }
 
 /// Inspect the fixed payload only after this exact worker has been stopped.
@@ -166,6 +168,7 @@ fn inspect_stopped_payload(
         if !store.worker_stdin_issued
             || store.poisoned
             || store.cleanup_started
+            || store.worker_payload_reservation != Some(super::WORKER_PAYLOAD_RESERVATION)
             || receipt.pid() == 0
             || receipt.token() != store.token
             || store.phase != Phase::Stopped(receipt.pid())
@@ -222,6 +225,7 @@ struct BoundJournal {
     root_id: (u64, u64),
     journal_id: (u64, u64),
     bytes: Vec<u8>,
+    reservation: u64,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -229,14 +233,18 @@ fn capture_bound_journal(root: &File) -> Result<BoundJournal, StoreError> {
     let root_id = validate_worker_root(root)?;
     super::require_entries(root, &["owner.journal"])?;
     let (journal_id, bytes) = read_named_journal(root)?;
-    if parse_journal_prefix(&bytes, root_id, std::process::id())? != JournalState::Bound {
-        return Err(StoreError::InvalidJournal);
-    }
+    let reservation = match parse_journal_prefix(&bytes, root_id, std::process::id())? {
+        JournalState::BoundWithReservation(value) if value == super::WORKER_PAYLOAD_RESERVATION => {
+            value
+        }
+        _ => return Err(StoreError::InvalidJournal),
+    };
     super::require_entries(root, &["owner.journal"])?;
     Ok(BoundJournal {
         root_id,
         journal_id,
         bytes,
+        reservation,
     })
 }
 
@@ -260,7 +268,9 @@ fn verify_bound_root(
     if journal_id != binding.journal_id || bytes != binding.bytes {
         return Err(StoreError::InvalidJournal);
     }
-    if parse_journal_prefix(&bytes, binding.root_id, std::process::id())? != JournalState::Bound {
+    if parse_journal_prefix(&bytes, binding.root_id, std::process::id())?
+        != JournalState::BoundWithReservation(binding.reservation)
+    {
         return Err(StoreError::InvalidJournal);
     }
     match (has_payload, payload_id) {
@@ -509,7 +519,10 @@ fn validate_root_descriptor(root: &impl AsFd) -> Result<(), StoreError> {
         if Instant::now() >= deadline {
             return Err(StoreError::InvalidJournal);
         }
-        if state == JournalState::Bound {
+        if matches!(
+            state,
+            JournalState::Bound | JournalState::BoundWithReservation(_)
+        ) {
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -525,6 +538,7 @@ fn validate_root_descriptor(root: &impl AsFd) -> Result<(), StoreError> {
 enum JournalState {
     Pending,
     Bound,
+    BoundWithReservation(u64),
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -684,15 +698,41 @@ fn parse_journal_prefix(
     }
     rest = &rest[expected_root_bytes.len()..];
 
+    let mut reservation = None;
+    const RESERVATION_PREFIX: &[u8] = b"reservation:";
+    if rest.starts_with(RESERVATION_PREFIX)
+        || (rest.len() <= RESERVATION_PREFIX.len() && RESERVATION_PREFIX.starts_with(rest))
+    {
+        if rest.len() <= RESERVATION_PREFIX.len() {
+            return Ok(JournalState::Pending);
+        }
+        let value_line = &rest[RESERVATION_PREFIX.len()..];
+        let Some(end) = value_line.iter().position(|byte| *byte == b'\n') else {
+            return if valid_decimal_prefix(value_line) {
+                Ok(JournalState::Pending)
+            } else {
+                Err(StoreError::InvalidJournal)
+            };
+        };
+        let value = parse_decimal(&value_line[..end])?;
+        if value == 0 {
+            return Err(StoreError::InvalidJournal);
+        }
+        reservation = Some(value);
+        rest = &value_line[end + 1..];
+    }
+
     let expected_bound = format!("bound:{current_pid}\n");
-    if rest == b"created\n" || (rest.len() < b"created\n".len() && b"created\n".starts_with(rest)) {
+    if rest == b"created\n" || b"created\n".starts_with(rest) {
         return Ok(JournalState::Pending);
     }
-    let expected_bound = expected_bound.as_bytes();
-    if rest == expected_bound {
-        return Ok(JournalState::Bound);
+    if rest == expected_bound.as_bytes() {
+        return Ok(match reservation {
+            Some(value) => JournalState::BoundWithReservation(value),
+            None => JournalState::Bound,
+        });
     }
-    if expected_bound.starts_with(rest) {
+    if expected_bound.as_bytes().starts_with(rest) {
         return Ok(JournalState::Pending);
     }
     Err(StoreError::InvalidJournal)
@@ -917,6 +957,41 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn reserved_binding_prefixes_wait_and_exact_value_is_required_by_payload() {
+        let journal =
+            b"disk-steward-worker-store-v1\nabc-def-123\n2:3\n4:7\nreservation:131072\nbound:42\n";
+        for end in 0..journal.len() {
+            assert_eq!(
+                parse_journal_prefix(&journal[..end], (4, 7), 42).unwrap(),
+                JournalState::Pending,
+                "reserved journal prefix {end} must not prove binding"
+            );
+        }
+        assert_eq!(
+            parse_journal_prefix(journal, (4, 7), 42).unwrap(),
+            JournalState::BoundWithReservation(super::super::WORKER_PAYLOAD_RESERVATION)
+        );
+        assert_eq!(
+            parse_journal_prefix(
+                b"disk-steward-worker-store-v1\nabc-def-123\n2:3\n4:7\nreservation:131071\nbound:42\n",
+                (4, 7),
+                42
+            )
+            .unwrap(),
+            JournalState::BoundWithReservation(131071)
+        );
+        assert!(parse_journal_prefix(
+            b"disk-steward-worker-store-v1\nabc-def-123\n2:3\n4:7\nreservation:0131072\nbound:42\n",
+            (4, 7),
+            42
+        )
+        .is_err());
+        let extra_blank = [&journal[..], &b"\n"[..]].concat();
+        assert!(parse_journal_prefix(&extra_blank, (4, 7), 42).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn created_descriptor_times_out_without_readiness_or_journal_mutation() {
         let mut store = OwnedStore::create().unwrap();
         let descriptor = store.worker_stdin_once().unwrap();
@@ -964,8 +1039,40 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn fixed_payload_writer_refuses_missing_or_mismatched_reservation_before_creation() {
+        let pid = std::process::id();
+        let missing = OwnedStore::create().unwrap();
+        let descriptor = missing.root.try_clone().unwrap();
+        let mut missing = missing;
+        missing.bind_worker(pid).unwrap();
+        assert!(write_payload_from_root(&descriptor).is_err());
+        super::super::require_entries(&descriptor, &["owner.journal"]).unwrap();
+
+        let mut mismatched = OwnedStore::create().unwrap();
+        let descriptor = mismatched.root.try_clone().unwrap();
+        mismatched.bind_worker_payload_reservation().unwrap();
+        mismatched.bind_worker(pid).unwrap();
+        std::fs::write(
+            mismatched.parent_path.join("store/owner.journal"),
+            format!(
+                "disk-steward-worker-store-v1\n{}\n{}:{}\n{}:{}\nreservation:131071\nbound:{pid}\n",
+                mismatched.token,
+                mismatched.parent_id.0,
+                mismatched.parent_id.1,
+                mismatched.root_id.0,
+                mismatched.root_id.1
+            ),
+        )
+        .unwrap();
+        assert!(write_payload_from_root(&descriptor).is_err());
+        super::super::require_entries(&descriptor, &["owner.journal"]).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn fixed_payload_writer_refuses_a_second_attempt_without_changing_file() {
         let mut store = OwnedStore::create().unwrap();
+        store.bind_worker_payload_reservation().unwrap();
         let descriptor = store.worker_stdin_once().unwrap();
         store.bind_worker(std::process::id()).unwrap();
         let first = write_payload_from_root(&descriptor).unwrap();
@@ -983,6 +1090,7 @@ mod tests {
     #[test]
     fn stopped_payload_inspection_requires_receipt_and_refuses_changed_file() {
         let mut store = OwnedStore::create().unwrap();
+        store.bind_worker_payload_reservation().unwrap();
         let descriptor = store.worker_stdin_once().unwrap();
         let pid = std::process::id();
         store.bind_worker(pid).unwrap();
@@ -1023,6 +1131,7 @@ mod tests {
     #[test]
     fn stopped_partial_payload_has_a_separate_exact_inspection_gate() {
         let mut store = OwnedStore::create().unwrap();
+        store.bind_worker_payload_reservation().unwrap();
         let descriptor = store.worker_stdin_once().unwrap();
         let pid = std::process::id();
         store.bind_worker(pid).unwrap();
@@ -1065,6 +1174,34 @@ mod tests {
             .inspect_stopped_worker_partial_payload(&receipt)
             .is_err());
         std::fs::write(&path, b"short").unwrap();
+        assert!(store
+            .inspect_stopped_worker_partial_payload(&receipt)
+            .is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn stopped_inspection_refuses_unreserved_store_even_with_payload_entry() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut store = OwnedStore::create().unwrap();
+        let _descriptor = store.worker_stdin_once().unwrap();
+        let pid = std::process::id();
+        store.bind_worker(pid).unwrap();
+        let path = store
+            .parent_path
+            .join("store")
+            .join(super::super::payload::NAME);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+            .set_len(super::super::payload::LIMIT)
+            .unwrap();
+        let receipt = crate::StopReceipt::confirmed(store.token(), pid);
+        store.record_stopped(&receipt).unwrap();
+        assert!(store.inspect_stopped_worker_payload(&receipt).is_err());
         assert!(store
             .inspect_stopped_worker_partial_payload(&receipt)
             .is_err());
