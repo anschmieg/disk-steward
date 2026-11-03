@@ -53,7 +53,26 @@ mod checkpoint_replay;
 #[cfg(unix)]
 pub(crate) mod checkpoint_store;
 #[cfg(unix)]
+pub(crate) mod subtree_commands;
+#[cfg(unix)]
+pub(crate) mod subtree_job;
+#[cfg(unix)]
 mod tree_summary;
+#[cfg(not(unix))]
+pub(crate) mod subtree_commands {
+    #[tauri::command]
+    pub(crate) async fn start_subtree_scan() -> Result<(), String> {
+        Err("Subtree scans are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn continue_subtree_scan() -> Result<(), String> {
+        Err("Subtree scans are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn discard_subtree_scan() -> Result<(), String> {
+        Err("Subtree scans are unsupported on this platform.".into())
+    }
+}
 
 #[cfg(unix)]
 // Unix stat reports allocation in 512-byte units, not st_blksize units.
@@ -360,6 +379,7 @@ struct Session {
     entries: Vec<ObservedEntry>,
     snapshot: FolderInventorySnapshot,
     cursor: Option<DirectoryCursor>,
+    subtree_job: Option<subtree_job::SubtreeJob>,
 }
 
 #[cfg(not(unix))]
@@ -1011,6 +1031,7 @@ fn selected_root_session(
         entries: scanned.entries,
         snapshot: scanned.snapshot.clone(),
         cursor: scanned.cursor,
+        subtree_job: None,
     };
     Ok((session, scanned.snapshot))
 }
@@ -1181,6 +1202,7 @@ fn navigate_session(
         })?;
         validate_session_bindings(session, started, duration)?;
         session.frames.truncate(current_index);
+        session.subtree_job = None;
         session.observation_id = scanned.snapshot.observation_id;
         session.entries = scanned.entries;
         session.snapshot = scanned.snapshot.clone();
@@ -1275,6 +1297,7 @@ fn navigate_session(
     validate_session_bindings(session, started, duration)?;
     validate_child_binding(parent, &child, session.root_device, started, duration)?;
     session.frames.push(child);
+    session.subtree_job = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
@@ -1350,6 +1373,7 @@ fn continue_session(
         session.snapshot.can_checkpoint = false;
         return Err(error);
     }
+    session.subtree_job = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
@@ -1396,6 +1420,7 @@ fn refresh_session(
     })?;
     validate_session_bindings(session, started, duration)?;
 
+    session.subtree_job = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();

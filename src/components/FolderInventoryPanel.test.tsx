@@ -511,7 +511,7 @@ test("subtree summary is explicit, keeps exact totals and leaves page and import
   const summary = await screen.findByRole("region", {
     name: "Subtree metadata summary",
   });
-  expect(invoke).toHaveBeenNthCalledWith(2, "inspect_folder_tree_summary", {
+  expect(invoke).toHaveBeenNthCalledWith(2, "start_subtree_scan", {
     request: {
       expectedObservationId: "observation-1",
       attemptId: expect.stringMatching(/^disk-steward:summary-attempt:v1:/),
@@ -676,7 +676,7 @@ test("a late cancellation response cannot change a later summary attempt", async
   );
   const requests = vi
     .mocked(invoke)
-    .mock.calls.filter(([name]) => name === "inspect_folder_tree_summary");
+    .mock.calls.filter(([name]) => name === "start_subtree_scan");
   expect(requests[0][1]).not.toEqual(requests[1][1]);
   acknowledgeCancel();
   await waitFor(() =>
@@ -927,4 +927,147 @@ test("saved checkpoint inspection offers metadata and forgetting without native 
     screen.getByRole("button", { name: "Forget saved checkpoint" }),
   ).toBeEnabled();
   expect(screen.queryByRole("table")).not.toBeInTheDocument();
+});
+
+const chunkProgress = {
+  observationId: sample.observationId,
+  rootLabel: sample.rootLabel,
+  entriesObserved: 512,
+  filesObserved: 500,
+  uniqueFileObjects: 500,
+  duplicateHardlinkNames: 0,
+  directoriesVisited: 2,
+  skippedEntries: 0,
+  excludedDirectories: 0,
+  unreadableEntries: 0,
+  changedDirectories: 0,
+  uniqueFileLogicalBytes: "500",
+  coverageComplete: false,
+  stopReason: null,
+  scanId: "scan-1",
+  canContinue: true,
+  scanFinished: false,
+  entriesThisBatch: 512,
+};
+
+test("subtree scan advances bounded batches with fresh attempts and preserves the folder page", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce(chunkProgress)
+    .mockResolvedValueOnce({
+      ...chunkProgress,
+      entriesObserved: 1024,
+      entriesThisBatch: 512,
+      canContinue: false,
+      scanFinished: true,
+      coverageComplete: true,
+    });
+  const busy = vi.fn();
+  render(<FolderInventoryPanel native onBusyChange={busy} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  const before = screen.getByRole("table").textContent;
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  await screen.findByText(/Traversal finished within its policy/);
+  expect(invoke).toHaveBeenNthCalledWith(3, "continue_subtree_scan", {
+    request: {
+      expectedObservationId: "observation-1",
+      scanId: "scan-1",
+      attemptId: expect.stringMatching(/^disk-steward:summary-attempt:v1:/),
+    },
+  });
+  const start = vi.mocked(invoke).mock.calls[1][1] as {
+    request: { attemptId: string };
+  };
+  const next = vi.mocked(invoke).mock.calls[2][1] as {
+    request: { attemptId: string };
+  };
+  expect(next.request.attemptId).not.toBe(start.request.attemptId);
+  expect(screen.getByRole("table").textContent).toBe(before);
+  expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
+});
+
+test("pause waits for a completed batch then resumes the same retained scan", async () => {
+  let finishBatch: (value: typeof chunkProgress) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishBatch = resolve;
+        }),
+    )
+    .mockResolvedValueOnce({
+      ...chunkProgress,
+      canContinue: false,
+      scanFinished: true,
+    });
+  const busy = vi.fn();
+  render(<FolderInventoryPanel native onBusyChange={busy} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Pause subtree scan" }));
+  expect(
+    screen.getByRole("button", { name: "Pause requested" }),
+  ).toBeDisabled();
+  expect(busy.mock.calls).toEqual([[true], [false], [true]]);
+  finishBatch(chunkProgress);
+  await screen.findByText(/paused at a batch boundary/);
+  expect(invoke).toHaveBeenCalledTimes(2);
+  fireEvent.click(screen.getByRole("button", { name: "Resume subtree scan" }));
+  await screen.findByText(/Traversal finished within its policy/);
+  expect(invoke).toHaveBeenLastCalledWith("continue_subtree_scan", {
+    request: {
+      expectedObservationId: "observation-1",
+      scanId: "scan-1",
+      attemptId: expect.any(String),
+    },
+  });
+});
+
+test("discard uses exact scan references and reports release only on native success", async () => {
+  let finishBatch: (value: typeof chunkProgress) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishBatch = resolve;
+        }),
+    )
+    .mockRejectedValueOnce(new Error("stale /private/path"))
+    .mockResolvedValueOnce(undefined);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Pause subtree scan" }));
+  finishBatch(chunkProgress);
+  await screen.findByText(/paused at a batch boundary/);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Discard subtree scan state" }),
+  );
+  await screen.findByText(/release could not be confirmed/);
+  expect(
+    screen.getByRole("button", { name: "Resume subtree scan" }),
+  ).toBeEnabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Discard subtree scan state" }),
+  );
+  await screen.findByText(/Scan state released/);
+  expect(invoke).toHaveBeenLastCalledWith("discard_subtree_scan", {
+    request: { expectedObservationId: "observation-1", scanId: "scan-1" },
+  });
+  expect(
+    screen.queryByRole("button", { name: "Resume subtree scan" }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
 });
