@@ -1564,28 +1564,58 @@ fn drain_reader_result(receiver: &Receiver<ReaderEvent>) -> Result<(u64, bool), 
 }
 
 fn stop_and_reap(child: &mut Child) -> Result<(), String> {
-    // A status-query failure must not bypass the stop attempt. A kill error
-    // may race natural exit; bounded try_wait polling confirms that race.
-    match child.try_wait() {
-        Ok(Some(_status)) => return Ok(()),
-        Ok(None) => {}
-        Err(query_error) => {
-            let kill_error = child.kill().err();
-            return wait_for_child_exit(child, Instant::now() + OUTER_DEADLINE)
+    stop_policy(
+        child,
+        |child| {
+            child
+                .try_wait()
+                .map(|status| status.is_some())
+                .map_err(|error| format!("query child status: {error}"))
+        },
+        |child| {
+            child
+                .kill()
+                .map_err(|error| format!("kill fixed child: {error}"))
+        },
+        |child, deadline| {
+            wait_for_child_exit(child, deadline)
                 .map(|_| ())
-                .map_err(|wait_error| format!(
-                    "initial child status query failed: {query_error}; kill fixed child: {}; {wait_error}",
-                    kill_error.map_or_else(|| "succeeded".to_owned(), |error| error.to_string())
-                ));
+                .map_err(|error| format!("confirm fixed child exit: {error}"))
+        },
+    )
+}
+
+fn stop_policy<T, Q, K, C>(target: &mut T, query: Q, kill: K, confirm: C) -> Result<(), String>
+where
+    Q: FnOnce(&mut T) -> Result<bool, String>,
+    K: FnOnce(&mut T) -> Result<(), String>,
+    C: FnOnce(&mut T, Instant) -> Result<(), String>,
+{
+    let query_error = match query(target) {
+        Ok(true) => return Ok(()),
+        Ok(false) => None,
+        Err(error) => Some(error),
+    };
+
+    // Always attempt the fixed-target kill after a running or uncertain query.
+    // A kill failure can race natural exit, so confirmation remains authoritative.
+    let kill_error = kill(target).err();
+    let deadline = Instant::now() + OUTER_DEADLINE;
+    match confirm(target, deadline) {
+        Ok(()) => Ok(()),
+        Err(confirm_error) => {
+            let mut diagnostics = Vec::new();
+            if let Some(error) = query_error {
+                diagnostics.push(error);
+            }
+            match kill_error {
+                Some(error) => diagnostics.push(error),
+                None => diagnostics.push("kill fixed child succeeded".to_owned()),
+            }
+            diagnostics.push(confirm_error);
+            Err(diagnostics.join("; "))
         }
     }
-    let kill_error = child.kill().err();
-    wait_for_child_exit(child, Instant::now() + OUTER_DEADLINE)
-        .map(|_| ())
-        .map_err(|wait_error| match kill_error {
-            Some(kill_error) => format!("kill fixed child: {kill_error}; {wait_error}"),
-            None => wait_error,
-        })
 }
 
 fn bounded_reader_join(reader: JoinHandle<()>) -> bool {
@@ -2254,5 +2284,134 @@ mod bounded_shutdown_tests {
             "test reader did not finish"
         );
         assert!(!joined, "blocked reader unexpectedly joined before release");
+    }
+}
+
+#[cfg(test)]
+mod stop_policy_tests {
+    use super::{stop_policy, OUTER_DEADLINE};
+    use std::time::Instant;
+
+    #[test]
+    fn confirmed_reaped_child_skips_kill_and_confirmation() {
+        let mut calls = Vec::new();
+        let result = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Ok(true)
+            },
+            |calls| {
+                calls.push("kill");
+                Err("unexpected kill".into())
+            },
+            |calls, _| {
+                calls.push("confirm");
+                Err("unexpected confirm".into())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, ["query"]);
+    }
+
+    #[test]
+    fn query_failure_still_attempts_kill_and_bounded_confirmation() {
+        let mut calls = Vec::new();
+        let started = Instant::now();
+        let result = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Err("query failed".into())
+            },
+            |calls| {
+                calls.push("kill");
+                Ok(())
+            },
+            |calls, deadline| {
+                calls.push("confirm");
+                assert!(deadline >= started + OUTER_DEADLINE);
+                assert!(deadline <= Instant::now() + OUTER_DEADLINE);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, ["query", "kill", "confirm"]);
+    }
+
+    #[test]
+    fn kill_error_racing_natural_exit_succeeds_only_after_confirmation() {
+        let mut calls = Vec::new();
+        let result = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Ok(false)
+            },
+            |calls| {
+                calls.push("kill");
+                Err("already exited".into())
+            },
+            |calls, _| {
+                calls.push("confirm");
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, ["query", "kill", "confirm"]);
+    }
+
+    #[test]
+    fn query_kill_and_confirmation_failures_retain_every_diagnostic() {
+        let mut calls = Vec::new();
+        let error = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Err("query failed".into())
+            },
+            |calls| {
+                calls.push("kill");
+                Err("kill failed".into())
+            },
+            |calls, _| {
+                calls.push("confirm");
+                Err("exit unconfirmed".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, ["query", "kill", "confirm"]);
+        for diagnostic in ["query failed", "kill failed", "exit unconfirmed"] {
+            assert!(error.contains(diagnostic), "missing {diagnostic}: {error}");
+        }
+    }
+
+    #[test]
+    fn independent_exit_confirmation_resolves_both_query_and_kill_errors() {
+        let mut confirmed = false;
+        let result = stop_policy(
+            &mut confirmed,
+            |_| Err("query unavailable".into()),
+            |_| Err("kill raced exit".into()),
+            |confirmed, _| {
+                *confirmed = true;
+                Ok(())
+            },
+        );
+        assert!(confirmed);
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn kill_success_without_confirmed_exit_does_not_claim_stop() {
+        let error = stop_policy(
+            &mut (),
+            |_| Ok(false),
+            |_| Ok(()),
+            |_, _| Err("exit unknown".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("kill fixed child succeeded"));
+        assert!(error.contains("exit unknown"));
     }
 }

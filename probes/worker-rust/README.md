@@ -408,3 +408,10 @@ joined reader. These checks do not impose a hard deadline on noninterruptible
 OS calls, stop a descendant process tree, prove production isolation, release
 reservations, or authorize cleanup. Each shutdown stage has its own bound; the
 probe does not claim a single end-to-end hard deadline from these stage limits.
+
+Deterministic shutdown-policy tests inject query, kill, and exit-confirmation
+results through a private operation seam. They check that status-query errors
+still lead to stop and confirmation attempts, that a kill/exit race needs
+independent exit confirmation, and that combined failures retain their reasons.
+The production wrapper continues to operate only on its existing owned child;
+this seam adds no command, renderer route, process selector or stop authority.
