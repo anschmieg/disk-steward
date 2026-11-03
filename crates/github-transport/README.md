@@ -260,3 +260,24 @@ observation. These remain unverified remote claims: object integrity, required
 object completeness, relationships, reachability, freshness/retention and an
 atomic remote snapshot still require independent evidence. The real-Git fixture
 checks the reported tip set against its owned source and isolated receiver.
+
+`check_sha1_pack_checksum(reader, expected_len, cancellation, deadline)` is a
+separate inactive backend stage for already-transferred legacy SHA-1 packs.
+Following the [Git pack format](https://git-scm.com/docs/gitformat-pack), it
+checks the 12-byte PACK/version/count header, streams the header and compressed
+payload through pinned `sha1-checked` 0.10.0, rejects detected collisions, and
+compares the trailing 20-byte checksum. It accepts declared versions 2 and 3,
+lengths from 32 bytes through 2 GiB, and probes at most one extra byte to refuse
+appended data. It uses a fixed 8 KiB buffer, bounds repeated interrupted reads,
+and checks cancellation/deadlines around reads and hashing. A blocking reader
+still requires an outer worker; no files, network endpoints or objects are
+opened by this function.
+
+The returned `PackChecksumReport` contains checksum-match evidence and header
+claims only. It does not inflate objects or establish the declared object count,
+object integrity, completeness, authenticity, reachability, retention or cleanup
+eligibility. A self-consistent malformed object stream can pass this stage and
+must still fail independent object verification. Tests cover that boundary,
+an independent empty-pack digest vector, fragmented/adversarial readers, and
+the real-Git fixture's pack plus checksum corruption and truncation. Independent
+strict Git receiver verification remains in place.
