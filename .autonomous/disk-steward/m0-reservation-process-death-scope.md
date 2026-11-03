@@ -1,0 +1,7 @@
+# M0 reservation process-death proof
+
+Add Linux/macOS test-only exact-child integration for registry admission. Parentcreatesfreshprivatecanonicaltaskroot, passesonlythatroot+expectedidentity/fixedphase toexactignoredchild. ChildvalidatescanonicalprivateUID/devino/mode/no-followhelddir, native2GiBreserve+1MiBheadroom, createsfreshfixedregistry/registersactualrootidentity/reserves128KiB. Twofixedphases: markeraftercommittedreservation/no payload, or exclusiveopenatpartial.bin/writePACKf5+sync/marker. Childparksholdingregistrylease; parentboundedstdout+readinessdeadline confirmsLeaseHeld thenkills/reaps/joinsreaderbeforeassertions. Reopenmustretainreservation, classifyNeedsRecon/priorRegistered, refusefurtherreservation; payloadabsent/5bytes respectively. No returnedstatecleanupauthority/no retry/no release.
+
+Onlytask-owneddisposablefixtures/staticcurrenttestexecutable; no app/renderer/newCLI/userpath/liveendpoint/otherprogram/descendantprocess. This is processdeath notpowerloss/OSkilllatency/whole-store/globalaggregate/productionworker/M0pass. Rootreviewsconcretecodebeforeexec/CARGO_INCREMENTAL=0/nooverlappingbuilds/2GiBreserve.
+
+Luna mediumboundednewintegrationtestfile; rootdocs/progress/integration/verification. Branch atop58579dd8d/mainf2734c5baseline/localnotes preserved/existing47–58watchesnotpolled/host7.3GiBfree/version0.0.17/no releases.

@@ -534,6 +534,26 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
                 .max(pack_metadata.blocks().checked_mul(512).unwrap())
     );
     assert!(fetch_report.is_complete_transfer(), "{fetch_report:?}");
+    let transfer_claims = fetch_report.advertised_refs().unwrap();
+    let transferred_main = transfer_claims
+        .iter()
+        .find(|r| r.name() == b"refs/heads/main")
+        .unwrap();
+    let transferred_tag = transfer_claims
+        .iter()
+        .find(|r| r.name() == b"refs/tags/fixture")
+        .unwrap();
+    assert_eq!(transferred_main.oid(), &hex_oid(&commit));
+    assert_eq!(transferred_tag.oid(), &hex_oid(&tag_object));
+    assert_eq!(transferred_tag.peeled(), Some(&hex_oid(&peeled)));
+    let actual_wants: std::collections::HashSet<_> =
+        transfer_claims.iter().map(|r| *r.oid()).collect();
+    assert_eq!(
+        actual_wants,
+        [hex_oid(&commit), hex_oid(&tag_object)]
+            .into_iter()
+            .collect()
+    );
     assert_eq!(fetch_report.bytes_written(), pack.len() as u64);
     assert!(
         report.is_complete(),
@@ -665,6 +685,7 @@ fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
+    assert!(report.advertised_refs().is_none());
     assert_eq!(sink.contents().unwrap(), b"PACKf");
     assert_eq!(report.bytes_written(), 5);
     let partial_metadata = fs::metadata(root.path.join("pack.download")).unwrap();

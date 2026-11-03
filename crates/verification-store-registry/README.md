@@ -10,7 +10,12 @@ private regular database file (or creates the database with private mode). A
 nonblocking process lease prevents simultaneous registry owners. On every
 successful open, unfinished records are classified as
 `needs_reconciliation`; this crate never retries work or declares it complete.
-Reconciliation is intentionally outside this M0 API.
+Reconciliation is intentionally outside this M0 API. The lease guard explicitly
+unlocks after the SQLite connection closes, so a briefly inherited or duplicated
+file descriptor cannot extend normal owner-drop lifetime. Closing such an old
+duplicate cannot unlock a subsequent owner's independently opened lease. If
+unlocking fails, ordinary close remains the fallback and acquisition still
+fails closed; no retry or ownership bypass is introduced.
 
 Supported filesystem enforcement is limited to Linux and macOS. Other targets
 are refused. Paths must come from a trusted backend; this is not a renderer API.
@@ -58,3 +63,13 @@ Reservations survive reopen, while unfinished rows become needs-reconciliation.
 Unknown/future/malformed schemas are refused before migration. No reconciliation
 or release operation is supplied yet, and lifecycle labels grant no filesystem
 or cleanup authority.
+
+Linux/macOS process-death integration tests launch an exact ignored child test
+under a fresh private task-owned root. The child commits a 128 KiB reservation
+and parks while holding the registry lease, either before payload creation or
+after writing a five-byte private partial file. The parent verifies the live
+lease blocks a second owner, terminates and reaps the child, and joins a bounded
+stdout reader before checking evidence. Reopen must retain admission and require
+reconciliation; the payload must remain absent or retain exactly those bytes.
+These are local process-death tests, not power-loss, kill-latency, global-budget,
+production-worker or cleanup-authorization evidence.
