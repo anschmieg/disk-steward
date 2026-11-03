@@ -461,6 +461,20 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-02 feat/m0-bounded-pack-transfer atop52132f8e3: Luna newpackmodule/rootAPI+realGitfixture+adversarialtests/concretereview. Freshinitialcapabilities authorize lsrefs+fetch; all<=64distinctadvertisedSHA1tips sorted/deduped, empty/oversizedrefused. StreamingPACKsignature/strictpackfilesection/sideband/finalflush, decodedpack2GiB/65536packet/1MiBprogress caps, acceptedpartialwritescounted, zero/invalidcount/boundedInterrupted/cancel/deadline failclosed. Consumingreport explicit transferframingonly(nointegrity/refsreceipt), errorssanitized via sharednestedgixkindmapper, operationfailurecancelsthe attempt beforefinalization toprevent post-sink-refusal networkdrain. Callerownsstoreadmission/reserve/aggregatebudget/partialretention/outerworker/flushsync; no app/renderer/filesystem/credential/cleanupwiring. Initialsuite74PASS5FAIL exposedgix repeatedhandshake retainedlineprovider behavior, rootchangedsharedrefshelper tovalidatefetchcapabilityontheinitialhandshake/removeredundantGET; finalrealGit test uses actualnewAPI with3HTTPresponses andisolatedstrictobjectverification/corrupttruncatedrejection. Addedfailuretests malformed/fatal/truncatedGit, truncatedHTTPafterflush, sinkpartialfailure/cancelpositivebytes, empty/65tips, helperinvalidcount/zero/signature. StrictClippytomanyarguments fixedbygroupingPackPrefixstate. Final80testsPASS+1ignoredexactchildentry invokedbyparent, strictClippy/fmt/diffPASS; CARGO_INCREMENTAL=0/nooverlappingbuilds. Hostreserve9GiBmaintained/no cleanupthisbatch; versions0.0.17/dependenciesunchanged. RealprivateGitHub/Keychain/fullstoreworkers/budgets/reachability/human/M0gatesremainopen. Priorlocal46+51notes preserved; existing43–52watchesnotpolled/automationenabled; currentheadCIrequired.
 
 2026-11-02 packtransfer finalerror-pathrecheck: cancel-before-finalize intentionally makes rejectedtipset HTTPevidence incomplete; oldtestexpectedcompleted2failed79PASS1FAIL, rootcorrected toasserttwo trackedresponses/no falsecomplete. Finalrerun80PASS1ignored/strictClippy/fmt/diffPASS; host9.3GiBfree. No furtherimplementationchanges pending.
+
+2026-11-02 PR45greenwake: actualf875069a10993779875cba47bd843159d287a6c4 OPEN/MERGEABLE; four currenthead build/test jobsSUCCESS, SourceryreviewSKIPPED, CopilotquotaCOMMENTED notapproval, inlinecomments empty/no blockingfindings. Base44feature remainsunmerged; preservegreen45 until lowerstack integratesmain, no featureparentmerge/lowerwatchpoll. Existingwatch/current53branch4621913preserved/automationenabled.
+
+2026-11-02 PR51greenwake: actualf7568e83541d4c818bd1e2ccf7c3577301c6ad2b OPEN/MERGEABLE; four currenthead build/test jobsSUCCESS, SourceryreviewSKIPPED, CopilotquotaCOMMENTED notapproval, inlinecomments empty/no blockingfindings. Base50feature remainsunmerged; preservegreen51 until lowerstack integratesmain, no featureparentmerge/lowerwatchpoll. Existingwatch/current53branch4621913/local45checkpointpreserved/automationenabled.
+
+2026-11-02 latestintegration: PR43mergedmain02095ae/unwatched; PR44retargetedmain/head3f18d06 resolves squashconflicts after main-vs43sourcecomparison identical, stageddiffprogress-only/noimplementationchange. All38candidate tests/fmt/diffPASS; fresh44CIrequired/existingwatchpersists. Current53branch4621913/local45+51notesrestoredpreserved/automationenabled/no lowerwatchpoll.
+
+2026-11-02 PR52commentwake: read Sourcery guide6589824171 in full; descriptive boundedrealGitfetch/privateTLS/strictisolatedreceivers/corrupttruncatedrejection/limits summary without actionablefindings. Inlinecomments empty; CopilotquotaCOMMENTED notapproval. Actual52head132f8e35fd29dc4828c0c9539ebb54d42c7388e6/base51confirmed. No codechange/CIrestart warranted; existingwatch/current53branch4621913/localintegrationnotes preserved/automationenabled.
+
+2026-11-02 lateststack: PR47head28e146a integrates46ed8ef44; append-onlyprogressconflict/all datedentriesretained/stageddiffprogress-only/diffcheckPASS/noimplementationchange. Fresh47CIrequired/existingwatchpersists. Current53branch4621913/local45+51+43merge+52reviewnotes restoredpreserved/automationenabled/no watchedPRpoll.
+
+2026-11-02 WIP fix/m0-payload-allocation-accounting atop534621913/main02095ae: actualgit/worktree/localnotes preserved/host9.3GiBfree. RevisitedROADMAP/spec2GiBtemp+reservecontract: ownedpayloadprobe chargeslenonly; nextclosedfixchargesmax(logical,reportedallocated)highwater includingpost-sync, no whole-store/recoveryclaim. BoundedLuna payload.rs only/rootconcretereviewbeforeexecution+integration; existing44–53 watchesnotpolled/nooverlappingbuilds/automationenabled.
+
+2026-11-02 fix/m0-payload-allocation-accounting atop534621913: boundedLuna payload.rs/rootconcretereview beforeexecution. Payload budget nowchargesmonotonicmax(logical length, checked Unixblocks*512) initial/beforewrites/afterwrites/afterpayloadsync even syncerror; partialwrites/postwritereservefailure retainactualobservedallocation/firstbudgetreason, lowerlaterobservationsneverreleasecharges. Existing32KiBlogicalcap/identity/privateownership/no-follow/retention/cleanuprefusal unchanged. RustMetadataExtprimarydocs confirms512byteblocks; no blocksize multiplication confusion. Rootremovedredundantformula-mirrortest, retainedrealpartial/reserve/syncerroraccounting and pureoverflow/highwaterinvariants. Final32unit+10supervisionintegrationtestsPASS, strictClippy/fmt/version0.0.17/diffPASS; host9.2GiBfree/CARGO_INCREMENTAL=0/nooverlappingbuilds/no cleanup. Singlepayloadaccountingonly, directory/journal/index/whole-store/durableaggregate/sharedextents/reclaimablebytes/productionheadroom/privateauth/human/M0gatesremainopen. Priorlocalnotification/integrationnotespreserved; existing44–53 watchesnotpolled/automationenabled; currentheadCIrequired.
 2026-11-02 PR35mergedtomain8a2a4f516d7ae39aedb2f212d4331e431bfe00b8 afterhead174a2edfourbuild/testjobsSUCCESS/noinlinefindings(botquota/guide/SourcerySKIPPEDnotapproval). Unwatched35/retargeted36main. Integratedmaininto36; progress/READMEappend-onlysquashconflictsresolvedretainingHEADsupersetaftercomparison, noimplementationdiff. DiffcheckPASS, prior25transporttestsunchanged; new36headrequiresCI/existingwatchactive. PR37/38andstashedcheckpointpreserved; automationenabled.
 
 2026-11-02 PR36mergedtomainf7a5991a544dba37bcd41932b301384dadb014b0 afterhead2031069fourbuild/testjobsSUCCESS/noinlinefindings(botquota/guide/SourcerySKIPPEDnotapproval). Unwatched36/retargeted37main. Integratedmaininto37; additivePOSTsource/README/progresssquashconflictsresolvedretainingreviewed37implementationandallmainprogressentries. Stageddiffonlyprogress(noimplementationchange); diffcheckPASS/prior29transporttestsunchanged, new37headCIrequired/existingwatchactive. PR38/39andstashedcheckpointpreserved; automationenabled.
@@ -502,6 +516,8 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 lateststack: PR52 integrates5135a81a7; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current58/localnotes preserved/automationenabled.
 
 2026-11-03 lateststack: PR53 integrates5230daee3; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current59/localnotes preserved/automationenabled.
+
+2026-11-03 lateststack: PR54 integrates539917e33; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current60/localnotes preserved/automationenabled.
 2026-11-02 PR40mergedmain15f0de1 after head2a30c09 four current-head build/test jobs SUCCESS/no inline or blocking findings; botquota/SourcerySKIPPED notapproval. Unwatched40/retargeted41main. Verified main candidate source+README identical to40head; resolved41 squash conflicts retaining reviewed41chunkedsource/docs/progress superset/no implementationchange. Fresh41CIrequired/existingwatchpersists. Current49/local47green+48review+43parent+41green checkpoint preserved; automationenabled.
 
 2026-11-02 PR42green+parentconflictwake: cf31913 fourbuild/testSUCCESS/SourcerySKIPPED but updatedparent41head5414e4e caused append-only progressconflict. Integratedparent/main15f0de1, bothdatedhistoriesretained; stageddiffprogress-only/no implementationchange/diffcheckPASS. New42headneedsfreshCI/existingwatchpersists; current50cleancheckpoint preserved/automationenabled.
@@ -536,6 +552,8 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 lateststack: PR52 integrates51738de56; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current59/localnotes preserved/automationenabled.
 
 2026-11-03 lateststack: PR53 integrates523134fb0; append-onlyprogressconflict/all datedentriesretained/noimplementationchange, freshcurrentheadCIrequired/existingwatchpersists. Current60/localnotes preserved/automationenabled.
+
+2026-11-03 PR54 integrates updated53 head344ae47; conflict limited to appended progress, every dated entry retained. No implementation changes; fresh current-head CI required before merge. Existing watch persists.
 2026-11-02 PR45mergedmainba0b9ae; PR46retargetedmain/integratedbaseline afterparent45ancestor+main sourceidentical verified; retainedreviewed46source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing46watchpersists/current57localnotes preserved/automationenabled.
 
 2026-11-03 PR47green/conflict integration: 8b0e61e fourbuild/testSUCCESS/noinlinefindings, parentadvanced46361b35c/mainba0b9ae; mergedparent resolvingonlyappend-onlyprogress/all datedentriesretained/noimplementationchange. FreshcurrentheadCIrequired/existingwatchpersists/current57localnotes preserved/automationenabled.
@@ -551,6 +569,8 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR52 green wake:3134fb0 four build/test jobs SUCCESS, Sourcery SKIPPED/Copilot quota COMMENTED, inline findings empty; parent51 updated7871702 caused conflict. Integrated parent, preserving all dated progress entries; no implementation changes. Fresh current-head CI required, feature parent remains unmerged, existing watch persists.
 
 2026-11-03 PR53 integrates updated52 head0d71954; conflict limited to appended progress, every dated entry retained. No implementation changes; fresh current-head CI required before merge. Existing watch persists.
+
+2026-11-03 PR54 integrates updated53 headcbd81bc; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 2026-11-02 PR45mergedmainba0b9ae; PR46retargetedmain/integratedbaseline afterparent45ancestor+main sourceidentical verified; retainedreviewed46source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing46watchpersists/current57localnotes preserved/automationenabled.
 
 2026-11-03 PR46mergedmainf2734c5; PR47retargetedmain/integratedbaseline afterparent46ancestor+main sourceidentical verified; retainedreviewed47source, onlyappend-onlyprogresschange/all datedentriesretained. CurrentheadCIrequired/existing47watchpersists/current58localnotes preserved/automationenabled.
@@ -574,6 +594,8 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR52 integrates updated51 headc53d78c; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 
 2026-11-03 PR53 integrates updated52 head98b4a4d; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR54 integrates updated53 head7fc0a8f; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
 
 2026-11-03 PR50 integrates updated49 head52e858e/main e44957e; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
@@ -583,6 +605,8 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR52 integrates updated51 headd698c07/main e44957e; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 
 2026-11-03 PR53 integrates updated52 head5e235e1/main e44957e; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR54 integrates updated53 head302e1fb/main e44957e; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
 
 2026-11-03 PR49 head52e858e merged to main9635f78 after four current-head build/test successes/no blocking findings; unwatch49. PR50 retargeted main, verified49 ancestor and main-vs49 transport/budget source identical; retained reviewed50 source for squash integration. All dated progress preserved; fresh50 CI required.
@@ -592,6 +616,8 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR52 integrates updated51 head11e87bd/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 
 2026-11-03 PR53 integrates updated52 head544e563/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR54 integrates updated53 headf1934d1/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
 
 2026-11-03 PR50 integrates updated49 head52e858e/main e44957e; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
@@ -604,11 +630,15 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR52 integrates updated51 headaf82b3e/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 
 2026-11-03 PR53 integrates updated52 head536cf48/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR54 integrates updated53 head5b2a3b8/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 2026-11-03 PR51 exactheadaf82b3e four required build/test jobs SUCCESS/no blocking inline findings, Sourcery SKIPPED and Copilot quota COMMENTED not approval. Root source review bounded test-only fixture; merged squash to mainfb2c452 and unwatched51. PR52 retargetedmain; prior51/main crate source identical, retained reviewed52 fixture/README/lib source through squash conflicts, all dated progress preserved. Fresh52 CI required.
 
 2026-11-03 PR52/main integration validation: staged implementation unchanged,68transport tests PASS/1 helper ignored/fmt and diff checks PASS. Mainbaseline nowfb2c452; no authentication/product milestone gate closed. Fresh current-head CI required and existing52 watch persists.
 
 2026-11-03 PR53 integrates updated52 headd5f8191/mainfb2c452; append-only progress conflict resolved retaining every dated entry. Implementation unchanged; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR54 integrates updated53 headc402be0/mainfb2c452; append-only progress conflict resolved retaining every dated entry. Implementation unchanged; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
 2026-11-03 PR51 exactheadaf82b3e four required build/test jobs SUCCESS/no blocking inline findings, Sourcery SKIPPED and Copilot quota COMMENTED not approval. Root source review bounded test-only fixture; merged squash to mainfb2c452 and unwatched51. PR52 retargetedmain; prior51/main crate source identical, retained reviewed52 fixture/README/lib source through squash conflicts, all dated progress preserved. Fresh52 CI required.
 
 2026-11-03 PR52/main integration validation: staged implementation unchanged,68transport tests PASS/1 helper ignored/fmt and diff checks PASS. Mainbaseline nowfb2c452; no authentication/product milestone gate closed. Fresh current-head CI required and existing52 watch persists.
@@ -616,3 +646,7 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR52 exactheadd5f8191 four required build-test jobs SUCCESS/MERGEABLE/main/no inline blocking findings; Sourcery SKIPPED/Copilot quota not approval. Root reviewed isolated test-only fetch/receiver diff and merged52 squashmain4844d7c/unwatched52. PR53 retargetedmain; verified52/main transportcrate identical, retained reviewed53 fixture/README/lib through squash conflicts, all dated progress preserved. Fresh53 CI required/existingwatch persists.
 
 2026-11-03 PR53 mainintegration validation: staged source unchanged/progress-only,80transport tests PASS/1 exactchildhelper ignored/fmt/diff PASS locallymacOS. Newmainbaseline4844d7c; no production/milestone acceptance inference. Fresh-head CI required/existing53watch retained.
+
+2026-11-03 PR54 integrates updated53 head6694224/main4844d7c; append-only progress conflict resolved retaining every dated entry. Implementation unchanged; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR53 merged: exact6694224 four required build/test jobs SUCCESS, no inline/blocking findings, base main; squash main3cf5c8c/unwatched53. PR54 retargeted main and integrated source-identical squash; progress-only conflict/all dated entries retained/implementation unchanged/diff check PASS. Fresh54 head CI required before merge; bounded evidence only/no milestone complete.

@@ -100,10 +100,25 @@ fn write_payload_accounted(
         validate_payload_metadata(&metadata, None, 0)?;
         let payload_id = identity(&payload)?;
         validate_store(&store, true, Some(payload_id))?;
+        let mut accounted_high_water = 0;
+        account_payload_observation(
+            job,
+            budget,
+            payload_high_water_from_metadata(&metadata)?,
+            free_before,
+            &mut accounted_high_water,
+        )?;
 
         let (written, cap_reached) = write_chunks(&mut payload, |file, offset, next| {
             validate_store(&store, true, Some(payload_id))?;
             let free_before = sample_free(&store.root)?;
+            account_payload_observation(
+                job,
+                budget,
+                payload_high_water(file)?,
+                free_before,
+                &mut accounted_high_water,
+            )?;
             budget
                 .check_store_admission(job, next as u64, free_before)
                 .map_err(|_| StoreError::InvalidJournal)?;
@@ -114,23 +129,41 @@ fn write_payload_accounted(
                 *byte = (((offset as usize + index) * 31 + 17) % 251 + 1) as u8;
             }
             let write_result = write_bytes(file, &chunk[..next]);
-            // Observe and charge even when write_all left only part of this chunk.
-            // An unreadable size leaves an uncertain retained fixture, never cleanup.
-            let actual_size = file.metadata()?.len();
-            let growth = actual_size
-                .checked_sub(offset)
-                .ok_or(StoreError::InvalidIdentity)?;
+            // Observe and charge actual high-water growth even when write_all
+            // left only part of this chunk. Never release a prior allocation
+            // charge if the filesystem later reports fewer blocks.
+            let actual_high_water = payload_high_water(file)?;
             let free_after = sample_free(&store.root);
-            let charge_result =
-                budget.record_store(job, growth, free_after.as_ref().copied().unwrap_or(0));
+            let charge_result = account_payload_observation(
+                job,
+                budget,
+                actual_high_water,
+                free_after.as_ref().copied().unwrap_or(0),
+                &mut accounted_high_water,
+            );
             write_result?;
             free_after?;
-            charge_result.map_err(|_| StoreError::InvalidJournal)?;
+            charge_result?;
             validate_store(&store, true, Some(payload_id))?;
             validate_named_payload(&store, file, payload_id, offset + next as u64)?;
             Ok(())
         })?;
-        sync_payload(&payload, sync_file)?;
+        let sync_result = sync_payload(&payload, sync_file);
+        let sync_high_water = payload_high_water(&payload);
+        let free_after_sync = sample_free(&store.root);
+        let sync_charge = match sync_high_water {
+            Ok(high_water) => account_payload_observation(
+                job,
+                budget,
+                high_water,
+                free_after_sync.as_ref().copied().unwrap_or(0),
+                &mut accounted_high_water,
+            ),
+            Err(error) => Err(error),
+        };
+        sync_result?;
+        free_after_sync?;
+        sync_charge?;
         store.root.sync_all()?;
         validate_store(&store, true, Some(payload_id))?;
         validate_named_payload(&store, &payload, payload_id, written)?;
@@ -186,6 +219,43 @@ fn sync_payload(
     sync: impl FnOnce(&File) -> std::io::Result<()>,
 ) -> Result<(), StoreError> {
     sync(file).map_err(StoreError::Io)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn payload_high_water(file: &File) -> Result<u64, StoreError> {
+    payload_high_water_from_metadata(&file.metadata()?)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn payload_high_water_from_metadata(metadata: &std::fs::Metadata) -> Result<u64, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    payload_high_water_bytes(metadata.len(), metadata.blocks())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn payload_high_water_bytes(logical_bytes: u64, allocated_blocks: u64) -> Result<u64, StoreError> {
+    let allocated_bytes = allocated_blocks
+        .checked_mul(512)
+        .ok_or(StoreError::InvalidJournal)?;
+    Ok(logical_bytes.max(allocated_bytes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn account_payload_observation(
+    job: verification_budget::JobId,
+    budget: &mut BudgetController,
+    observed_high_water: u64,
+    free_bytes: u64,
+    accounted_high_water: &mut u64,
+) -> Result<(), StoreError> {
+    let high_water = (*accounted_high_water).max(observed_high_water);
+    let growth = high_water
+        .checked_sub(*accounted_high_water)
+        .ok_or(StoreError::InvalidJournal)?;
+    *accounted_high_water = high_water;
+    budget
+        .record_store(job, growth, free_bytes)
+        .map_err(|_| StoreError::InvalidJournal)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -331,6 +401,19 @@ fn payload_length_named(root: &impl AsFd, name: &str) -> u64 {
     File::from(fd).metadata().unwrap().len()
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn payload_high_water_named(root: &impl AsFd, name: &str) -> u64 {
+    use rustix::fs::{openat, OFlags};
+    let fd = openat(
+        root,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    payload_high_water(&File::from(fd)).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,8 +464,9 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(payload_length(&root), 2048);
+        let actual_high_water = payload_high_water_named(&root, NAME);
         let job = budget.snapshot(JobId(1)).unwrap();
-        assert_eq!(job.usage.stored_bytes, 2048);
+        assert_eq!(job.usage.stored_bytes, actual_high_water);
         assert_eq!(
             job.state,
             JobState::Failed {
@@ -391,7 +475,7 @@ mod tests {
             }
         );
         assert!(budget.confirm_cleanup(JobId(1)).is_err());
-        assert_eq!(budget.aggregate_stored().unwrap(), 2048);
+        assert_eq!(budget.aggregate_stored().unwrap(), actual_high_water);
     }
 
     #[test]
@@ -415,8 +499,9 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(payload_length(&root), CHUNK as u64);
+        let actual_high_water = payload_high_water_named(&root, NAME);
         let job = budget.snapshot(JobId(1)).unwrap();
-        assert_eq!(job.usage.stored_bytes, CHUNK as u64);
+        assert_eq!(job.usage.stored_bytes, actual_high_water);
         assert_eq!(
             job.state,
             JobState::Failed {
@@ -600,15 +685,51 @@ mod tests {
 
         let store = OwnedStore::create().unwrap();
         let root = store.root.try_clone().unwrap();
-        let failure = write_payload_with(
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        let failure = write_payload_accounted(
             store,
             |_| Ok(u64::MAX),
             |file, bytes| file.write_all(bytes),
-            |_| Err(std::io::Error::other("injected sync failure")),
+            |file| {
+                file.sync_all()?;
+                Err(std::io::Error::other("injected sync failure"))
+            },
+            &mut budget,
         );
         assert!(failure.is_err());
         assert_eq!(payload_length(&root), LIMIT);
+        assert_eq!(
+            budget
+                .snapshot(verification_budget::JobId(1))
+                .unwrap()
+                .usage
+                .stored_bytes,
+            payload_high_water_named(&root, NAME)
+        );
         require_entries(&root, &["owner.journal", NAME]).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn high_water_uses_the_larger_logical_or_allocated_observation() {
+        assert_eq!(payload_high_water_bytes(2048, 1).unwrap(), 2048);
+        assert_eq!(payload_high_water_bytes(1000, 4).unwrap(), 2048);
+        assert_eq!(payload_high_water_bytes(0, 0).unwrap(), 0);
+        assert!(payload_high_water_bytes(1, u64::MAX).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lower_later_allocation_observation_does_not_release_budget_charge() {
+        let mut budget = BudgetController::new(Limits { headroom_bytes: 0 });
+        let job = budget.start(u64::MAX).unwrap();
+        let mut accounted = 0;
+        account_payload_observation(job, &mut budget, 8192, u64::MAX, &mut accounted).unwrap();
+        account_payload_observation(job, &mut budget, 4096, u64::MAX, &mut accounted).unwrap();
+        assert_eq!(accounted, 8192);
+        assert_eq!(budget.snapshot(job).unwrap().usage.stored_bytes, 8192);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

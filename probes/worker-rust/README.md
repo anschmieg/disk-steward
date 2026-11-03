@@ -128,18 +128,22 @@ This command retains all artifacts, including partial or uncertain outcomes on
 write/sync failure, and returns no store handle or cleanup receipt. The owner
 journal format and existing cleanup logic are unchanged: that cleanup refuses
 the added payload entry before mutation. The result measures bounded logical
-writes and sampled reserve gating only, not allocated disk growth, an aggregate
+writes, payload allocation observations and sampled reserve gating only, not a whole-store aggregate
 quota, Git object writes, a continuously maintained reserve against other
 writers, calibrated production headroom or power-loss durability.
 
 The payload command now uses the shared budget controller for advisory
-admission before creation and each chunk. It measures file-length growth after
-every attempted write and charges observed partial bytes even when the write
-returns an error. Completed fixture jobs retain their charged bytes with
+admission before creation and each chunk. On Linux/macOS it charges the
+monotonic high-water mark of the greater of logical payload length and reported
+allocated bytes (`MetadataExt::blocks()` in 512-byte units, checked for overflow).
+It observes the held payload before/after writes and after synchronization,
+including failed writes or syncs. Lower later observations never release a
+previous charge. This conservatively retains observed partial usage without
+claiming that allocated blocks equal uniquely owned or reclaimable bytes. Completed fixture jobs retain their charged bytes with
 cleanup unconfirmed; other incomplete store operations fail the fixture job
 without asserting worker-stop proof. An existing observation-limit failure
 keeps its original reason. Unknown post-write free space is treated
-conservatively as zero for post-write accounting; an unreadable file size leaves
+conservatively as zero for post-write accounting; unreadable or overflowing allocation metadata leaves
 an uncertain retained fixture rather than a claimed complete observation.
 The controller is local to this command, so this is not durable/global
 aggregate enforcement across retained fixture runs.
@@ -147,3 +151,8 @@ aggregate enforcement across retained fixture runs.
 This accounting covers payload-file growth only; owner/control metadata are
 not included in its observed byte total. Their production storage accounting
 and persistence across retained stores remain separate gates.
+
+Block counts follow [Rust's Unix metadata contract](https://doc.rust-lang.org/std/os/unix/fs/trait.MetadataExt.html#tymethod.blocks).
+They can differ from file length for sparse or compressed files. Shared extents,
+delayed allocation and filesystem-specific reclamation still need separate
+validation; a sampled high-water charge is not a disk-space reservation.
