@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -15,7 +16,10 @@ import {
 } from "../test-fixtures/editor";
 import AdvancedPlanPanel from "./AdvancedPlanPanel";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 function mount(
   snapshot = editorSnapshot([]),
@@ -190,6 +194,90 @@ describe("AdvancedPlanPanel decisions", () => {
       choice: "keep",
     });
   });
+
+  it.each([false, true])(
+    "restores focus after the focused row disappears (group removed: %s)",
+    (removeGroup) => {
+      const frames: FrameRequestCallback[] = [];
+      vi.stubGlobal(
+        "requestAnimationFrame",
+        (callback: FrameRequestCallback) => {
+          frames.push(callback);
+          return frames.length;
+        },
+      );
+      const original = editorItem("candidate", {
+        label: "Candidate",
+        groupIds: ["review-group"],
+      });
+      const other = editorItem("other", {
+        label: "Other",
+        groupIds: ["other-group"],
+      });
+      const initial = editorSnapshot(
+        [original, other],
+        [
+          editorGroup("review-group", ["candidate"]),
+          editorGroup("other-group", ["other"]),
+        ],
+      );
+      const onEdit = vi
+        .fn<(edit: PlanEdit) => Promise<void>>()
+        .mockResolvedValue();
+      const props = {
+        busy: false,
+        confirmed: false,
+        editsConfirmed: true,
+        readOnly: false,
+        onEdit,
+        onUndo: async () => {},
+        onRedo: async () => {},
+        onRefresh: async () => {},
+        onReview: async () => {},
+      };
+      const { rerender } = render(
+        <AdvancedPlanPanel snapshot={initial} {...props} />,
+      );
+      Object.defineProperty(
+        screen.getByRole("list", { name: "Grouped plan findings" }),
+        "clientHeight",
+        { configurable: true, value: 464 },
+      );
+      const remove = screen.getByRole("button", {
+        name: "Remove Candidate from plan",
+      });
+      act(() => remove.focus());
+      expect(remove).toHaveFocus();
+      fireEvent.click(remove);
+      expect(onEdit).toHaveBeenCalledExactlyOnceWith({
+        kind: "setMembership",
+        itemId: "candidate",
+        inPlan: false,
+      });
+      const next = {
+        ...initial,
+        revisionId: "revision-after-removal",
+        revisionNumber: initial.revisionNumber + 1,
+        items: [
+          { ...original, inPlan: false, effectiveSelected: false },
+          other,
+        ],
+        groups: removeGroup
+          ? [editorGroup("other-group", ["other"])]
+          : initial.groups,
+      };
+      rerender(<AdvancedPlanPanel snapshot={next} {...props} />);
+      act(() => frames.splice(0).forEach((callback) => callback(0)));
+      expect(
+        screen.queryByRole("button", { name: "Remove Candidate from plan" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name: removeGroup ? "Collapse other-group" : "Collapse review-group",
+        }),
+      ).toHaveFocus();
+    },
+  );
 
   it("sends the exact descendant exclusion identity set", () => {
     const folder = editorItem("project", { label: "Project", kind: "folder" });

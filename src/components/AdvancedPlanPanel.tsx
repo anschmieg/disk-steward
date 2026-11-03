@@ -85,7 +85,8 @@ export default function AdvancedPlanPanel({
     focusKey: string | null;
     itemId: string | null;
     rowKey: string | null;
-  }>({ focusKey: null, itemId: null, rowKey: null });
+    groupId: string | null;
+  }>({ focusKey: null, itemId: null, rowKey: null, groupId: null });
   const lastRevision = useRef(snapshot.revisionId);
   const pendingFocusRestore = useRef(false);
   const items = useMemo(
@@ -275,8 +276,20 @@ export default function AdvancedPlanPanel({
         if (row) {
           const index = rows.indexOf(row);
           requestFocusRow(index);
+          return;
         }
       }
+      if (previous.groupId) {
+        const groupIndex = rows.findIndex(
+          (row) => row.groupId === previous.groupId && !row.item,
+        );
+        if (groupIndex >= 0) {
+          requestFocusRow(groupIndex);
+          return;
+        }
+      }
+      if ((previous.itemId || previous.rowKey) && rows.length > 0)
+        requestFocusRow(0);
     });
   }, [snapshot.revisionId, busy, rows]);
   const descendants = useMemo(() => {
@@ -353,10 +366,14 @@ export default function AdvancedPlanPanel({
     if (!(target instanceof HTMLElement)) return;
     const keyed = target.closest<HTMLElement>("[data-editor-focus]");
     const row = target.closest<HTMLElement>("[data-editor-row]");
+    const rowKey = row?.dataset.editorRow ?? null;
     focusContext.current = {
       focusKey: keyed?.dataset.editorFocus ?? null,
       itemId: row?.dataset.itemId ?? null,
-      rowKey: row?.dataset.editorRow ?? null,
+      rowKey,
+      groupId: rowKey
+        ? (rows.find((entry) => entry.key === rowKey)?.groupId ?? null)
+        : null,
     };
   };
   const setChoice = (item: EditorItem, choice: PlanChoice) =>
