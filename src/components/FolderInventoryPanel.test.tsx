@@ -1229,3 +1229,32 @@ test("name categories filter the linked list while preserving exact totals, evid
   expect(table).toHaveTextContent("Zeta");
   expect(table).toHaveTextContent("Nested");
 });
+
+test("page observation timing stays historical on failed refresh and flags device clock reversal", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce({
+      ...sample,
+      observationWindow: {
+        startedUnixMs: "1700000000000",
+        finishedUnixMs: "1699999999999",
+        elapsedMillis: "12",
+      },
+    })
+    .mockRejectedValueOnce(new Error("fixture refusal"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  const timing = screen.getByRole("region", { name: "Observation timing" });
+  expect(timing).toHaveTextContent("2023-11-14T22:13:20.000Z");
+  expect(timing).toHaveTextContent("12 milliseconds");
+  expect(timing).toHaveTextContent("clock moved backward");
+  expect(timing).toHaveTextContent(
+    "timestamps do not guarantee that evidence is current",
+  );
+  const before = timing.textContent;
+  fireEvent.click(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  );
+  await screen.findByText(/could not be refreshed reliably/);
+  expect(timing.textContent).toBe(before);
+});

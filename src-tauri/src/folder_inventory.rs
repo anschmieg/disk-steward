@@ -5,7 +5,7 @@ use disk_steward_core::InventoryItemId;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_SAFE_JS_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -219,12 +219,53 @@ pub struct FolderInventoryEntry {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ObservationWindow {
+    pub started_unix_ms: Option<String>,
+    pub finished_unix_ms: Option<String>,
+    pub elapsed_millis: String,
+}
+
+fn unix_millis_decimal(time: SystemTime) -> Option<String> {
+    let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    u64::try_from(millis).ok().map(|value| value.to_string())
+}
+
+fn decimal_timestamp_or_unknown(value: Option<&str>) -> &str {
+    match value {
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 20
+                && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            value
+        }
+        _ => "unknown",
+    }
+}
+
+fn observation_window_evidence(window: &ObservationWindow) -> String {
+    format!(
+        "Observation window (device clock; advisory, not a freshness guarantee or approval): started Unix ms {}; finished Unix ms {}; elapsed ms {}.",
+        decimal_timestamp_or_unknown(window.started_unix_ms.as_deref()),
+        decimal_timestamp_or_unknown(window.finished_unix_ms.as_deref()),
+        decimal_timestamp_or_unknown(Some(window.elapsed_millis.as_str())),
+    )
+}
+
+fn finish_observation_window(snapshot: &mut FolderInventorySnapshot, started: Instant) {
+    snapshot.observation_window.finished_unix_ms = unix_millis_decimal(SystemTime::now());
+    snapshot.observation_window.elapsed_millis = started.elapsed().as_millis().to_string();
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct FolderInventorySnapshot {
     pub observation_id: InventoryItemId,
     pub root_label: String,
     pub breadcrumbs: Vec<String>,
     pub entries: Vec<FolderInventoryEntry>,
     pub name_categories: Vec<NameCategoryAggregate>,
+    pub observation_window: ObservationWindow,
     pub enumeration_complete: bool,
     pub unreadable_count: u32,
     pub stop_reason: Option<&'static str>,
@@ -249,6 +290,11 @@ fn empty_snapshot(
         breadcrumbs,
         entries: Vec::new(),
         name_categories: Vec::new(),
+        observation_window: ObservationWindow {
+            started_unix_ms: None,
+            finished_unix_ms: None,
+            elapsed_millis: "0".to_owned(),
+        },
         enumeration_complete: false,
         unreadable_count: 0,
         stop_reason: None,
@@ -440,7 +486,8 @@ impl FolderInventoryState {
                 evidence: vec![EvidenceRef {
                     id: disk_steward_core::EvidenceId::new(),
                     summary: format!(
-                        "Observation {observation} at {breadcrumb_text}. Shallow metadata only; no paths or contents retained. Availability: {}; logical bytes: {}; allocated bytes: {}; link count: {}. Provider and hydration behavior are unverified. Allocation is per-entry st_blocks metadata; hard links or shared storage may overlap, so this is not a unique or reclaimable total.",
+                        "Observation {observation} at {breadcrumb_text}. {} Shallow metadata only; no paths or contents retained. Availability: {}; logical bytes: {}; allocated bytes: {}; link count: {}. Provider and hydration behavior are unverified. Allocation is per-entry st_blocks metadata; hard links or shared storage may overlap, so this is not a unique or reclaimable total.",
+                        observation_window_evidence(&session.snapshot.observation_window),
                         entry.availability,
                         entry.logical_bytes.as_deref().unwrap_or("unknown"),
                         entry.allocated_bytes.as_deref().unwrap_or("unknown"),
@@ -826,17 +873,20 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     use rustix::fs::{fstat, statat, AtFlags, Dir, FileType};
 
     let started = Instant::now();
+    let wall_started = SystemTime::now();
     let mut snapshot = empty_snapshot(
         InventoryItemId::new(),
         root_label.to_owned(),
         breadcrumbs,
         can_go_back,
     );
+    snapshot.observation_window.started_unix_ms = unix_millis_decimal(wall_started);
     snapshot.page_number = page_number;
     snapshot.entries_seen = entries_seen.to_string();
     let root_metadata_result = fstat(fd);
     if started.elapsed() >= duration {
         snapshot.stop_reason = Some("time_limit");
+        finish_observation_window(&mut snapshot, started);
         return Ok(ScannedDirectory {
             snapshot,
             entries: Vec::new(),
@@ -873,6 +923,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     }
     if started.elapsed() >= duration {
         snapshot.stop_reason = Some("time_limit");
+        finish_observation_window(&mut snapshot, started);
         return Ok(ScannedDirectory {
             snapshot,
             entries: Vec::new(),
@@ -1038,6 +1089,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     if started.elapsed() >= duration {
         snapshot.enumeration_complete = false;
         snapshot.stop_reason.get_or_insert("time_limit");
+        finish_observation_window(&mut snapshot, started);
         return Ok(ScannedDirectory {
             snapshot,
             entries: observed_entries,
@@ -1048,6 +1100,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     if started.elapsed() >= duration {
         snapshot.enumeration_complete = false;
         snapshot.stop_reason.get_or_insert("time_limit");
+        finish_observation_window(&mut snapshot, started);
         return Ok(ScannedDirectory {
             snapshot,
             entries: observed_entries,
@@ -1088,6 +1141,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         entries_seen,
         replay_prefix,
     });
+    finish_observation_window(&mut snapshot, started);
     Ok(ScannedDirectory {
         snapshot,
         entries: observed_entries,
@@ -2100,6 +2154,58 @@ mod tests {
     }
 
     #[test]
+    fn observation_window_serializes_decimal_times_and_nonnegative_elapsed() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("observed"), b"x").unwrap();
+        let snapshot = scan_selected_folder(root.path()).unwrap();
+        let window = &snapshot.observation_window;
+        let started = window
+            .started_unix_ms
+            .as_deref()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let finished = window
+            .finished_unix_ms
+            .as_deref()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let _elapsed = window.elapsed_millis.parse::<u128>().unwrap();
+        assert!(window
+            .elapsed_millis
+            .bytes()
+            .all(|byte| byte.is_ascii_digit()));
+        // Wall-clock timestamps are advisory and may move backward independently.
+        let _wall_clock_moved_backward = finished < started;
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["observationWindow"]["startedUnixMs"].is_string());
+        assert!(json["observationWindow"]["finishedUnixMs"].is_string());
+        assert!(json["observationWindow"]["elapsedMillis"].is_string());
+        let empty = empty_snapshot(
+            InventoryItemId::new(),
+            "folder".to_owned(),
+            vec!["folder".to_owned()],
+            false,
+        );
+        assert_eq!(empty.observation_window.started_unix_ms, None);
+        assert_eq!(empty.observation_window.finished_unix_ms, None);
+        assert_eq!(empty.observation_window.elapsed_millis, "0");
+    }
+
+    #[test]
+    fn unix_millis_conversion_rejects_before_epoch_and_unrepresentable_values() {
+        let before_epoch = UNIX_EPOCH.checked_sub(Duration::from_millis(1)).unwrap();
+        assert_eq!(unix_millis_decimal(before_epoch), None);
+        if let Some(out_of_range) =
+            UNIX_EPOCH.checked_add(Duration::from_millis(u64::MAX) + Duration::from_millis(1))
+        {
+            assert_eq!(unix_millis_decimal(out_of_range), None);
+        }
+    }
+
+    #[test]
     fn folder_navigation_explanations_match_openability_policy() {
         use rustix::fs::{statat, AtFlags, CWD};
 
@@ -2874,8 +2980,14 @@ mod tests {
         fs::write(root.path().join("observed.txt"), b"abc").unwrap();
         fs::create_dir(root.path().join("child-folder")).unwrap();
         unix_fs::symlink("observed.txt", root.path().join("alias-link")).unwrap();
-        let (session, snapshot) =
+        let (mut session, snapshot) =
             selected_root_session(root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        session.snapshot.observation_window = ObservationWindow {
+            started_unix_ms: Some("1700000000000".to_owned()),
+            finished_unix_ms: Some("1700000000123".to_owned()),
+            elapsed_millis: "123".to_owned(),
+        };
+        let original_window = session.snapshot.observation_window.clone();
         let state = FolderInventoryState::default();
         *state.0.lock().unwrap() = Some(session);
 
@@ -2915,6 +3027,27 @@ mod tests {
         assert!(imported
             .iter()
             .all(|item| item.evidence[0].summary.len() <= 2048));
+        assert!(imported.iter().all(|item| {
+            item.evidence[0]
+                .summary
+                .contains("started Unix ms 1700000000000")
+                && item.evidence[0]
+                    .summary
+                    .contains("finished Unix ms 1700000000123")
+                && item.evidence[0].summary.contains("elapsed ms 123")
+                && item.evidence[0].summary.contains("device clock; advisory")
+        }));
+        assert_eq!(
+            state
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .observation_window,
+            original_window
+        );
         assert!(imported.iter().any(|item| {
             item.evidence[0]
                 .summary
