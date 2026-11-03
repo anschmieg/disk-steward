@@ -80,6 +80,7 @@ export default function AdvancedPlanPanel({
   const [descendantSearch, setDescendantSearch] = useState("");
   const [descendantPage, setDescendantPage] = useState(0);
   const scroller = useRef<HTMLDivElement>(null);
+  const panelRoot = useRef<HTMLElement>(null);
   const rowRefs = useRef(new Map<string, HTMLElement>());
   const pendingFocusRow = useRef<string | null>(null);
   const focusContext = useRef<{
@@ -281,7 +282,9 @@ export default function AdvancedPlanPanel({
         return;
       if (previous.focusKey) {
         const eligible = Array.from(
-          document.querySelectorAll<HTMLElement>("[data-editor-focus]"),
+          panelRoot.current?.querySelectorAll<HTMLElement>(
+            "[data-editor-focus]",
+          ) ?? [],
         ).find((element) => element.dataset.editorFocus === previous.focusKey);
         if (eligible && !eligible.matches(":disabled")) {
           eligible.focus({ preventScroll: true });
@@ -420,6 +423,7 @@ export default function AdvancedPlanPanel({
     : 0;
   return (
     <section
+      ref={panelRoot}
       className="advanced-plan"
       aria-labelledby="advanced-plan-title"
       onFocusCapture={captureFocus}

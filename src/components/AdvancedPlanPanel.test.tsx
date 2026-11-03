@@ -376,6 +376,49 @@ describe("AdvancedPlanPanel decisions", () => {
     expect(search).toHaveFocus();
   });
 
+  it("restores focus within the revised panel when another panel shares item IDs", () => {
+    const frames = stubAnimationFrames();
+    const snapshot = editorSnapshot([
+      editorItem("shared-item", { label: "Shared item" }),
+    ]);
+    const props = {
+      busy: false,
+      confirmed: false,
+      onEdit: async () => {},
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+    };
+    const { rerender } = render(
+      <>
+        <AdvancedPlanPanel key="first" snapshot={snapshot} {...props} />
+        <AdvancedPlanPanel key="second" snapshot={snapshot} {...props} />
+      </>,
+    );
+    const [firstInclude, secondInclude] = screen.getAllByRole("button", {
+      name: "Include",
+    });
+    act(() => secondInclude.focus());
+    rerender(
+      <>
+        <AdvancedPlanPanel key="first" snapshot={snapshot} {...props} />
+        <AdvancedPlanPanel
+          key="second"
+          snapshot={{
+            ...snapshot,
+            revisionId: "second-panel-next",
+            revisionNumber: 2,
+          }}
+          {...props}
+        />
+      </>,
+    );
+    expect(frames.callbacks).toHaveLength(1);
+    act(() => frames.run(1));
+    expect(secondInclude).toHaveFocus();
+    expect(firstInclude).not.toHaveFocus();
+  });
+
   it("respects focus moved outside the editor before a current restore runs", () => {
     const frames = stubAnimationFrames();
     const snapshot = editorSnapshot([editorItem("external-focus")]);
