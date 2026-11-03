@@ -434,4 +434,101 @@ describe("AdvancedPlanPanel large review navigation", () => {
       screen.getByRole("listitem", { name: /Large finding 09999/ }),
     ).toHaveFocus();
   });
+
+  it("clamps a scrolled window when a revision removes most visible members", () => {
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    const items = Array.from({ length: 80 }, (_, index) =>
+      editorItem(`revision-${index}`, { groupIds: ["revision-group"] }),
+    );
+    const groups = [
+      editorGroup(
+        "revision-group",
+        items.map((item) => item.itemId),
+      ),
+    ];
+    const view = mount(editorSnapshot(items, groups));
+    const list = screen.getByRole("list", { name: "Grouped plan findings" });
+    list.scrollTop = 79 * 58;
+    fireEvent.scroll(list);
+    expect(
+      within(list).queryByRole("listitem", { name: /^revision-0,/ }),
+    ).not.toBeInTheDocument();
+    view.rerender(
+      <AdvancedPlanPanel
+        snapshot={editorSnapshot(
+          items.map((item, index) => ({ ...item, inPlan: index === 0 })),
+          groups,
+          {
+            revisionId: "fixture-revision-2",
+            revisionNumber: 2,
+          },
+        )}
+        busy={false}
+        confirmed={false}
+        onEdit={view.onEdit}
+        onUndo={view.onUndo}
+        onRedo={view.onRedo}
+        onRefresh={view.onRefresh}
+        onReview={view.onReview}
+      />,
+    );
+    expect(
+      within(list).getByRole("listitem", { name: /^revision-0,/ }),
+    ).toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it("keeps filtered rows visible when a 10,000-item window shrinks from the end", () => {
+    const items = Array.from({ length: 10_000 }, (_, index) =>
+      editorItem(`shrink-${index + 1}`, {
+        label: `Shrink finding ${String(index + 1).padStart(5, "0")}`,
+        groupIds: ["shrink-group"],
+      }),
+    );
+    const snapshot = editorSnapshot(items, [
+      editorGroup(
+        "shrink-group",
+        items.map((item) => item.itemId),
+      ),
+    ]);
+    mount(snapshot);
+    const list = screen.getByRole("list", { name: "Grouped plan findings" });
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 464,
+    });
+    list.scrollTop = 10_000 * 58;
+    fireEvent.scroll(list);
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 10000/ }),
+    ).toBeInTheDocument();
+
+    const search = screen.getByRole("searchbox", {
+      name: "Search findings and groups",
+    });
+    search.focus();
+    fireEvent.change(search, { target: { value: "Shrink finding 00001" } });
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 00001/ }),
+    ).toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(search).toHaveFocus();
+    expect(list.scrollTop).toBe(0);
+
+    fireEvent.change(search, { target: { value: "" } });
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 00001/ }),
+    ).toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem").length).toBeLessThan(100);
+    expect(list.scrollTop).toBe(0);
+    const first = within(list).getByRole("listitem", {
+      name: /Shrink finding 00001/,
+    });
+    first.focus();
+    fireEvent.keyDown(first, { key: "ArrowDown" });
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 00002/ }),
+    ).toHaveFocus();
+  });
 });
