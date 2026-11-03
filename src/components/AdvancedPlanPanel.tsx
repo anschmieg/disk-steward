@@ -90,6 +90,7 @@ export default function AdvancedPlanPanel({
   }>({ focusKey: null, itemId: null, rowKey: null, groupId: null });
   const lastRevision = useRef(snapshot.revisionId);
   const pendingFocusRestore = useRef(false);
+  const focusRestoreGeneration = useRef(0);
   const items = useMemo(
     () => new Map(snapshot.items.map((item) => [item.itemId, item])),
     [snapshot.items],
@@ -261,9 +262,23 @@ export default function AdvancedPlanPanel({
       pendingFocusRestore.current = true;
     }
     if (busy || !pendingFocusRestore.current) return;
-    pendingFocusRestore.current = false;
     const previous = focusContext.current;
-    requestAnimationFrame(() => {
+    const focusedWhenScheduled = document.activeElement;
+    const generation = ++focusRestoreGeneration.current;
+    let completed = false;
+    const frame = requestAnimationFrame(() => {
+      if (focusRestoreGeneration.current !== generation) return;
+      completed = true;
+      pendingFocusRestore.current = false;
+      if (focusContext.current !== previous) return;
+      const currentFocus = document.activeElement;
+      if (
+        currentFocus !== focusedWhenScheduled &&
+        currentFocus instanceof HTMLElement &&
+        currentFocus !== document.body &&
+        currentFocus !== document.documentElement
+      )
+        return;
       if (previous.focusKey) {
         const eligible = Array.from(
           document.querySelectorAll<HTMLElement>("[data-editor-focus]"),
@@ -303,6 +318,13 @@ export default function AdvancedPlanPanel({
       if ((previous.itemId || previous.rowKey) && rows.length > 0)
         requestFocusRow(0);
     });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (focusRestoreGeneration.current === generation) {
+        focusRestoreGeneration.current += 1;
+        if (!completed) pendingFocusRestore.current = true;
+      }
+    };
   }, [snapshot.revisionId, busy, rows]);
   const descendants = useMemo(() => {
     if (!inspected || inspected.kind !== "folder") return [] as EditorItem[];
