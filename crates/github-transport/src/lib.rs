@@ -4,6 +4,8 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod entry_header;
+pub use entry_header::{parse_sha1_pack_entry_header, PackEntryHeader, PackEntryKind};
 mod checksum;
 pub use checksum::{check_sha1_pack_checksum, PackChecksumReport};
 mod pack;
@@ -2105,6 +2107,7 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 #[cfg(test)]
 mod tests {
     mod checksum_tests;
+    mod entry_header_tests;
     mod failure_tests;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod git_interop;
