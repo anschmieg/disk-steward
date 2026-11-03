@@ -10,6 +10,7 @@
     "allow-foundation-status",
     "allow-check-selected-folder-access",
     "allow-inspect-selected-folder-entries",
+    "allow-navigate-folder-inventory",
     "allow-preview-native-review",
     "allow-get-example-plan",
     "allow-edit-example-plan",

@@ -68,12 +68,14 @@ pub fn run() {
             app.manage(fixture_demo::FixtureDemoState::open(app.handle()));
             app.manage(general_plan::GeneralPlanState::open(app.handle()));
             app.manage(global_exclusions::ExclusionState::open(app.handle()));
+            app.manage(folder_inventory::FolderInventoryState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             foundation_status,
             check_selected_folder_access,
             folder_inventory::inspect_selected_folder_entries,
+            folder_inventory::navigate_folder_inventory,
             preview_native_review,
             example_plan::get_example_plan,
             example_plan::edit_example_plan,
