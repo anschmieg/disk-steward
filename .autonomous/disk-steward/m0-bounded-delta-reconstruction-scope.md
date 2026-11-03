@@ -1,0 +1,5 @@
+# M0 bounded single-delta reconstruction
+
+Inactive backend pure in-memory reconstruction of one already-inflated Git delta against a supplied base. Hard 16 MiB per base, delta input and result; caller may lower result limit. Validate declared base size, result cap before fallible allocation, ten-byte checked size varints, copy ranges and literal lengths, reserved opcode refusal, exact final size, at most 1,048,576 instructions, and cancellation/deadline checks between <=8 KiB copy chunks.
+
+No decompression, base identity/type verification, delta-chain resolution, aggregate memory accounting, object identity, graph completeness or cleanup authority. Caller must supply verified base and enforce aggregate/chain/worker controls. The 16 MiB bound is an experimental implementation limit, not the product's accepted object-size scope. No paths, network, renderer or execution interface. Main remains baseline; branch atop62 57bdb0d with local progress preserved. Luna module/root integration and adversarial vectors. Git format primary source https://git-scm.com/docs/gitformat-pack.
