@@ -337,3 +337,19 @@ must account for aggregate memory. Successful inflation does not validate object
 type/ID/count, delta bases or chains, graph completeness, or cleanup eligibility.
 Tests use independently encoded zlib/raw/gzip/dictionary vectors and compare
 inflated real Git objects plus a reconstructed REF_DELTA with strict Git import.
+
+### Canonical SHA-1 object identity
+
+`git_sha1_object_id` hashes one caller-supplied commit, tree, blob or tag using
+Git's canonical type, decimal length, NUL and content encoding. It reuses the
+pinned collision-checking SHA-1 implementation, refuses detected collisions,
+bounds content to 16 MiB, builds its header on the stack, and checks cancellation
+and deadlines around 8 KiB hash steps. This is an experimental implementation
+limit, not a product object-size commitment.
+
+The ID binds the supplied type and exact bytes. It does not validate commit,
+tree or tag syntax, authenticate the supplier, resolve delta chains, verify pack
+counts or graph completeness, or authorize cleanup. Callers must compare it with
+required identities and perform the remaining checks. Tests cover independent
+hash vectors and size/chunk boundaries, plus Git's own IDs for all four kinds
+and the reconstructed REF_DELTA result and its base reference.

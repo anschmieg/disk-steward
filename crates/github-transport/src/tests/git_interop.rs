@@ -587,6 +587,27 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     )
     .unwrap();
     assert_eq!(inflated.bytes(), raw_object);
+    for (kind, object_type, oid) in [
+        (GitObjectKind::Commit, "commit", &commit),
+        (GitObjectKind::Tree, "tree", &tree),
+        (GitObjectKind::Blob, "blob", &blob),
+        (GitObjectKind::Tag, "tag", &tag_object),
+    ] {
+        let raw = checked_git(
+            &root,
+            &["-C", &inspection_repo, "cat-file", object_type, oid],
+            b"",
+        )
+        .unwrap();
+        let actual = git_sha1_object_id(
+            kind,
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(actual, hex_oid(oid));
+    }
 
     let mut damaged_pack = pack.clone();
     *damaged_pack.last_mut().unwrap() ^= 1;
@@ -891,4 +912,25 @@ fn delta_reconstruction_matches_independent_strict_git_import() {
     .unwrap();
     assert_eq!(git_result, b"hello braveworld!");
     assert_eq!(reconstructed, git_result);
+    assert_eq!(
+        git_sha1_object_id(
+            GitObjectKind::Blob,
+            &reconstructed,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .unwrap(),
+        hex_oid("799d6e2806898251c4b4be06ec68ca7a32bb8c31")
+    );
+    let base_oid = git_sha1_object_id(
+        GitObjectKind::Blob,
+        base.bytes(),
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        delta_header.kind(),
+        PackEntryKind::ReferenceDelta { base_oid }
+    );
 }
