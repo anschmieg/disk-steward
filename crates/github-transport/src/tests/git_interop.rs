@@ -1140,6 +1140,56 @@ fn hex_oid(value: &str) -> [u8; 20] {
 }
 
 #[test]
+fn live_ingress_busy_refuses_pack_write_without_charging_or_writing() {
+    let root = PrivateRoot::create().unwrap();
+    let (transport, server) =
+        super::pack_tests::pack_fixture(super::pack_tests::pack_body(b"PACKbusy-counter-fixture"));
+    let counter = transport.budget.used.clone();
+    let signal = transport.cancellation_handle();
+    let mut sink = BudgetFileSink::new_for_transport(&root, &transport).unwrap();
+
+    // Complete and join the local transport fixture before holding the shared
+    // counter lock, so a failed assertion cannot strand network cleanup.
+    let report = transport.download_advertised_pack(&mut Vec::new()).unwrap();
+    server.join().unwrap();
+    let observed = report.finalization().observed_ingress_bytes();
+    assert!(observed > 0);
+
+    let held = counter.lock().unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let result = sink.write(b"PACKmust-not-be-written");
+        let charged_storage = sink.bytes_charged();
+        let charged_ingress = sink.ingress_bytes_charged();
+        let contents = sink.contents().unwrap();
+        let _ = finished_tx.send(());
+        (result, charged_storage, charged_ingress, contents, sink)
+    });
+    let completed_before_unlock = finished_rx.recv_timeout(Duration::from_secs(1));
+    // Always release the counter before joining/asserting, including if a
+    // regression makes the sink block in the observer.
+    drop(held);
+    let (write_result, charged_storage, charged_ingress, contents, mut sink) =
+        writer.join().unwrap();
+
+    assert!(completed_before_unlock.is_ok());
+    let error = write_result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(error.to_string(), "transport ingress observation busy");
+    assert_eq!(charged_storage, 0);
+    assert_eq!(charged_ingress, 0);
+    assert!(contents.is_empty());
+    assert!(signal.is_cancelled());
+    // Contention refusal must not hide already observed bytes at finalization.
+    sink.reconcile_transfer_ingress(&report).unwrap();
+    assert_eq!(sink.ingress_bytes_charged(), observed);
+    assert!(signal.is_cancelled());
+    assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+    drop(sink);
+    assert_durable_reservation_blocks_reopen(&root);
+}
+
+#[test]
 fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
     let root = PrivateRoot::create().unwrap();
     let mut body = super::ref_packet(b"packfile\n");

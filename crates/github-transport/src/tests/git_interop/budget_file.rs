@@ -245,9 +245,20 @@ impl BudgetFileSink {
         let Some(binding) = &self.transport_binding else {
             return Ok(());
         };
-        let total = binding
-            .observed_bytes()
-            .inspect_err(|_| self.signal.cancel())?;
+        let total = match binding.try_observed_bytes() {
+            Ok(Some(total)) => total,
+            Ok(None) => {
+                self.signal.cancel();
+                return Err(safe_error(
+                    io::ErrorKind::WouldBlock,
+                    "transport ingress observation busy",
+                ));
+            }
+            Err(error) => {
+                self.signal.cancel();
+                return Err(error);
+            }
+        };
         self.charge_ingress_total(total)
     }
 
