@@ -339,3 +339,14 @@ synthetic payload nor a stopped child proves remote verification success. The
 budget retains usage, the registry retains its reservation and reconciliation
 blocker, and no cleanup is confirmed or authorized. Continuous parent monitoring,
 app-wide ownership and production Git verification remain separate work.
+
+The parent payload settlement also checks elapsed milliseconds against the
+existing five-minute budget using one monotonic start captured immediately
+before coordinated admission. The start is retained through worker shutdown and
+readback; it is not renewed for settlement. Observed payload bytes are charged
+before the elapsed check. A timeout retains those bytes and is acknowledged as
+worker-stopped; an earlier storage or free-space refusal keeps its first reason.
+`parent_elapsed_checked=true` identifies the successful elapsed checkpoint in
+complete and partial reports. This is a stopped checkpoint, not continuous parent
+monitoring, a bound on noninterruptible system calls, or proof of production
+verification completion.
