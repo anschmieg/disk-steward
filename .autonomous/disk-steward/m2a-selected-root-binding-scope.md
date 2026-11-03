@@ -1,0 +1,7 @@
+# Bind the selected folder observation before enumeration
+
+Continue R1.1/R2.1 from PR12645dc2e2 with main as eventual integration baseline. The native selection path obtains no-follow metadata before opening a directory. Require the opened directory metadata to match that observed selection before scanning: directory type, device/inode, mode, size, link count, modification/change timestamps and dataless state. A stale observation refuses rather than silently enumerating a replacement. Apply the same gate to the shallow test helper so fixtures exercise the same binding contract.
+
+Keep native-picker ownership and publish a new retained session only after successful inspection. Failures leave any existing session intact. Add no renderer paths, user-file writes, content reads, cleanup eligibility or execution authority. Directory renames/replacements after successful observation and ancestor aliasing are not made atomic by these checks. Saved checkpoint replay and subsequent navigation retain their independent binding checks. Focused stat-pair tests prove rejection decisions, not deterministic injection into the native picker race.
+
+Validate unchanged selection and mismatched/replaced directory fixtures, relevant native suite, strict Clippy, formatting and frontend/build compatibility. Full native picker/provider/accessibility, durable recursive restart, large-tree resource/performance and actual MVP acceptance remain open. Final adversarial review/fixes/validation and automation disable/stop follow actual MVP completion.

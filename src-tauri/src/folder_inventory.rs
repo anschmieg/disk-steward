@@ -502,6 +502,16 @@ fn root_metadata_matches(before: &rustix::fs::Stat, after: &rustix::fs::Stat) ->
 }
 
 #[cfg(unix)]
+fn selected_root_binding_matches(selected: &rustix::fs::Stat, opened: &rustix::fs::Stat) -> bool {
+    use rustix::fs::FileType;
+
+    FileType::from_raw_mode(selected.st_mode) == FileType::Directory
+        && FileType::from_raw_mode(opened.st_mode) == FileType::Directory
+        && identity(selected) == identity(opened)
+        && root_metadata_matches(selected, opened)
+}
+
+#[cfg(unix)]
 fn identity(stat: &rustix::fs::Stat) -> DirectoryIdentity {
     DirectoryIdentity {
         device: stat.st_dev as u64,
@@ -632,6 +642,9 @@ fn scan_selected_folder_with_limits(
     let root_id = identity(&root_before);
     if FileType::from_raw_mode(root_before.st_mode) != FileType::Directory {
         return Err("The selected location is not a directory.");
+    }
+    if !selected_root_binding_matches(&selected_stat, &root_before) {
+        return Err("The selected folder changed. Choose it again to inspect it.");
     }
     refuse_dataless_directory(&root_before)?;
     let frame = DirectoryFrame {
@@ -1000,6 +1013,9 @@ fn selected_root_session(
     let root_stat = root_stat.map_err(|_| "The selected folder metadata is unavailable.")?;
     if FileType::from_raw_mode(root_stat.st_mode) != FileType::Directory {
         return Err("The selected location is not a directory.");
+    }
+    if !selected_root_binding_matches(&selected_stat, &root_stat) {
+        return Err("The selected folder changed. Choose it again to inspect it.");
     }
     refuse_dataless_directory(&root_stat)?;
     let root_identity = identity(&root_stat);
@@ -1890,6 +1906,55 @@ mod tests {
         unix_fs::symlink(&actual, &link).unwrap();
         assert!(scan_selected_folder(&parent.path().join("missing")).is_err());
         assert!(scan_selected_folder(&link).is_err());
+    }
+
+    #[test]
+    fn selected_root_binding_requires_same_stable_directory_metadata() {
+        use rustix::fs::{fstat, open, statat, AtFlags, Mode, OFlags, CWD};
+
+        let parent = tempdir().unwrap();
+        let selected = parent.path().join("selected");
+        let replacement = parent.path().join("replacement");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&replacement).unwrap();
+
+        let selected_stat = statat(CWD, &selected, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let replacement_stat = statat(CWD, &replacement, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(!selected_root_binding_matches(
+            &selected_stat,
+            &replacement_stat
+        ));
+
+        let mut changed_metadata = selected_stat;
+        changed_metadata.st_mtime_nsec = changed_metadata.st_mtime_nsec.wrapping_add(1);
+        assert!(!selected_root_binding_matches(
+            &selected_stat,
+            &changed_metadata
+        ));
+
+        let fd = open(
+            &selected,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let opened_stat = fstat(&fd).unwrap();
+        assert!(selected_root_binding_matches(&selected_stat, &opened_stat));
+        assert!(selected_root_session(&selected, MAX_RAW_ENTRIES, MAX_DURATION).is_ok());
+        // A real rename/replacement between observation and opening must not
+        // bind the previously selected directory to the new path occupant.
+        fs::rename(&selected, parent.path().join("old-selected")).unwrap();
+        fs::rename(&replacement, &selected).unwrap();
+        let replacement_fd = open(
+            &selected,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        assert!(!selected_root_binding_matches(
+            &selected_stat,
+            &fstat(&replacement_fd).unwrap()
+        ));
     }
 
     #[test]
