@@ -46,6 +46,7 @@ pub(crate) mod checkpoint_commands {
     }
 }
 
+pub(crate) mod allocation_map;
 #[cfg(unix)]
 mod checkpoint_prefix;
 #[cfg(unix)]
@@ -290,6 +291,7 @@ pub struct FolderInventorySnapshot {
     pub breadcrumbs: Vec<String>,
     pub entries: Vec<FolderInventoryEntry>,
     pub name_categories: Vec<NameCategoryAggregate>,
+    pub allocation_map: Option<allocation_map::AllocationMap>,
     pub observation_window: ObservationWindow,
     pub enumeration_complete: bool,
     pub unreadable_count: u32,
@@ -315,6 +317,7 @@ fn empty_snapshot(
         breadcrumbs,
         entries: Vec::new(),
         name_categories: Vec::new(),
+        allocation_map: None,
         observation_window: ObservationWindow {
             started_unix_ms: None,
             finished_unix_ms: None,
@@ -1111,6 +1114,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     snapshot.regular_file_logical_bytes = logical_bytes.to_string();
     snapshot.entries_seen = entries_seen.to_string();
     snapshot.name_categories = aggregate_name_categories(&snapshot.entries)?;
+    snapshot.allocation_map = Some(allocation_map::aggregate(&snapshot.entries)?);
     if started.elapsed() >= duration {
         snapshot.enumeration_complete = false;
         snapshot.stop_reason.get_or_insert("time_limit");
@@ -1987,8 +1991,18 @@ mod tests {
         assert_eq!(snapshot.stop_reason, None);
         assert_eq!(snapshot.entries.len(), 5);
         assert_eq!(snapshot.regular_file_logical_bytes, "7");
-        assert_eq!(snapshot.directories_not_traversed, 1);
         let entries = &snapshot.entries;
+        let allocation_map = snapshot.allocation_map.as_ref().unwrap();
+        assert_eq!(allocation_map.shared_link_entries, 2);
+        assert!(allocation_map
+            .tiles
+            .iter()
+            .all(|tile| tile.entry_ids.iter().all(|id| {
+                entries
+                    .iter()
+                    .any(|entry| entry.id == *id && entry.kind == "file" && !entry.hard_linked)
+            })));
+        assert_eq!(snapshot.directories_not_traversed, 1);
         assert!(entries.iter().all(|entry| entry.availability == "unknown"));
         assert!(entries.iter().any(|entry| entry.kind == "folder"));
         assert!(entries.iter().any(|entry| entry.kind == "symlink"));

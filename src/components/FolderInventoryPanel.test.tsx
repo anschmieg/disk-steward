@@ -183,13 +183,31 @@ test("failed or stale navigation keeps the old observation and busy ownership bl
   expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
 });
 
-test("filtering keeps the full observed logical-size denominator and never changes coverage", async () => {
+test("filtering keeps the full reported allocation denominator and never changes coverage", async () => {
   vi.mocked(invoke).mockResolvedValue({
     ...sample,
     regularFileLogicalBytes: "100",
+    allocationMap: {
+      knownAllocatedBytes: "400",
+      tiles: [
+        { entryIds: ["1"], allocatedBytes: "100", category: "document" },
+        { entryIds: ["2"], allocatedBytes: "300", category: "code" },
+      ],
+      unknownAllocationEntries: 0,
+      sharedLinkEntries: 0,
+      zeroAllocationEntries: 0,
+      unmappedNonFileEntries: 0,
+      datalessEntries: 0,
+    },
     entries: [
-      { ...sample.entries[0], logicalBytes: "25" },
-      { ...sample.entries[1], logicalBytes: "75" },
+      {
+        ...sample.entries[0],
+        logicalBytes: "25",
+        allocatedBytes: "100",
+        linkCount: "1",
+        hardLinked: false,
+      },
+      { ...sample.entries[1], logicalBytes: "75", allocatedBytes: "300" },
     ],
   });
   render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
@@ -204,8 +222,8 @@ test("filtering keeps the full observed logical-size denominator and never chang
   expect(rows[1].querySelector(".inventory-size-bar")).toHaveStyle({
     width: "25%",
   });
-  expect(screen.getByText(/Size bars use/)).toHaveTextContent(
-    "100 regular-file logical bytes",
+  expect(screen.getByText(/Allocation bars use/)).toHaveTextContent(
+    "400 eligible reported allocated bytes",
   );
   expect(screen.getByText(/Incomplete immediate/)).toBeVisible();
   expect(screen.getByText(/Showing 1 of 2/)).toBeVisible();
@@ -310,7 +328,9 @@ test("allocation sort and inspector distinguish exact logical bytes, allocation 
   expect(within(evidence).getByText("9007199254740993")).toBeVisible();
   expect(within(evidence).getByText("7")).toBeVisible();
   expect(within(evidence).getByText(/Cleanup blocked/)).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Return to entry list" }));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Return to selected entry" }),
+  );
   expect(inspect).toHaveFocus();
   expect(
     screen.queryByRole("region", { name: "Entry evidence" }),
@@ -336,7 +356,9 @@ test("filtering does not alter selected evidence and returning falls back to the
       { name: "Alpha" },
     ),
   ).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Return to entry list" }));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Return to selected entry" }),
+  );
   expect(screen.getByRole("searchbox")).toHaveFocus();
 });
 
@@ -430,7 +452,9 @@ test("known dataless folders show a reason and no Open control; absence of the f
   let evidence = screen.getByRole("region", { name: "Entry evidence" });
   expect(within(evidence).getByText(/Known dataless object/)).toBeVisible();
   expect(within(evidence).getByText(/Cleanup blocked/)).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Return to entry list" }));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Return to selected entry" }),
+  );
   fireEvent.click(screen.getByRole("button", { name: "Inspect Alpha" }));
   evidence = screen.getByRole("region", { name: "Entry evidence" });
   expect(
@@ -524,8 +548,8 @@ test("subtree summary is explicit, keeps exact totals and leaves page and import
       .nextElementSibling,
   ).toHaveTextContent("2");
   expect(screen.getByRole("table").textContent).toBe(rowsBefore);
-  expect(screen.getByText(/Size bars use/)).toHaveTextContent(
-    "9007199254741000",
+  expect(screen.getByText(/Allocation bars use/)).toHaveTextContent(
+    "unavailable eligible reported allocated bytes",
   );
   fireEvent.click(screen.getByRole("button", { name: "Next page" }));
   await waitFor(() =>
@@ -1379,4 +1403,120 @@ test("recursive checkpoint failure preserves the prior folder and forgetting use
   expect(screen.getByRole("heading", { name: "Chosen folder" })).toBeVisible();
   expect(screen.getByText("Zeta")).toBeVisible();
   expect(screen.queryByText(/private path/)).not.toBeInTheDocument();
+});
+
+const mappedSample: FolderInventory = {
+  ...sample,
+  allocationMap: {
+    knownAllocatedBytes: "12288",
+    tiles: [
+      { entryIds: ["2"], allocatedBytes: "8192", category: "code" },
+      { entryIds: ["1"], allocatedBytes: "4096", category: "document" },
+    ],
+    unknownAllocationEntries: 0,
+    sharedLinkEntries: 0,
+    zeroAllocationEntries: 0,
+    unmappedNonFileEntries: 1,
+    datalessEntries: 0,
+  },
+  entries: sample.entries.map((entry) =>
+    entry.kind === "file"
+      ? {
+          ...entry,
+          linkCount: "1",
+          hardLinked: false,
+          allocatedBytes: entry.id === "1" ? "4096" : "8192",
+        }
+      : entry,
+  ),
+};
+
+test("map and list share evidence selection while filtering preserves area and selected evidence", async () => {
+  vi.mocked(invoke).mockResolvedValue(mappedSample);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  const map = screen.getByRole("group", {
+    name: "Proportional allocated space tiles",
+  });
+  const tile = map.querySelector<HTMLButtonElement>(
+    'button[aria-label*="Alpha;"]',
+  )!;
+  const before = tile.getAttribute("style");
+  // Equivalent map controls remain operable even when actual plot dimensions are unavailable.
+  const controls = screen.getByRole("list", {
+    name: "Mapped files and groups",
+  });
+  fireEvent.click(
+    within(controls).getByRole("button", { name: /Alpha.*4,096 bytes/ }),
+  );
+  expect(await screen.findByRole("heading", { name: "Alpha" })).toHaveFocus();
+  const list = screen.getByRole("table");
+  expect(
+    within(list).getByRole("button", { name: "Inspect Alpha" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(tile).toHaveAttribute("aria-pressed", "true");
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "Zeta" },
+  });
+  expect(tile).toHaveAttribute("style", before);
+  expect(tile).toBeDisabled();
+  expect(screen.getByRole("heading", { name: "Alpha" })).toBeVisible();
+  expect(screen.getByText(/Allocation bars use/)).toHaveTextContent(
+    "12288 eligible reported allocated bytes",
+  );
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "" } });
+  fireEvent.click(within(list).getByRole("button", { name: "Inspect Zeta" }));
+  expect(await screen.findByRole("heading", { name: "Zeta" })).toHaveFocus();
+  expect(
+    map.querySelector<HTMLButtonElement>('button[aria-label*="Zeta;"]')!,
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(invoke).toHaveBeenCalledTimes(1);
+});
+
+test("map group filter preserves whole-page imports and resets only after successful scope replacement", async () => {
+  const grouped: FolderInventory = {
+    ...mappedSample,
+    allocationMap: {
+      ...mappedSample.allocationMap!,
+      tiles: [
+        { entryIds: ["1", "2"], allocatedBytes: "12288", category: null },
+      ],
+    },
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(grouped)
+    .mockRejectedValueOnce(new Error("changed"))
+    .mockResolvedValueOnce({ ...mappedSample, observationId: "fresh-map" });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  const controls = screen.getByRole("list", {
+    name: "Mapped files and groups",
+  });
+  fireEvent.click(
+    within(controls).getByRole("button", { name: /Alpha.*Zeta.*12,288 bytes/ }),
+  );
+  expect(
+    screen.getByRole("heading", { name: "Observed entries" }),
+  ).toHaveFocus();
+  expect(screen.getByText(/Showing 2 of 3/)).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Show all map entries" }),
+  ).toBeEnabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  );
+  await screen.findByText(/could not be refreshed reliably/);
+  expect(
+    screen.getByRole("button", { name: "Show all map entries" }),
+  ).toBeEnabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  );
+  await screen.findByText(/Folder refreshed/);
+  expect(
+    screen.queryByRole("button", { name: "Show all map entries" }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByText(/Showing 3 of 3/)).toBeVisible();
 });

@@ -2,9 +2,13 @@ import {
   formatObservationTime,
   observationClockReversed,
 } from "../observation-window";
+import { buildAllocationLayout } from "../allocation-layout";
+import AllocationMap, {
+  type AllocationModel as AllocationMapData,
+} from "./AllocationMap";
 import type { EditorSnapshot } from "../general-plan-contract";
 import "./FolderInventoryPanel.css";
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 type NameCategory =
@@ -38,6 +42,7 @@ export type FolderInventory = {
     elapsedMillis: string;
   };
   rootLabel: string;
+  allocationMap?: AllocationMapData | null;
   nameCategories?: Array<{
     category: NameCategory;
     entryCount: number;
@@ -122,6 +127,11 @@ type SubtreeCheckpointInfo = {
   batches: number;
 };
 
+function allocationShare(bytes: string, total: bigint): string {
+  const basisPoints = (BigInt(bytes) * 10000n) / total;
+  return basisPoints === 0n ? "<0.01%" : `${Number(basisPoints) / 100}%`;
+}
+
 export default function FolderInventoryPanel({
   native,
   active = true,
@@ -164,6 +174,8 @@ export default function FolderInventoryPanel({
   const [imported, setImported] = useState(false);
   const [query, setQuery] = useState("");
   const [nameCategory, setNameCategory] = useState<NameCategory | null>(null);
+  const [mapGroupIds, setMapGroupIds] = useState<Set<string> | null>(null);
+  const listHeadingRef = useRef<HTMLHeadingElement>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [sort, setSort] = useState<"name" | "size" | "allocated">("size");
   useEffect(() => {
@@ -220,6 +232,7 @@ export default function FolderInventoryPanel({
         setSnapshot(next);
         setQuery("");
         setNameCategory(null);
+        setMapGroupIds(null);
         if (refreshing)
           setMessage(
             "Folder refreshed. Paging restarted at the first page; saved plan and review metadata are unchanged.",
@@ -314,6 +327,7 @@ export default function FolderInventoryPanel({
             setSnapshot(next);
             setQuery("");
             setNameCategory(null);
+            setMapGroupIds(null);
             setMessage(
               "Resumed at the page after the saved checkpoint. Save again to advance the checkpoint; saved plan decisions are unchanged.",
             );
@@ -407,6 +421,7 @@ export default function FolderInventoryPanel({
             setSnapshot(resumed.snapshot);
             setQuery("");
             setNameCategory(null);
+            setMapGroupIds(null);
             setMessage(
               "Recursive scan resumed paused. Review its coverage, then explicitly continue scanning when ready.",
             );
@@ -484,6 +499,7 @@ export default function FolderInventoryPanel({
       setImported(false);
       setQuery("");
       setNameCategory(null);
+      setMapGroupIds(null);
       setMessage(
         "Folder scope cleared. Retained directory handles and enumeration state were released. Saved plan and review metadata remain.",
       );
@@ -635,12 +651,12 @@ export default function FolderInventoryPanel({
     }
   };
   const selected = snapshot?.entries.find((entry) => entry.id === selectedId);
-  const total = BigInt(snapshot?.regularFileLogicalBytes ?? "0");
   const entries = [...(snapshot?.entries ?? [])]
     .filter(
       (entry) =>
         entry.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()) &&
-        (nameCategory === null || entry.nameCategory === nameCategory),
+        (nameCategory === null || entry.nameCategory === nameCategory) &&
+        (mapGroupIds === null || mapGroupIds.has(entry.id)),
     )
     .sort((a, b) => {
       if (sort !== "name") {
@@ -652,6 +668,38 @@ export default function FolderInventoryPanel({
       }
       return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
     });
+  const visibleIds = new Set(entries.map((entry) => entry.id));
+  const mapEvidence = useMemo(() => {
+    const model = snapshot?.allocationMap;
+    if (!model || !snapshot) return null;
+    try {
+      const layout = buildAllocationLayout(model);
+      const ids = new Set(layout.tiles.flatMap((tile) => tile.entryIds));
+      const observedIds = new Set(snapshot.entries.map((entry) => entry.id));
+      const counts = [
+        model.unknownAllocationEntries,
+        model.sharedLinkEntries,
+        model.zeroAllocationEntries,
+        model.unmappedNonFileEntries,
+        model.datalessEntries,
+      ];
+      if (
+        observedIds.size !== snapshot.entries.length ||
+        [...ids].some((id) => !observedIds.has(id)) ||
+        counts.some(
+          (count) => !Number.isSafeInteger(count) || count < 0 || count > 512,
+        ) ||
+        counts.reduce((sum, count) => sum + count, ids.size) !==
+          snapshot.entries.length
+      )
+        return null;
+      return { ids, total: BigInt(layout.totalBytes) };
+    } catch {
+      return null;
+    }
+  }, [snapshot]);
+  const mappedIds = mapEvidence?.ids ?? new Set<string>();
+  const allocationTotal = mapEvidence?.total ?? null;
   return (
     <section
       className="panel folder-inventory"
@@ -1197,7 +1245,7 @@ export default function FolderInventoryPanel({
           </label>
           <p>
             Showing {entries.length} of {snapshot.entries.length} observed
-            entries. Filtering does not change coverage or the logical-size
+            entries. Filtering does not change coverage or the allocation
             denominator.
           </p>
           <label>
@@ -1216,13 +1264,52 @@ export default function FolderInventoryPanel({
               <option value="name">Name</option>
             </select>
           </label>
+          <AllocationMap
+            allocation={
+              mapEvidence ? (snapshot.allocationMap ?? undefined) : undefined
+            }
+            entries={snapshot.entries}
+            visibleIds={visibleIds}
+            selectedId={selectedId}
+            busy={busy}
+            onSelect={(id, target) => {
+              inspectorReturnRef.current = target;
+              setSelectedId(id);
+            }}
+            onGroup={(ids) => {
+              setQuery("");
+              setNameCategory(null);
+              setMapGroupIds(new Set(ids));
+              listHeadingRef.current?.focus();
+            }}
+          />
+          <h4 ref={listHeadingRef} tabIndex={-1}>
+            Observed entries
+          </h4>
+          {mapGroupIds !== null && (
+            <p>
+              Showing a grouped map area in the list. Other filters also apply.{" "}
+              <button
+                className="button secondary"
+                disabled={busy}
+                onClick={() => setMapGroupIds(null)}
+              >
+                Show all map entries
+              </button>
+            </p>
+          )}
           <div style={{ overflowX: "auto" }}>
             <table>
               <caption>
                 Read-only metadata observation. All entries remain unavailable
-                for cleanup. Size bars use the current page’s{" "}
-                {snapshot.regularFileLogicalBytes} regular-file logical bytes as
-                their denominator; folders have unknown size.
+                for cleanup. Allocation bars use the current page’s{" "}
+                {allocationTotal === null
+                  ? "unavailable"
+                  : allocationTotal.toString()}{" "}
+                eligible reported allocated bytes as their unfiltered
+                denominator. Shared links, unknown allocation and folder
+                contents have no bar. This is not unique occupied or reclaimable
+                space.
               </caption>
               <thead>
                 <tr>
@@ -1236,7 +1323,14 @@ export default function FolderInventoryPanel({
               </thead>
               <tbody>
                 {entries.map((entry) => (
-                  <tr key={entry.id}>
+                  <tr
+                    key={entry.id}
+                    className={
+                      selectedId === entry.id
+                        ? "inventory-row-selected"
+                        : undefined
+                    }
+                  >
                     <th scope="row">
                       {entry.canOpen ? (
                         <button
@@ -1263,19 +1357,41 @@ export default function FolderInventoryPanel({
                         <small> · dataless object</small>
                       )}
                     </td>
+                    <td>{entry.logicalBytes ?? "Unknown"}</td>
                     <td className="inventory-size">
-                      <span
-                        className="inventory-size-bar"
-                        aria-hidden="true"
-                        style={{
-                          width: `${entry.logicalBytes !== null && total > 0n ? Number((BigInt(entry.logicalBytes) * 10000n) / total) / 100 : 0}%`,
-                        }}
-                      />
+                      {mappedIds.has(entry.id) &&
+                        allocationTotal !== null &&
+                        allocationTotal > 0n &&
+                        entry.allocatedBytes !== null && (
+                          <span
+                            className="inventory-size-bar"
+                            aria-hidden="true"
+                            style={{
+                              width: `${Number((BigInt(entry.allocatedBytes) * 10000n) / allocationTotal) / 100}%`,
+                            }}
+                          />
+                        )}
                       <span className="inventory-size-value">
-                        {entry.logicalBytes ?? "Unknown"}
+                        {entry.allocatedBytes ?? "Unknown"}
+                        {mappedIds.has(entry.id) &&
+                          allocationTotal !== null &&
+                          allocationTotal > 0n &&
+                          entry.allocatedBytes !== null && (
+                            <small>
+                              {" "}
+                              ·{" "}
+                              {allocationShare(
+                                entry.allocatedBytes,
+                                allocationTotal,
+                              )}{" "}
+                              of mapped page allocation
+                            </small>
+                          )}
+                        {!mappedIds.has(entry.id) && (
+                          <small> · not represented by area</small>
+                        )}
                       </span>
                     </td>
-                    <td>{entry.allocatedBytes ?? "Unknown"}</td>
                     <td>
                       {entry.linkCount === null
                         ? "Unknown"
@@ -1317,7 +1433,7 @@ export default function FolderInventoryPanel({
                   else queryRef.current?.focus();
                 }}
               >
-                Return to entry list
+                Return to selected entry
               </button>
               <dl>
                 <dt>Entry kind</dt>
