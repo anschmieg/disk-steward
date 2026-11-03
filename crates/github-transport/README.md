@@ -318,3 +318,22 @@ fixed mixed copy/insert vector with an independent strict Git import of a
 Python zlib/hashlib-generated two-object REF_DELTA pack, and cover malformed
 instructions, overflow, truncation, sparse offsets, implicit 64 KiB copies,
 cancellation, deadlines, and the instruction ceiling.
+
+### One-stream zlib inflation
+
+`inflate_pack_representation` uses pinned flate2 1.1.10 with its Rust backend to
+inflate one zlib stream from an in-memory slice. It requires StreamEnd, including
+zlib checksum validation, and an exact declared output length. The returned
+compressed byte count identifies the next entry or trailer; concatenated streams
+are not implicitly consumed. The compressed input slice and output are each
+limited to 16 MiB, with a caller-lowered output ceiling validated before fallible
+reservation. These are experimental limits rather than accepted product scope.
+
+Decoder calls use at most 8 KiB input/output chunks, a one-byte overshoot probe,
+checked progress counters, a finite call limit, and cooperative cancellation and
+deadline checks. The decoder's own internal state allocation remains library
+controlled. An outer worker is still required for hard interruption; callers
+must account for aggregate memory. Successful inflation does not validate object
+type/ID/count, delta bases or chains, graph completeness, or cleanup eligibility.
+Tests use independently encoded zlib/raw/gzip/dictionary vectors and compare
+inflated real Git objects plus a reconstructed REF_DELTA with strict Git import.

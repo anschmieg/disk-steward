@@ -559,6 +559,35 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
             .unwrap()
     );
     assert!(entry.header_bytes() <= 10);
+    let inflated = inflate_pack_representation(
+        &pack[12 + entry.header_bytes()..],
+        entry.inflated_bytes(),
+        512,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let object_type = match entry.kind() {
+        PackEntryKind::Commit => "commit",
+        PackEntryKind::Tree => "tree",
+        PackEntryKind::Blob => "blob",
+        PackEntryKind::Tag => "tag",
+        _ => unreachable!(),
+    };
+    let raw_object = checked_git(
+        &root,
+        &[
+            "-C",
+            &inspection_repo,
+            "cat-file",
+            object_type,
+            first_object,
+        ],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(inflated.bytes(), raw_object);
+
     let mut damaged_pack = pack.clone();
     *damaged_pack.last_mut().unwrap() ^= 1;
     assert!(check_sha1_pack_checksum(
@@ -824,9 +853,37 @@ fn delta_reconstruction_matches_independent_strict_git_import() {
         b"",
     )
     .unwrap();
+    let base_header = parse_sha1_pack_entry_header(&pack[12..], 12, 512).unwrap();
+    assert_eq!(base_header.kind(), PackEntryKind::Blob);
+    let base_start = 12 + base_header.header_bytes();
+    let base = inflate_pack_representation(
+        &pack[base_start..],
+        base_header.inflated_bytes(),
+        512,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let delta_offset = base_start + base.compressed_bytes();
+    let delta_header =
+        parse_sha1_pack_entry_header(&pack[delta_offset..], delta_offset as u64, 512).unwrap();
+    assert!(matches!(
+        delta_header.kind(),
+        PackEntryKind::ReferenceDelta { .. }
+    ));
+    let delta_start = delta_offset + delta_header.header_bytes();
+    let delta = inflate_pack_representation(
+        &pack[delta_start..],
+        delta_header.inflated_bytes(),
+        512,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(delta_start + delta.compressed_bytes() + 20, pack.len());
     let reconstructed = reconstruct_git_delta(
-        b"hello world!",
-        &[12, 17, 0x90, 6, 5, b'b', b'r', b'a', b'v', b'e', 0x91, 6, 6],
+        base.bytes(),
+        delta.bytes(),
         17,
         &CancellationHandle::new(),
         Instant::now() + Duration::from_secs(5),
