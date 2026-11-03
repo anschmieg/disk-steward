@@ -291,15 +291,9 @@ export default function App() {
   };
   const reviewActions = useMemo(() => review?.actions ?? [], [review]);
 
-  if (!plan)
+  if (!plan && page !== "explore" && page !== "advanced")
     return (
       <div className="loading-shell">
-        {page === "explore" && (
-          <FolderInventoryPanel
-            native={native}
-            onBusyChange={setInventoryBusy}
-          />
-        )}
         <HardDrive />
         <p>
           {pending
@@ -317,6 +311,7 @@ export default function App() {
       </div>
     );
 
+  const displayedExample = plan ?? browserPlan;
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -333,9 +328,11 @@ export default function App() {
           <i />
           {page === "explore"
             ? "Read-only folder observation"
-            : page === "demo"
-              ? "Disposable file demo"
-              : "Non-executable example"}
+            : page === "advanced"
+              ? "Metadata review plan"
+              : page === "demo"
+                ? "Disposable file demo"
+                : "Non-executable example"}
         </span>
       </header>
       <aside className="sidebar">
@@ -362,7 +359,7 @@ export default function App() {
           onClick={() => setPage("advanced")}
         >
           <Archive size={16} />
-          Grouped editor
+          Review plan
         </button>
         <button
           className={`nav-item ${page === "explore" ? "active" : ""}`}
@@ -384,7 +381,7 @@ export default function App() {
                   ? generalSummary
                     ? fmt(generalSummary.bytes)
                     : "Loading…"
-                  : fmt(plan.totalBytes)}
+                  : fmt(displayedExample.totalBytes)}
               </b>
               <small>
                 {page === "advanced"
@@ -399,15 +396,15 @@ export default function App() {
                   ? generalSummary
                     ? fmt(generalSummary.selectedBytes)
                     : "—"
-                  : fmt(plan.selectedBytes)}
+                  : fmt(displayedExample.selectedBytes)}
               </b>
               <small>
                 {page === "advanced"
                   ? (generalSummary?.selectedCount ?? "—")
-                  : plan.selectedCount}{" "}
+                  : displayedExample.selectedCount}{" "}
                 {page === "advanced"
                   ? "items"
-                  : plan.selectedCount === 1
+                  : displayedExample.selectedCount === 1
                     ? "action"
                     : "actions"}
               </small>
@@ -429,7 +426,9 @@ export default function App() {
         <div className="main-head">
           <div>
             <div className="crumb">
-              {page === "explore" ? "LOCAL OBSERVATION" : "EXAMPLE WORKSPACE"}{" "}
+              {page === "explore" || page === "advanced"
+                ? "LOCAL WORKSPACE"
+                : "EXAMPLE WORKSPACE"}{" "}
               <ChevronRight size={12} />{" "}
               {page === "explore"
                 ? "FOLDER EXPLORER"
@@ -487,7 +486,7 @@ export default function App() {
             disappear when this page reloads
           </div>
         )}
-        {error && (
+        {error && page !== "explore" && page !== "advanced" && (
           <div className="error-banner" role="alert">
             <CircleAlert size={16} />
             <span>{error}</span>
@@ -502,11 +501,13 @@ export default function App() {
         )}
         {page === "explore" ? (
           <FolderInventoryPanel
+            onOpenPlan={() => setPage("advanced")}
             native={native}
             onBusyChange={setInventoryBusy}
           />
         ) : page === "advanced" ? (
           <GeneralPlanWorkspace
+            initialProfile="live"
             native={native}
             onBusyChange={setGeneralBusy}
             onSummaryChange={setGeneralSummary}
@@ -514,16 +515,18 @@ export default function App() {
         ) : page === "demo" ? (
           <DemoLifecyclePanel
             plan={{
-              revisionId: plan.revisionId,
-              actions: plan.actions.map(({ id, label, bytes, decision }) => ({
-                id,
-                label,
-                bytes,
-                decision,
-              })),
-              selectedCount: plan.selectedCount,
-              selectedBytes: plan.selectedBytes,
-              totalBytes: plan.totalBytes,
+              revisionId: displayedExample.revisionId,
+              actions: displayedExample.actions.map(
+                ({ id, label, bytes, decision }) => ({
+                  id,
+                  label,
+                  bytes,
+                  decision,
+                }),
+              ),
+              selectedCount: displayedExample.selectedCount,
+              selectedBytes: displayedExample.selectedBytes,
+              totalBytes: displayedExample.totalBytes,
             }}
             native={native}
             planBusy={pending}
@@ -539,8 +542,8 @@ export default function App() {
                 <div>
                   <h2>Cleanup actions</h2>
                   <p>
-                    {plan.actions.length} actions · Revision{" "}
-                    {plan.revisionNumber}
+                    {displayedExample.actions.length} actions · Revision{" "}
+                    {displayedExample.revisionNumber}
                   </p>
                 </div>
                 <span
@@ -555,7 +558,7 @@ export default function App() {
                 aria-label="Actions"
                 onKeyDown={keySelect}
               >
-                {plan.actions.map((action, index) => (
+                {displayedExample.actions.map((action, index) => (
                   <button
                     key={action.id}
                     ref={(node) => {
@@ -600,10 +603,11 @@ export default function App() {
               <div className="totals-row" role="status" aria-live="polite">
                 <div>
                   <small>Included in example</small>
-                  <strong>{fmt(plan.selectedBytes)}</strong>
+                  <strong>{fmt(displayedExample.selectedBytes)}</strong>
                 </div>
                 <span>
-                  {plan.selectedCount} of {plan.actions.length} actions
+                  {displayedExample.selectedCount} of{" "}
+                  {displayedExample.actions.length} actions
                 </span>
               </div>
               <div className="panel-actions">
@@ -622,7 +626,7 @@ export default function App() {
                     pending ||
                     workspaceBusy ||
                     needsRefresh ||
-                    plan.selectedCount === 0
+                    displayedExample.selectedCount === 0
                   }
                 >
                   {native ? "Save review" : "Preview review"}
@@ -635,7 +639,7 @@ export default function App() {
                   review.
                 </p>
               )}
-              {plan.selectedCount === 0 && (
+              {displayedExample.selectedCount === 0 && (
                 <p className="inline-help">
                   Include at least one action to save a review.
                 </p>
@@ -830,7 +834,10 @@ function previewReview(plan: Plan): Review {
     revisionId: plan.revisionId,
     revisionNumber: plan.revisionNumber,
     manifestSha256: "0".repeat(64),
-    actions: plan.actions.map((a) => ({ ...a, evidence: [...a.evidence] })),
+    actions: plan.actions.map((a) => ({
+      ...a,
+      evidence: [...a.evidence],
+    })),
     totalBytes: plan.totalBytes,
     selectedBytes: plan.selectedBytes,
     selectedCount: plan.selectedCount,

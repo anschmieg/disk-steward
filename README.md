@@ -74,3 +74,9 @@ The folder explorer also supports explicit drill-down into observed child folder
 A local name filter narrows only the displayed entries. Subtle size bars retain the full observation's per-name regular-file logical-byte denominator when filtering/sorting, with exact byte labels always available. They do not represent allocated or recoverable space.
 
 Navigation sessions are bounded to 16 held directory levels and 512 observed immediate entries. Boundary detection currently recognizes specific package/library name suffixes; it is not complete platform library/cloud-placeholder classification. Binding checks before and after scans are conservative race detection, not an atomic guarantee against another process continuously renaming directories. No file contents are read, and observations cannot authorize cleanup.
+
+## Review observed entries
+
+After exploring a folder, explicitly add the observed file/folder entries to Your plan. This saves bounded names and historical metadata locally in a separate initially empty workspace; pilot/stress examples stay separate. Filtering the explorer does not narrow the import. The whole batch is one undo step, and decisions, redo and saved review snapshots survive reopening. Reimporting the same observation is refused atomically.
+
+Imported entries default to Keep and remain blocked from cleanup, including when Include is requested. There is no source-path binding or execution approval. Different observations may overlap or describe hard links: plan totals count per-entry logical metadata, not occupied or recoverable space. Unsafe integer sizes or cumulative totals are refused rather than rounded. Refreshing the explorer does not overwrite saved decisions.
