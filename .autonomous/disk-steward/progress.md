@@ -751,3 +751,27 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR59 integrates updated58 head31cc1fd/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 
 2026-11-03 PR59 Ubuntu failure head256eb42/run41552842612/job125644432229: direct completed-job log (run still in progress so gh run log unavailable) shows github-transport unreconciled_registry_refuses_payload_creation final reopen atline685 failed LeaseHeld;82transport tests passed. Existing lease relied on final descriptor close; Linux flock manual confirms duplicate/fork descriptors share open-file-description lock until explicit unlock or all closes. Deterministic owner-drop-with-duplicate regression reproduced LeaseHeld locally BEFORE fix. RegistryLease guard now explicitly Unlocks after connection field drops (field order), also wraps acquired lease before fallible initialization so failure paths release; unlock failure retains close fallback/fail-closed acquisition. Test verifies live-owner exclusion, immediate reopen with old duplicate alive, and old duplicate close cannot unlock new owner. This reproduces a mechanism consistent with concurrent spawn inheritance, not direct proof of runner scheduling. Final19registry unit+2process-death parent+83transport tests PASS (ignored exact children run by parents),32worker unit+10supervision PASS, strict registry/transport Clippy/fmt/version0.0.17/diff PASS. Initial worker test command used directory name rather than packageID and was corrected to disk-steward-worker-probe; no implementation failure. No retry/poll/safety relaxation/dependency change/user data mutation. Current66 local notes targeted-stashed/preserved; fresh Linux/current59 CI required, host5.1GiB free/automation enabled.
+2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
+
+2026-11-03 PR50 integrates updated49 head52e858e/main e44957e; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
+
+2026-11-03 PR49 head52e858e merged to main9635f78 after four current-head build/test successes/no blocking findings; unwatch49. PR50 retargeted main, verified49 ancestor and main-vs49 transport/budget source identical; retained reviewed50 source for squash integration. All dated progress preserved; fresh50 CI required.
+
+2026-11-03 PR50 head935ec0e merged to mainc5997b2 after four current-head build/test successes/no blocking findings; unwatch50. PR51 retargeted main, verified50 ancestor and main-vs50 transport source identical; retained reviewed51 source for squash conflicts. All dated progress preserved; fresh51 CI required.
+
+2026-11-03 PR52 integrates updated51 headaf82b3e/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR53 integrates updated52 head536cf48/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR54 integrates updated53 head5b2a3b8/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR55 integrates updated54 head035c15f/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR56 integrates updated55 head58c17ab/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR57 integrates updated56 head5683a18/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR58 integrates updated57 head67b90d7/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR59 integrates updated58 head72d0da3; append-only progress conflict resolved retaining every dated entry. Registry lease fix retained; no implementation changes. Fresh current-head CI required; existing watch persists.
