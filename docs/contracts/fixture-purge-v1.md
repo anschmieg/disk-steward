@@ -72,6 +72,8 @@ These are internal backend contracts. No renderer-facing edit or command accepts
 
 `PurgeReviewTarget` is a sanitized public summary: action ID, receipt ID, fixed fixture label, logical bytes, and status. It contains no filesystem path, inode, raw device identity, or content. The private manifest binds every exact target to the fixture's registered device/inode, byte length, content digest, directory identities, receipt slot, plan/revision, session, operation, adapter/schema versions, selected byte sum, and review timestamps. Canonical serialization and a fixed hash cover the complete manifest. SQL byte limits are checked before JSON is loaded.
 
+Preparation and revalidation use the same target builder: each selected action and receipt resolve to that exact registered fixture, regardless of selection order or position in the full registry. A non-prefix subset must not borrow another fixture’s size or hashes. Historical reviews with mismatching manifests remain refused; they are not rewritten or revived. A wall-clock reversal observed across the trusted confirmation callback refuses before the execution claim.
+
 ## Review, confirmation, and durable authority
 
 The coordinator holds the existing exclusive app-owner lease from open through confirmation, execution, and recovery. It prepares an immutable review with a short bounded lifetime (five minutes by default); expiry is fixed at creation and independently indexed. Clock reversal, expiry, changed review bytes, reuse, unsupported schema, or a stale plan revision refuses the operation. Historical plan reviews and approval ledger rows remain immutable and are never reset or rewritten.
