@@ -226,3 +226,9 @@ reader before asserting evidence. This uses an in-memory sink and no files or
 child subprocesses. It demonstrates why arbitrary blocking `Write` calls still
 need an outer worker; it does not establish production worker/store integration,
 OS kill latency, flush durability or a milestone acceptance gate.
+
+The fixed system-Git fixture supervises repository setup and local receiver
+verification with a ten-second per-command budget, while upload-pack RPC
+commands retain a three-second budget. Shared macOS CI exceeded the earlier
+three-second setup budget; the failing child was reaped. These are test-fixture
+limits, not changes to transport or product attempt deadlines.
