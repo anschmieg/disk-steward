@@ -204,3 +204,55 @@ fn git_flush_cannot_complete_transfer_with_truncated_http_framing() {
     assert!(!report.is_complete_transfer());
     assert!(!report.finalization().is_complete());
 }
+
+const BLOCKED_PACK_SINK_READY: &[u8] = b"PACK_SINK_SECOND_WRITE_BLOCKED\n";
+
+struct PrefixThenBlock {
+    signal: CancellationHandle,
+    accepted: usize,
+}
+
+impl io::Write for PrefixThenBlock {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.accepted == 0 {
+            assert_eq!(bytes, b"PACK");
+            self.accepted = 4;
+            return Ok(4);
+        }
+
+        assert_eq!(self.accepted, 4);
+        assert_eq!(bytes, b"fixture tail");
+        self.signal.cancel();
+        assert!(self.signal.is_cancelled());
+        let mut stdout = io::stdout();
+        stdout.write_all(BLOCKED_PACK_SINK_READY)?;
+        stdout.flush()?;
+        loop {
+            thread::park();
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "invoked only by the exact blocked pack-sink deadline parent"]
+fn blocked_pack_sink_child() {
+    let (transport, _server) = pack_fixture(pack_body(b"PACKfixture tail"));
+    let mut sink = PrefixThenBlock {
+        signal: transport.cancellation_handle(),
+        accepted: 0,
+    };
+    let _report = transport.download_advertised_pack(&mut sink);
+    panic!("candidate returned from the deliberately blocked pack sink");
+}
+
+#[test]
+fn outer_deadline_stops_blocked_pack_sink() {
+    super::assert_outer_deadline_stops_child(
+        "tests::pack_tests::blocked_pack_sink_child",
+        BLOCKED_PACK_SINK_READY,
+    );
+}

@@ -215,3 +215,20 @@ establish durable aggregate enforcement across stores, directory/journal/index
 overhead, continuously reserved free space or production worker shutdown.
 The five-byte refusal is injected evidence, distinct from the native volume
 reserve sample in the successful fixture. No live GitHub endpoint is used.
+
+A separate exact-child test exercises the outer deadline after the actual
+candidate reaches a blocking sink during a private TLS pack transfer. The sink
+accepts the four-byte `PACK` prefix, cancels the cooperative handle, then emits
+a fixed readiness marker only when the next expected write enters its deliberate
+block. The parent requires the child to remain blocked through its three-second
+deadline, then kills and reaps that exact process and joins its bounded stdout
+reader before asserting evidence. This uses an in-memory sink and no files or
+child subprocesses. It demonstrates why arbitrary blocking `Write` calls still
+need an outer worker; it does not establish production worker/store integration,
+OS kill latency, flush durability or a milestone acceptance gate.
+
+The fixed system-Git fixture supervises repository setup and local receiver
+verification with a ten-second per-command budget, while upload-pack RPC
+commands retain a three-second budget. Shared macOS CI exceeded the earlier
+three-second setup budget; the failing child was reaped. These are test-fixture
+limits, not changes to transport or product attempt deadlines.
