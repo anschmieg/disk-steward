@@ -1,7 +1,7 @@
 //! Immutable, bounded manifest of caller-supplied required references.
 //!
 //! Entries are raw claims supplied by the caller, not native reference
-//! capture or cycle proof. They do not establish HEAD completeness, preservation,
+//! capture or proof about omitted refs. They do not establish HEAD completeness, preservation,
 //! backup, retention, signature, or cleanup authorization. The entry caps are
 //! experimental and are not product scope.
 
@@ -168,23 +168,40 @@ fn validate_present_symrefs(
     cancel: &CancellationHandle,
     deadline: Instant,
 ) -> io::Result<()> {
-    // Follow every present link. Missing targets remain caller claims; a walk
-    // longer than the entry count proves that a link cycle was encountered.
+    const UNSEEN: u8 = 0;
+    const VISITING: u8 = 1;
+    const DONE: u8 = 2;
+
+    // Each node has at most one outgoing edge. These arrays bound traversal
+    // state without allocating a second graph representation.
+    let mut states = [UNSEEN; MAX_ENTRIES];
+    let mut path = [0usize; MAX_ENTRIES];
     for start in 0..entries.len() {
         check_attempt(cancel, deadline)?;
+        if states[start] == DONE {
+            continue;
+        }
         let mut current = start;
-        let mut terminated = false;
-        for _ in 0..=entries.len() {
+        let mut path_len = 0usize;
+        loop {
             check_attempt(cancel, deadline)?;
+            match states[current] {
+                VISITING => return Err(invalid("required symbolic reference cycle")),
+                DONE => break,
+                UNSEEN => {}
+                _ => return Err(invalid("invalid required symbolic reference state")),
+            }
+
+            states[current] = VISITING;
+            path[path_len] = current;
+            path_len += 1;
             let entry = &entries[current];
             let Some(target_name) = entry.symref_target.as_deref() else {
-                terminated = true;
                 break;
             };
             let Ok(target_index) =
                 entries.binary_search_by(|candidate| candidate.name.as_slice().cmp(target_name))
             else {
-                terminated = true;
                 break;
             };
             let target = &entries[target_index];
@@ -192,14 +209,12 @@ fn validate_present_symrefs(
                 return Err(invalid("required symbolic reference claim mismatch"));
             }
             current = target_index;
-            if current == start {
-                return Err(invalid("required symbolic reference cycle"));
-            }
         }
-        // If a walk still links to a present target after N+1 steps, it must
-        // have entered a cycle, whether or not the cycle contains `start`.
-        if !terminated {
-            return Err(invalid("required symbolic reference cycle"));
+
+        while path_len > 0 {
+            check_attempt(cancel, deadline)?;
+            path_len -= 1;
+            states[path[path_len]] = DONE;
         }
     }
     check_attempt(cancel, deadline)
