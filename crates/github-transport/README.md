@@ -468,3 +468,21 @@ full fsck, signatures, practical private authentication, production worker/RSS
 limits or cleanup eligibility. Strict supported-subset refusals remain incomplete
 verification. Tests use bounded private TLS fixtures and the isolated real-Git
 fetch/strict receiver fixture; no user repository is accessed.
+
+### Required-object reachability
+
+`AdvertisedPackReport::check_required_objects` checks caller-supplied typed IDs
+against the report's privately retained advertised roots. Each requested object
+must be present with the expected kind and visited by the bounded root traversal;
+an unrelated extra pack entry does not count as coverage. The set must contain
+1–1,024 nonzero IDs. Duplicates consume the request count and every supplied kind
+is checked. The result reports request and graph counts, with no cleanup flag.
+
+This relation does not discover or attest local repository state. Callers still
+need a complete, stable local inventory, local ref-name preservation/disposition,
+receipt freshness and revalidation, and treatment of working files, hooks,
+configuration, stashes and recoverable state. The earlier stream-provenance,
+full-fsck, authentication, worker/RSS and cleanup limits remain. Traversal reuses
+existing fallible allocation and cooperative controls without cloning payloads.
+Tests distinguish an unreachable packed object from a reachable ancestor and
+check all four fixture object kinds through the real-Git private TLS flow.

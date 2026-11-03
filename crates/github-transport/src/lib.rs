@@ -5,7 +5,9 @@
 //! deadline. See the crate README for the current scope and limits.
 
 mod advertised_graph;
-pub use advertised_graph::{decode_advertised_pack, AdvertisedPackReport};
+pub use advertised_graph::{
+    decode_advertised_pack, AdvertisedPackReport, RequiredObjectCoverageReport,
+};
 mod graph;
 pub use graph::{check_pack_graph_closure, PackGraphReport};
 mod tag;

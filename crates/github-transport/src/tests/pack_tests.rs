@@ -447,3 +447,46 @@ fn repeated_advertised_peel_claims_consume_one_cumulative_budget() {
         }
     }
 }
+
+#[test]
+fn advertised_report_retains_roots_for_required_object_coverage() {
+    use super::graph_tests::{commit, hex, oid, pack_bytes, tree};
+    use GitObjectKind as K;
+    let blob = b"linked".to_vec();
+    let id = oid(K::Blob, &blob);
+    let stray = b"stray".to_vec();
+    let stray_id = oid(K::Blob, &stray);
+    let t = tree("100644", id);
+    let tree_id = oid(K::Tree, &t);
+    let c = commit(tree_id, &[]);
+    let commit_id = oid(K::Commit, &c);
+    let bytes = pack_bytes(&[
+        (K::Blob, blob),
+        (K::Blob, stray),
+        (K::Tree, t),
+        (K::Commit, c),
+    ]);
+    let report =
+        advertised_decode_fixture(format!("{} HEAD\n", hex(&commit_id)).into_bytes(), &bytes);
+    let checked = decode_report(&report, &bytes).unwrap();
+    let cancel = CancellationHandle::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let coverage = checked
+        .check_required_objects(&[(id, K::Blob), (commit_id, K::Commit)], &cancel, deadline)
+        .unwrap();
+    assert_eq!(coverage.required_object_count(), 2);
+    assert_eq!(coverage.graph().reachable_objects(), 3);
+    assert_eq!(
+        checked
+            .check_required_objects(&[(stray_id, K::Blob)], &cancel, deadline)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(checked
+        .check_required_objects(&[], &cancel, deadline)
+        .is_err());
+    assert!(checked
+        .check_required_objects(&[(id, K::Tree)], &cancel, deadline)
+        .is_err());
+}

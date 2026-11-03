@@ -239,3 +239,80 @@ fn directory_blob_modes_parent_and_nested_tag_links_are_checked() {
         ErrorKind::InvalidData
     );
 }
+
+#[test]
+fn required_coverage_uses_reachability_not_merely_pack_presence() {
+    use crate::graph::check_pack_graph_coverage as coverage;
+    let linked = b"linked".to_vec();
+    let stray = b"unreachable".to_vec();
+    let linked_id = oid(K::Blob, &linked);
+    let stray_id = oid(K::Blob, &stray);
+    let t = tree("100644", linked_id);
+    let tree_id = oid(K::Tree, &t);
+    let parent = commit(tree_id, &[]);
+    let parent_id = oid(K::Commit, &parent);
+    let child = commit(tree_id, &[parent_id]);
+    let child_id = oid(K::Commit, &child);
+    let p = pack(&[
+        (K::Blob, linked),
+        (K::Blob, stray),
+        (K::Tree, t),
+        (K::Commit, parent),
+        (K::Commit, child),
+    ]);
+    let roots = [(child_id, K::Commit)];
+    let cancel = CancellationHandle::new();
+    let all = [
+        (child_id, K::Commit),
+        (parent_id, K::Commit),
+        (tree_id, K::Tree),
+        (linked_id, K::Blob),
+    ];
+    assert_eq!(
+        coverage(&p, &roots, &all, &cancel, deadline())
+            .unwrap()
+            .reachable_objects(),
+        4
+    );
+    assert_eq!(
+        coverage(&p, &roots, &[(stray_id, K::Blob)], &cancel, deadline())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+    assert_eq!(
+        coverage(&p, &roots, &[([1; 20], K::Blob)], &cancel, deadline())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    for required in [
+        vec![],
+        vec![([0; 20], K::Blob)],
+        vec![(linked_id, K::Blob); 1025],
+        vec![(linked_id, K::Blob), (linked_id, K::Tree)],
+    ] {
+        assert!(coverage(&p, &roots, &required, &cancel, deadline()).is_err());
+    }
+    assert!(coverage(
+        &p,
+        &roots,
+        &vec![(linked_id, K::Blob); 1024],
+        &cancel,
+        deadline()
+    )
+    .is_ok());
+    assert_eq!(
+        coverage(&p, &roots, &all, &cancel, Instant::now())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::TimedOut
+    );
+    cancel.cancel();
+    assert_eq!(
+        coverage(&p, &roots, &all, &cancel, deadline())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::ConnectionAborted
+    );
+}
