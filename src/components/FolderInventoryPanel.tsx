@@ -30,6 +30,22 @@ export type FolderInventory = {
   regularFileLogicalBytes: string;
 };
 
+export type FolderTreeSummary = {
+  observationId: string;
+  rootLabel: string;
+  entriesObserved: number;
+  filesObserved: number;
+  uniqueFileObjects: number;
+  duplicateHardlinkNames: number;
+  directoriesVisited: number;
+  skippedEntries: number;
+  unreadableEntries: number;
+  changedDirectories: number;
+  uniqueFileLogicalBytes: string;
+  coverageComplete: boolean;
+  stopReason: string | null;
+};
+
 export default function FolderInventoryPanel({
   native,
   active = true,
@@ -48,7 +64,11 @@ export default function FolderInventoryPanel({
   const inspectorReturnRef = useRef<HTMLButtonElement | null>(null);
   const queryRef = useRef<HTMLInputElement>(null);
   const chooseRef = useRef<HTMLButtonElement>(null);
+  const treeHeadingRef = useRef<HTMLHeadingElement>(null);
   const focusChooseAfterClear = useRef(false);
+  const [treeSummary, setTreeSummary] = useState<FolderTreeSummary | null>(
+    null,
+  );
   const [snapshot, setSnapshot] = useState<FolderInventory | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -66,6 +86,9 @@ export default function FolderInventoryPanel({
   useEffect(() => {
     if (active && selectedId !== null) evidenceHeadingRef.current?.focus();
   }, [selectedId, active]);
+  useEffect(() => {
+    if (active && treeSummary) treeHeadingRef.current?.focus();
+  }, [treeSummary, active]);
   const inspect = async (entryId?: string | null, nextPage = false) => {
     if (activeRequest.current || !native) return;
     if ((nextPage || entryId !== undefined) && !snapshot) return;
@@ -90,6 +113,7 @@ export default function FolderInventoryPanel({
                 },
               });
       if (next) {
+        setTreeSummary(null);
         inspectorReturnRef.current = null;
         setSelectedId(null);
         setImported(false);
@@ -100,6 +124,7 @@ export default function FolderInventoryPanel({
           "Folder selection canceled. The previous observation is unchanged.",
         );
     } catch {
+      if (nextPage) setTreeSummary(null);
       if (nextPage)
         setSnapshot((previous) =>
           previous ? { ...previous, canContinue: false } : previous,
@@ -160,6 +185,7 @@ export default function FolderInventoryPanel({
       });
       focusChooseAfterClear.current = true;
       inspectorReturnRef.current = null;
+      setTreeSummary(null);
       setSnapshot(null);
       setSelectedId(null);
       setImported(false);
@@ -170,6 +196,31 @@ export default function FolderInventoryPanel({
     } catch {
       setMessage(
         "The folder scope could not be cleared. The historical view is retained; choose the folder again to refresh its state.",
+      );
+    } finally {
+      activeRequest.current = false;
+      setBusy(false);
+      onBusyChange(false);
+    }
+  };
+  const summarizeTree = async () => {
+    if (!native || !snapshot || activeRequest.current) return;
+    activeRequest.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    setMessage("");
+    setTreeSummary(null);
+    try {
+      const result = await invoke<FolderTreeSummary>(
+        "inspect_folder_tree_summary",
+        { request: { expectedObservationId: snapshot.observationId } },
+      );
+      if (result.observationId !== snapshot.observationId)
+        throw new Error("Observation mismatch");
+      setTreeSummary(result);
+    } catch {
+      setMessage(
+        "The subtree summary could not be completed reliably. The folder page is unchanged; choose the folder again to refresh its scope.",
       );
     } finally {
       activeRequest.current = false;
@@ -229,6 +280,69 @@ export default function FolderInventoryPanel({
             in-memory observations. Previously saved plan and review metadata
             remain.
           </p>
+          <button
+            className="button secondary"
+            disabled={busy || !native}
+            onClick={() => void summarizeTree()}
+          >
+            Summarize subtree metadata
+          </button>
+          <p>
+            Explicit read-only summary: up to 4,096 entries, 16 levels and
+            cooperative two-second checks. File contents are not read. Links and
+            unsupported boundaries are skipped; coverage gaps remain visible.
+          </p>
+          {treeSummary && (
+            <section
+              className="inventory-evidence"
+              aria-label="Subtree metadata summary"
+            >
+              <h3 ref={treeHeadingRef} tabIndex={-1}>
+                Subtree observation · {treeSummary.rootLabel}
+              </h3>
+              <p role="status">
+                {treeSummary.coverageComplete
+                  ? "Traversal finished within the bounded policy."
+                  : "Incomplete subtree coverage."}{" "}
+                {treeSummary.stopReason
+                  ? (summaryReasons[treeSummary.stopReason] ??
+                    "Some metadata could not be observed reliably.")
+                  : ""}
+              </p>
+              <dl>
+                <dt>Observed entry records</dt>
+                <dd>{treeSummary.entriesObserved}</dd>
+                <dt>Regular-file names</dt>
+                <dd>{treeSummary.filesObserved}</dd>
+                <dt>Unique observed file objects</dt>
+                <dd>{treeSummary.uniqueFileObjects}</dd>
+                <dt>Repeated hard-link names</dt>
+                <dd>{treeSummary.duplicateHardlinkNames}</dd>
+                <dt>Directories visited</dt>
+                <dd>{treeSummary.directoriesVisited}</dd>
+                <dt>Skipped entries</dt>
+                <dd>{treeSummary.skippedEntries}</dd>
+                <dt>Unreadable entries</dt>
+                <dd>{treeSummary.unreadableEntries}</dd>
+                <dt>Changed directories</dt>
+                <dd>{treeSummary.changedDirectories}</dd>
+                <dt>Observed file-object logical bytes</dt>
+                <dd>{treeSummary.uniqueFileLogicalBytes}</dd>
+              </dl>
+              <p>
+                Historical metadata observation, not a consistent filesystem
+                snapshot. Native file-object identities deduplicate hard-link
+                names only within this bounded walk. Shared extents, clones,
+                snapshots and skipped contents remain unknown. This is not
+                occupied or reclaimable space and creates no cleanup
+                eligibility.
+              </p>
+              <p>
+                The current-page list, size-bar denominator and metadata import
+                remain unchanged. Summary totals do not add items to your plan.
+              </p>
+            </section>
+          )}
           <nav aria-label="Folder location">
             <ol>
               {snapshot.breadcrumbs.map((label, index) => (
@@ -536,4 +650,12 @@ const navigationReasons: Record<string, string> = {
   managed_boundary:
     "Application or managed library boundary: traversal is blocked.",
   depth_limit: "Navigation depth limit reached.",
+};
+
+const summaryReasons: Record<string, string> = {
+  entry_limit: "The entry limit was reached.",
+  depth_limit: "The depth limit was reached.",
+  time_limit: "The observation time limit was reached.",
+  logical_size_overflow: "The logical-byte total exceeded the supported range.",
+  directory_changed: "A directory changed during inspection.",
 };
