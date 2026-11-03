@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -15,7 +16,10 @@ import {
 } from "../test-fixtures/editor";
 import AdvancedPlanPanel from "./AdvancedPlanPanel";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 function mount(
   snapshot = editorSnapshot([]),
@@ -151,6 +155,130 @@ describe("AdvancedPlanPanel decisions", () => {
     });
   });
 
+  it("requires hidden removed members to be shown before group-wide choices", () => {
+    const visible = editorItem("visible", { label: "Visible item" });
+    const removed = editorItem("removed", {
+      label: "Removed item",
+      inPlan: false,
+      effectiveSelected: false,
+    });
+    const { onEdit } = mount(
+      editorSnapshot(
+        [visible, removed],
+        [editorGroup("mixed", ["visible", "removed"])],
+      ),
+    );
+    expect(
+      screen.queryByRole("listitem", { name: /Removed item/ }),
+    ).not.toBeInTheDocument();
+    for (const name of ["Keep group", "Include group", "Investigate"]) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute(
+        "title",
+        "Show removed items before group-wide changes",
+      );
+      fireEvent.click(button);
+    }
+    expect(onEdit).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: /Show removed items/ }),
+    );
+    expect(
+      screen.getByRole("listitem", { name: /Removed item/ }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep group" }));
+    expect(onEdit).toHaveBeenCalledExactlyOnceWith({
+      kind: "setGroupChoice",
+      groupId: "mixed",
+      choice: "keep",
+    });
+  });
+
+  it.each([false, true])(
+    "restores focus after the focused row disappears (group removed: %s)",
+    (removeGroup) => {
+      const frames: FrameRequestCallback[] = [];
+      vi.stubGlobal(
+        "requestAnimationFrame",
+        (callback: FrameRequestCallback) => {
+          frames.push(callback);
+          return frames.length;
+        },
+      );
+      const original = editorItem("candidate", {
+        label: "Candidate",
+        groupIds: ["review-group"],
+      });
+      const other = editorItem("other", {
+        label: "Other",
+        groupIds: ["other-group"],
+      });
+      const initial = editorSnapshot(
+        [original, other],
+        [
+          editorGroup("review-group", ["candidate"]),
+          editorGroup("other-group", ["other"]),
+        ],
+      );
+      const onEdit = vi
+        .fn<(edit: PlanEdit) => Promise<void>>()
+        .mockResolvedValue();
+      const props = {
+        busy: false,
+        confirmed: false,
+        editsConfirmed: true,
+        readOnly: false,
+        onEdit,
+        onUndo: async () => {},
+        onRedo: async () => {},
+        onRefresh: async () => {},
+        onReview: async () => {},
+      };
+      const { rerender } = render(
+        <AdvancedPlanPanel snapshot={initial} {...props} />,
+      );
+      Object.defineProperty(
+        screen.getByRole("list", { name: "Grouped plan findings" }),
+        "clientHeight",
+        { configurable: true, value: 464 },
+      );
+      const remove = screen.getByRole("button", {
+        name: "Remove Candidate from plan",
+      });
+      act(() => remove.focus());
+      expect(remove).toHaveFocus();
+      fireEvent.click(remove);
+      expect(onEdit).toHaveBeenCalledExactlyOnceWith({
+        kind: "setMembership",
+        itemId: "candidate",
+        inPlan: false,
+      });
+      const next = {
+        ...initial,
+        revisionId: "revision-after-removal",
+        revisionNumber: initial.revisionNumber + 1,
+        items: [
+          { ...original, inPlan: false, effectiveSelected: false },
+          other,
+        ],
+        groups: removeGroup
+          ? [editorGroup("other-group", ["other"])]
+          : initial.groups,
+      };
+      rerender(<AdvancedPlanPanel snapshot={next} {...props} />);
+      act(() => frames.splice(0).forEach((callback) => callback(0)));
+      expect(
+        screen.queryByRole("button", { name: "Remove Candidate from plan" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name: removeGroup ? "Collapse other-group" : "Collapse review-group",
+        }),
+      ).toHaveFocus();
+    },
+  );
+
   it("sends the exact descendant exclusion identity set", () => {
     const folder = editorItem("project", { label: "Project", kind: "folder" });
     const child = editorItem("valuable", {
@@ -175,6 +303,48 @@ describe("AdvancedPlanPanel decisions", () => {
       kind: "excludeDescendants",
       parentId: "project",
       itemIds: ["valuable"],
+    });
+  });
+
+  it("distinguishes same-named descendants by ancestor context and keeps exact identities", () => {
+    const { onEdit } = mount(
+      editorSnapshot([
+        editorItem("project", { label: "Project", kind: "folder" }),
+        editorItem("first-folder", {
+          label: "Design drafts",
+          kind: "folder",
+          parentId: "project",
+        }),
+        editorItem("second-folder", {
+          label: "Published notes",
+          kind: "folder",
+          parentId: "project",
+        }),
+        editorItem("first-notes", {
+          label: "notes.txt",
+          parentId: "first-folder",
+        }),
+        editorItem("second-notes", {
+          label: "notes.txt",
+          parentId: "second-folder",
+        }),
+      ]),
+    );
+    fireEvent.click(screen.getByRole("listitem", { name: /Project/ }));
+    const first = screen.getByRole("checkbox", {
+      name: /notes.txt.*Design drafts/,
+    });
+    const second = screen.getByRole("checkbox", {
+      name: /notes.txt.*Published notes/,
+    });
+    expect(first).not.toBe(second);
+    expect(first).not.toBeChecked();
+    expect(second).not.toBeChecked();
+    fireEvent.click(first);
+    expect(onEdit).toHaveBeenCalledExactlyOnceWith({
+      kind: "excludeDescendants",
+      parentId: "project",
+      itemIds: ["first-notes"],
     });
   });
 
