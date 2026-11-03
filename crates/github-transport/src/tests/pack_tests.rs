@@ -370,6 +370,24 @@ fn advertised_pack_closure_binds_all_tip_claims_and_peeled_targets() {
         format!("{} refs/tags/missing\n", hex(&[1; 20])),
         format!("{} HEAD symref-target:refs/heads/absent\n", hex(&commit_id)),
         format!(
+            "{} refs/heads/self symref-target:refs/heads/self\n",
+            hex(&commit_id)
+        ),
+        format!(
+            "{} HEAD symref-target:refs/heads/tail\n{} refs/heads/tail symref-target:refs/heads/a\n{} refs/heads/a symref-target:refs/heads/b\n{} refs/heads/b symref-target:refs/heads/a\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+        format!(
+            "{} refs/heads/c symref-target:refs/heads/a\n{} refs/heads/a symref-target:refs/heads/b\n{} HEAD symref-target:refs/heads/c\n{} refs/heads/b symref-target:refs/heads/c\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+        format!(
             "{} HEAD symref-target:refs/tags/blob\n{} refs/tags/blob\n",
             hex(&commit_id),
             hex(&blob_id)
@@ -393,7 +411,59 @@ fn advertised_pack_closure_binds_all_tip_claims_and_peeled_targets() {
         let report = advertised_decode_fixture(refs.into_bytes(), &bytes);
         assert!(decode_report(&report, &bytes).is_err());
     }
+
+    for refs in [
+        format!(
+            "{} HEAD symref-target:refs/heads/a\n{} refs/heads/a symref-target:refs/heads/main\n{} refs/heads/b symref-target:refs/heads/main\n{} refs/heads/main\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+        format!(
+            "{} refs/heads/main\n{} refs/heads/b symref-target:refs/heads/main\n{} refs/heads/a symref-target:refs/heads/main\n{} HEAD symref-target:refs/heads/a\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+    ] {
+        let report = advertised_decode_fixture(refs.into_bytes(), &bytes);
+        let decoded = decode_report(&report, &bytes).unwrap();
+        assert_eq!(decoded.graph().root_count(), 1);
+    }
 }
+#[test]
+fn advertised_symref_chain_at_reference_limit_is_bounded_and_cycle_refused() {
+    use super::graph_tests::{commit, hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let tree = Vec::new();
+    let commit = commit(oid(K::Tree, &tree), &[]);
+    let commit_id = hex(&oid(K::Commit, &commit));
+    let bytes = pack_bytes(&[(K::Tree, tree), (K::Commit, commit)]);
+    let mut refs = String::new();
+    for index in 0..1023 {
+        refs.push_str(&format!(
+            "{commit_id} refs/heads/r{index:04} symref-target:refs/heads/r{:04}\n",
+            index + 1
+        ));
+    }
+    let mut chain = refs.clone();
+    chain.push_str(&format!("{commit_id} refs/heads/r1023\n"));
+    let report = advertised_decode_fixture(chain.into_bytes(), &bytes);
+    let decoded = decode_report(&report, &bytes).unwrap();
+    assert_eq!(decoded.advertised_ref_count(), 1024);
+    assert_eq!(decoded.graph().root_count(), 1);
+
+    refs.push_str(&format!(
+        "{commit_id} refs/heads/r1023 symref-target:refs/heads/r0000\n"
+    ));
+    let report = advertised_decode_fixture(refs.into_bytes(), &bytes);
+    let error = decode_report(&report, &bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "advertised symbolic reference cycle");
+}
+
 #[test]
 fn advertised_pack_decode_refuses_incomplete_transfer_and_missing_graph_links() {
     use super::graph_tests::{commit, hex, oid, pack_bytes};
