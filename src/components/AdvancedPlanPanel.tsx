@@ -92,6 +92,23 @@ export default function AdvancedPlanPanel({
     () => new Map(snapshot.items.map((item) => [item.itemId, item])),
     [snapshot.items],
   );
+  const hiddenRemovedItemIds = useMemo(
+    () =>
+      new Set(
+        snapshot.items
+          .filter((item) => !item.inPlan)
+          .map((item) => item.itemId),
+      ),
+    [snapshot.items],
+  );
+  const hasHiddenRemovedGroupMembers = useMemo(
+    () =>
+      !showRemoved &&
+      snapshot.groups.some((group) =>
+        group.memberIds.some((itemId) => hiddenRemovedItemIds.has(itemId)),
+      ),
+    [showRemoved, snapshot.groups, hiddenRemovedItemIds],
+  );
   const maxKnownLogicalBytes = useMemo(
     () => Math.max(0, ...snapshot.items.map((item) => item.logicalBytes ?? 0)),
     [snapshot.items],
@@ -502,6 +519,11 @@ export default function AdvancedPlanPanel({
               Show removed items
             </label>
           </div>
+          {hasHiddenRemovedGroupMembers && (
+            <p className="ap-window-note" aria-live="polite">
+              Show removed items before changing a group that contains them.
+            </p>
+          )}
           {normalizedQuery && (
             <p className="ap-window-note">
               Summary totals include the whole plan, including findings hidden
@@ -533,6 +555,22 @@ export default function AdvancedPlanPanel({
                 if (!item) {
                   const label = group?.label ?? "Other findings";
                   const count = group?.memberIds.length ?? 0;
+                  const hasHiddenRemovedMembers = Boolean(
+                    group &&
+                    !showRemoved &&
+                    group.memberIds.some((itemId) =>
+                      hiddenRemovedItemIds.has(itemId),
+                    ),
+                  );
+                  const groupChoiceDisabled =
+                    editsBlocked ||
+                    Boolean(normalizedQuery) ||
+                    hasHiddenRemovedMembers;
+                  const groupChoiceTitle = normalizedQuery
+                    ? "Clear search before group-wide changes"
+                    : hasHiddenRemovedMembers
+                      ? "Show removed items before group-wide changes"
+                      : undefined;
                   return (
                     <div
                       key={row.key}
@@ -601,12 +639,8 @@ export default function AdvancedPlanPanel({
                           aria-label={`Set all eligible ${label} items`}
                         >
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -618,12 +652,8 @@ export default function AdvancedPlanPanel({
                             Include group
                           </button>
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -635,12 +665,8 @@ export default function AdvancedPlanPanel({
                             Keep group
                           </button>
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",

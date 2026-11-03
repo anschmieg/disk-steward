@@ -151,6 +151,46 @@ describe("AdvancedPlanPanel decisions", () => {
     });
   });
 
+  it("requires hidden removed members to be shown before group-wide choices", () => {
+    const visible = editorItem("visible", { label: "Visible item" });
+    const removed = editorItem("removed", {
+      label: "Removed item",
+      inPlan: false,
+      effectiveSelected: false,
+    });
+    const { onEdit } = mount(
+      editorSnapshot(
+        [visible, removed],
+        [editorGroup("mixed", ["visible", "removed"])],
+      ),
+    );
+    expect(
+      screen.queryByRole("listitem", { name: /Removed item/ }),
+    ).not.toBeInTheDocument();
+    for (const name of ["Keep group", "Include group", "Investigate"]) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute(
+        "title",
+        "Show removed items before group-wide changes",
+      );
+      fireEvent.click(button);
+    }
+    expect(onEdit).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: /Show removed items/ }),
+    );
+    expect(
+      screen.getByRole("listitem", { name: /Removed item/ }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep group" }));
+    expect(onEdit).toHaveBeenCalledExactlyOnceWith({
+      kind: "setGroupChoice",
+      groupId: "mixed",
+      choice: "keep",
+    });
+  });
+
   it("sends the exact descendant exclusion identity set", () => {
     const folder = editorItem("project", { label: "Project", kind: "folder" });
     const child = editorItem("valuable", {
