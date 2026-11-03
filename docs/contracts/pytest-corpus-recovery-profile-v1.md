@@ -16,13 +16,15 @@ attempt history before returning state. Reopen never retries a pending intent.
 Unknown profiles, mixed registries and altered corpus fail closed. Historical
 synthetic sessions retain their existing schema and migration behavior.
 
-The existing five-file demo coordinator and synthetic purge-review service
-explicitly reject this profile. Their manifests, seeded plan and native
-confirmation wording do not authorize generated records. The low-level
-lifecycle remains trusted backend infrastructure; its methods do not themselves
-obtain user approval. A future product coordinator must bind detector evidence,
-plan decisions, exact review, single-use approval, journaled execution and
-separate purge approval before exposing this profile through a UI.
+The existing five-file coordinator entry point and synthetic purge-review
+service explicitly reject this profile. A separate backend corpus entry point
+now binds its own fixed editable plan, exact review, single-use approval and
+journaled stage/restore/separate-purge flow; see [the execution contract](pytest-corpus-execution-v1.md).
+The synthetic manifests and native confirmation wording do not authorize corpus
+records. The low-level lifecycle remains trusted backend infrastructure; its
+methods do not themselves obtain user approval. Live detector evidence and
+native product approval integration remain required before exposing live
+project mutations through a UI.
 
 Tests use disposable app-owned parents. They exercise reopen across lifecycle
 transitions and refusal paths, preserving unselected records and unknown

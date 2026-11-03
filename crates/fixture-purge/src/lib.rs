@@ -17,10 +17,12 @@ use disk_steward_core::{PlanId, ReceiptId, ReviewId, RevisionId, SessionId, Supp
 use disk_steward_fixture_lifecycle::{
     FixtureLifecycle, FixtureProfile, FixtureStatus, PurgeItemOutcome,
 };
-use disk_steward_review_plan::ReviewPlanStore;
+use disk_steward_review_plan::{ReviewPlanProfile, ReviewPlanStore};
 
 const CONTROL_DB: &str = "fixture-purge-control-v1.sqlite3";
 const CONTROL_APPLICATION_ID: i64 = 0x4453_4650;
+const PYTEST_CONTROL_DB: &str = "pytest-corpus-purge-v1.sqlite3";
+const PYTEST_CONTROL_APPLICATION_ID: i64 = 0x4453_5055;
 const CONTROL_SCHEMA_VERSION: i64 = 1;
 const MAX_TARGETS: usize = 5;
 const REVIEW_LIFETIME_MS: i64 = 5 * 60 * 1000;
@@ -193,6 +195,7 @@ struct ManifestTargetV1 {
 
 pub struct FixturePurgeService {
     control: Connection,
+    profile: FixtureProfile,
     now: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
@@ -221,13 +224,34 @@ impl FixturePurgeService {
         app_owned_root: &Path,
         now: Box<dyn Fn() -> i64 + Send + Sync>,
     ) -> Result<Self, PurgeError> {
+        Self::open_profile_with_clock(app_owned_root, now, FixtureProfile::SyntheticV1)
+    }
+
+    /// Backend-only approval adapter for the closed app-owned pytest corpus.
+    /// This does not adopt live project files or share synthetic approvals.
+    pub fn open_pytest_corpus_with_clock(
+        app_owned_root: &Path,
+        now: Box<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Result<Self, PurgeError> {
+        Self::open_profile_with_clock(app_owned_root, now, FixtureProfile::Pytest920V1)
+    }
+
+    fn open_profile_with_clock(
+        app_owned_root: &Path,
+        now: Box<dyn Fn() -> i64 + Send + Sync>,
+        profile: FixtureProfile,
+    ) -> Result<Self, PurgeError> {
         let root = std::fs::canonicalize(app_owned_root)?;
         if !root.is_dir() {
             return Err(PurgeError::StorageFailure);
         }
-        let mut control = open_control_db(&root)?;
+        let mut control = open_control_db(&root, profile)?;
         recover_unfinished_executions(&mut control, (now)())?;
-        Ok(Self { control, now })
+        Ok(Self {
+            control,
+            profile,
+            now,
+        })
     }
 
     /// Freeze an immutable purge review over explicitly selected staged
@@ -240,10 +264,11 @@ impl FixturePurgeService {
         expected_revision: RevisionId,
         targets: Vec<PurgeTarget>,
     ) -> Result<PreparedPurgeReview, PurgeError> {
-        if lifecycle.profile() != FixtureProfile::SyntheticV1 {
+        require_control_profile(&self.control, self.profile)?;
+        if lifecycle.profile() != self.profile || !plan_matches_profile(plan, self.profile) {
             return Err(PurgeError::UnsupportedSchema);
         }
-        if targets.is_empty() || targets.len() > MAX_TARGETS {
+        if targets.is_empty() || targets.len() > profile_max_targets(self.profile) {
             return Err(PurgeError::InvalidInput);
         }
         let mut seen_actions = std::collections::HashSet::new();
@@ -301,7 +326,7 @@ impl FixturePurgeService {
             created_at_ms,
             expires_at_ms: created_at_ms + REVIEW_LIFETIME_MS,
             selected_logical_bytes,
-            adapter_schema_version: 2,
+            adapter_schema_version: profile_adapter_version(self.profile),
             targets: build_manifest_targets(&review_targets, &snapshot)?,
         };
         // Canonical: serde_json of a typed struct is field-order
@@ -333,7 +358,7 @@ impl FixturePurgeService {
         self.checkpoint()?;
         Ok(PreparedPurgeReview {
             schema_version: 1,
-            kind: "disposable_fixture_purge_review".into(),
+            kind: profile_review_kind(self.profile).into(),
             review_id,
             plan_id: manifest.plan_id,
             revision_id: manifest.revision_id,
@@ -391,6 +416,7 @@ impl FixturePurgeService {
         &self,
         review_id: &ReviewId,
     ) -> Result<PreparedPurgeReview, PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
         load_stored_review(&self.control, review_id, "prepared")
     }
 
@@ -403,7 +429,11 @@ impl FixturePurgeService {
         plan: &ReviewPlanStore,
         prepared: &PreparedPurgeReview,
     ) -> Result<(), PurgeError> {
-        if lifecycle.profile() != FixtureProfile::SyntheticV1 {
+        require_control_profile(&self.control, self.profile)?;
+        if lifecycle.profile() != self.profile || !plan_matches_profile(plan, self.profile) {
+            return Err(PurgeError::UnsupportedSchema);
+        }
+        if prepared.kind != profile_review_kind(self.profile) {
             return Err(PurgeError::UnsupportedSchema);
         }
         let plan_view = plan.get_plan().map_err(|_| PurgeError::StaleRevision)?;
@@ -452,6 +482,7 @@ impl FixturePurgeService {
     /// uncertain execution, or any pending child attempt. Stage, restore and
     /// purge consults gate on this (contract: both control stores).
     pub fn has_uncertainty(&self) -> Result<bool, PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
         let started: i64 = self.control.query_row(
             "SELECT EXISTS(SELECT 1 FROM purge_executions WHERE state IN ('started','uncertain')) OR EXISTS(SELECT 1 FROM purge_child_attempts WHERE state='pending')",
             [],
@@ -470,12 +501,13 @@ impl FixturePurgeService {
         child_attempts: &[disk_steward_core::AttemptId],
         now: i64,
     ) -> Result<(), PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
         let execution_wire =
             serde_json::to_string(&execution_id).map_err(|_| PurgeError::StorageFailure)?;
         let tx = self
             .control
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if child_attempts.is_empty() || child_attempts.len() > MAX_TARGETS {
+        if child_attempts.is_empty() || child_attempts.len() > profile_max_targets(self.profile) {
             return Err(PurgeError::InvalidInput);
         }
         let execution: Option<String> = tx
@@ -563,6 +595,7 @@ impl FixturePurgeService {
         ),
         PurgeError,
     > {
+        require_control_profile(&self.control, self.profile)?;
         let review_wire =
             serde_json::to_string(&prepared.review_id).map_err(|_| PurgeError::StorageFailure)?;
         let tx = self
@@ -625,6 +658,7 @@ impl FixturePurgeService {
         prepared: &PreparedPurgeReview,
         child_attempts: Vec<disk_steward_core::AttemptId>,
     ) -> Result<PurgeExecutionResult, PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
         let execution_now = (self.now)();
         validate_claimed_execution(
             &self.control,
@@ -755,6 +789,7 @@ fn load_stored_review(
     review_id: &ReviewId,
     expected_state: &str,
 ) -> Result<PreparedPurgeReview, PurgeError> {
+    let profile = control_profile(connection)?;
     let wire = serde_json::to_string(review_id).map_err(|_| PurgeError::StorageFailure)?;
     let row: Option<StoredReviewRow> = connection
         .query_row(
@@ -804,7 +839,7 @@ fn load_stored_review(
     let selected_logical_bytes =
         u64::try_from(selected_logical_bytes).map_err(|_| PurgeError::UnsupportedSchema)?;
     if targets.is_empty()
-        || targets.len() > MAX_TARGETS
+        || targets.len() > profile_max_targets(profile)
         || created_at_ms < 0
         || expires_at_ms.checked_sub(created_at_ms) != Some(REVIEW_LIFETIME_MS)
     {
@@ -830,7 +865,7 @@ fn load_stored_review(
     }
     Ok(PreparedPurgeReview {
         schema_version: 1,
-        kind: "disposable_fixture_purge_review".into(),
+        kind: profile_review_kind(profile).into(),
         review_id: *review_id,
         plan_id,
         revision_id,
@@ -852,7 +887,7 @@ fn validate_claimed_execution(
     attempts: &[disk_steward_core::AttemptId],
     now: i64,
 ) -> Result<(), PurgeError> {
-    if lifecycle.profile() != FixtureProfile::SyntheticV1 {
+    if lifecycle.profile() != control_profile(connection)? {
         return Err(PurgeError::UnsupportedSchema);
     }
     if attempts.is_empty()
@@ -988,7 +1023,7 @@ fn build_manifest(
         created_at_ms: prepared.created_at_ms,
         expires_at_ms: prepared.expires_at_ms,
         selected_logical_bytes: prepared.selected_logical_bytes,
-        adapter_schema_version: 2,
+        adapter_schema_version: profile_adapter_version(profile_from_review_kind(&prepared.kind)?),
         targets: build_manifest_targets(&prepared.targets, snapshot)?,
     })
 }
@@ -1053,6 +1088,70 @@ fn recover_unfinished_executions(db: &mut Connection, now: i64) -> Result<(), Pu
     Ok(())
 }
 
+fn profile_control_db(profile: FixtureProfile) -> &'static str {
+    match profile {
+        FixtureProfile::SyntheticV1 => CONTROL_DB,
+        FixtureProfile::Pytest920V1 => PYTEST_CONTROL_DB,
+    }
+}
+fn profile_application_id(profile: FixtureProfile) -> i64 {
+    match profile {
+        FixtureProfile::SyntheticV1 => CONTROL_APPLICATION_ID,
+        FixtureProfile::Pytest920V1 => PYTEST_CONTROL_APPLICATION_ID,
+    }
+}
+fn profile_review_kind(profile: FixtureProfile) -> &'static str {
+    match profile {
+        FixtureProfile::SyntheticV1 => "disposable_fixture_purge_review",
+        FixtureProfile::Pytest920V1 => "pytest_corpus_purge_review",
+    }
+}
+fn profile_from_review_kind(kind: &str) -> Result<FixtureProfile, PurgeError> {
+    match kind {
+        "disposable_fixture_purge_review" => Ok(FixtureProfile::SyntheticV1),
+        "pytest_corpus_purge_review" => Ok(FixtureProfile::Pytest920V1),
+        _ => Err(PurgeError::UnsupportedSchema),
+    }
+}
+fn profile_max_targets(profile: FixtureProfile) -> usize {
+    match profile {
+        FixtureProfile::SyntheticV1 => MAX_TARGETS,
+        FixtureProfile::Pytest920V1 => 2,
+    }
+}
+fn profile_adapter_version(profile: FixtureProfile) -> i64 {
+    match profile {
+        FixtureProfile::SyntheticV1 => 2,
+        FixtureProfile::Pytest920V1 => 1001,
+    }
+}
+fn control_profile(db: &Connection) -> Result<FixtureProfile, PurgeError> {
+    let app: i64 = db.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != CONTROL_SCHEMA_VERSION {
+        return Err(PurgeError::UnsupportedSchema);
+    }
+    match app {
+        CONTROL_APPLICATION_ID => Ok(FixtureProfile::SyntheticV1),
+        PYTEST_CONTROL_APPLICATION_ID => Ok(FixtureProfile::Pytest920V1),
+        _ => Err(PurgeError::UnsupportedSchema),
+    }
+}
+fn require_control_profile(db: &Connection, expected: FixtureProfile) -> Result<(), PurgeError> {
+    if control_profile(db)? == expected {
+        Ok(())
+    } else {
+        Err(PurgeError::UnsupportedSchema)
+    }
+}
+fn plan_matches_profile(plan: &ReviewPlanStore, profile: FixtureProfile) -> bool {
+    let expected = match profile {
+        FixtureProfile::SyntheticV1 => ReviewPlanProfile::SyntheticV1,
+        FixtureProfile::Pytest920V1 => ReviewPlanProfile::Pytest920V1,
+    };
+    plan.profile() == expected
+}
+
 fn wall_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1061,13 +1160,13 @@ fn wall_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn open_control_db(root: &Path) -> Result<Connection, PurgeError> {
+fn open_control_db(root: &Path, profile: FixtureProfile) -> Result<Connection, PurgeError> {
     let metadata = std::fs::symlink_metadata(root)?;
     if !metadata.file_type().is_dir() {
         return Err(PurgeError::StorageFailure);
     }
     let db = Connection::open_with_flags(
-        root.join(CONTROL_DB),
+        root.join(profile_control_db(profile)),
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -1076,7 +1175,7 @@ fn open_control_db(root: &Path) -> Result<Connection, PurgeError> {
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.pragma_update(None, "journal_mode", "WAL")?;
     db.pragma_update(None, "synchronous", "FULL")?;
-    initialize_control(&db)?;
+    initialize_control(&db, profile)?;
     enforce_private_store(&db)?;
     Ok(db)
 }
@@ -1117,7 +1216,7 @@ fn enforce_private_store(db: &Connection) -> Result<(), PurgeError> {
     Ok(())
 }
 
-fn initialize_control(db: &Connection) -> Result<(), PurgeError> {
+fn initialize_control(db: &Connection, profile: FixtureProfile) -> Result<(), PurgeError> {
     let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let schema_version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let objects: i64 = db.query_row(
@@ -1135,17 +1234,17 @@ fn initialize_control(db: &Connection) -> Result<(), PurgeError> {
         [],
         |r| r.get(0),
     )?;
-    if objects == 0 {
+    if objects == 0 && application_id == 0 && schema_version == 0 {
         // Fresh store: initialize exactly the reviewed schema.
         db.execute_batch(&format!(
             "{REVIEWS_SCHEMA};{EXECUTIONS_SCHEMA};{CHILD_ATTEMPTS_SCHEMA};{EXPIRY_INDEX};"
         ))?;
-        db.pragma_update(None, "application_id", CONTROL_APPLICATION_ID)?;
+        db.pragma_update(None, "application_id", profile_application_id(profile))?;
         db.pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)?;
         return Ok(());
     }
     // Existing store: exact schema, exact objects, known version, no reset.
-    if application_id != CONTROL_APPLICATION_ID
+    if application_id != profile_application_id(profile)
         || schema_version != CONTROL_SCHEMA_VERSION
         || objects != 4
         || known != 3
@@ -1473,6 +1572,146 @@ mod tests {
         );
         assert_eq!(pytest.snapshot().unwrap(), before);
         assert!(!service.has_uncertainty().unwrap());
+    }
+
+    #[test]
+    fn pytest_purge_uses_its_exact_plan_profile_and_separate_approval_kind() {
+        let (dir, _) = demo_root();
+        let now = 1_700_000_000_000;
+        let mut plan =
+            ReviewPlanStore::open_pytest_corpus(dir.path().join("pytest-review.sqlite3")).unwrap();
+        let initial = plan.get_plan().unwrap();
+        let ids = [initial.actions[0].id, initial.actions[1].id];
+        let view = plan
+            .edit(
+                initial.revision_id,
+                ids[1],
+                disk_steward_review_plan::Decision::Include,
+            )
+            .unwrap();
+        let (mut lifecycle, _) = FixtureLifecycle::create_pytest_corpus(dir.path(), ids).unwrap();
+        let receipt = lifecycle
+            .stage(ids[1], disk_steward_core::AttemptId::new())
+            .unwrap();
+        let mut service =
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now))
+                .unwrap();
+        let targets = vec![PurgeTarget {
+            action_id: ids[1],
+            receipt_id: receipt,
+        }];
+        let synthetic = ReviewPlanStore::open(dir.path().join("synthetic-review.sqlite3")).unwrap();
+        assert!(matches!(
+            service.prepare_purge_review(
+                &mut lifecycle,
+                &synthetic,
+                view.revision_id,
+                targets.clone()
+            ),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let prepared = service
+            .prepare_purge_review(&mut lifecycle, &plan, view.revision_id, targets)
+            .unwrap();
+        assert_eq!(prepared.kind, "pytest_corpus_purge_review");
+        let manifest = build_manifest(&prepared, &lifecycle.snapshot().unwrap()).unwrap();
+        assert_eq!(manifest.adapter_schema_version, 1001);
+        assert_eq!(prepared.selected_logical_bytes, 42);
+        assert_eq!(prepared.targets[0].label, "pytest lastfailed corpus");
+        let mut tampered = prepared.clone();
+        tampered.kind = "disposable_fixture_purge_review".into();
+        assert!(matches!(
+            service.revalidate(&lifecycle, &plan, &tampered),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        assert!(matches!(
+            service.claim(&tampered, now),
+            Err(PurgeError::ChangedTarget)
+        ));
+        assert!(!service.has_uncertainty().unwrap());
+        let result = service
+            .claim_and_execute(&mut lifecycle, &plan, prepared.review_id, |shown| {
+                assert_eq!(*shown, prepared);
+                true
+            })
+            .unwrap();
+        assert_eq!(result.state, "finished");
+        assert_eq!(result.durably_unlinked_logical_bytes, 42);
+        let snapshot = lifecycle.snapshot().unwrap();
+        assert_eq!(snapshot.fixtures[0].status, FixtureStatus::Available);
+        assert_eq!(
+            snapshot.fixtures[1].status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        drop(service);
+        let reopened =
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now))
+                .unwrap();
+        assert!(!reopened.has_uncertainty().unwrap());
+        assert!(matches!(
+            reopened.read_stored_review(&prepared.review_id),
+            Err(PurgeError::ReviewReplayed)
+        ));
+    }
+
+    #[test]
+    fn empty_foreign_control_is_not_initialized_as_a_corpus_store() {
+        let (dir, _) = demo_root();
+        let db = Connection::open(dir.path().join(PYTEST_CONTROL_DB)).unwrap();
+        db.pragma_update(None, "application_id", CONTROL_APPLICATION_ID)
+            .unwrap();
+        drop(db);
+        assert!(matches!(
+            FixturePurgeService::open_pytest_corpus_with_clock(
+                dir.path(),
+                fixed_clock(1_700_000_000_000)
+            ),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let db = Connection::open(dir.path().join(PYTEST_CONTROL_DB)).unwrap();
+        let tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+        let app: i64 = db
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(app, CONTROL_APPLICATION_ID);
+    }
+
+    #[test]
+    fn pytest_purge_rejects_foreign_control_identity_without_reseed() {
+        let (dir, _) = demo_root();
+        let now = 1_700_000_000_000;
+        let service =
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now))
+                .unwrap();
+        service
+            .control
+            .pragma_update(None, "application_id", CONTROL_APPLICATION_ID)
+            .unwrap();
+        assert!(matches!(
+            service.has_uncertainty(),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        drop(service);
+        assert!(matches!(
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now)),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let db = Connection::open(dir.path().join(PYTEST_CONTROL_DB)).unwrap();
+        let id: i64 = db
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, CONTROL_APPLICATION_ID);
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM purge_reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
