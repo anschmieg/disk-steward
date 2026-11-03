@@ -393,3 +393,18 @@ already require a validated live latch, and the fallback does not reopen or retr
 a control path. Process termination or storage failure can still prevent durable
 recording; restart reconciliation and the other recorded platform gates remain
 necessary.
+
+Shutdown polling is also bounded independently of readiness capture. The parent
+attempts to stop its exact child, then uses a monotonic deadline and finite
+`try_wait` poll count to confirm a reaped exit. A natural exit racing a kill
+error is accepted only when the status query confirms exit. Reader completion
+is checked with its own finite deadline and poll cap; the parent joins only
+a reader already observed finished.
+
+An unconfirmed child exit or reader completion returns an incomplete error and
+withholds stop receipts. A reader that misses its completion bound may be
+detached when its handle is dropped; that is reported as uncertainty, not as a
+joined reader. These checks do not impose a hard deadline on noninterruptible
+OS calls, stop a descendant process tree, prove production isolation, release
+reservations, or authorize cleanup. Each shutdown stage has its own bound; the
+probe does not claim a single end-to-end hard deadline from these stage limits.
