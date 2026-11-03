@@ -30,12 +30,7 @@ pub(super) struct BudgetFileSink {
     registry: VerificationStoreRegistry,
     reservation_bytes: u64,
     signal: crate::CancellationHandle,
-    transport_binding: Option<TransportBinding>,
-}
-
-struct TransportBinding {
-    budget: crate::Budget,
-    context: crate::attempt_context::AttemptContext,
+    transport_binding: Option<crate::TransportIngressObserver>,
 }
 
 impl BudgetFileSink {
@@ -210,10 +205,7 @@ impl BudgetFileSink {
         logical_limit: u64,
     ) -> io::Result<Self> {
         let mut sink = Self::new_with_limit(root, transport.cancellation_handle(), logical_limit)?;
-        sink.transport_binding = Some(TransportBinding {
-            budget: transport.budget.clone(),
-            context: transport.context.clone(),
-        });
+        sink.transport_binding = Some(transport.ingress_observer());
         Ok(sink)
     }
 
@@ -238,7 +230,7 @@ impl BudgetFileSink {
         if self
             .transport_binding
             .as_ref()
-            .is_some_and(|binding| binding.context != *report.context())
+            .is_some_and(|binding| !binding.matches_transfer(report))
         {
             self.signal.cancel();
             return Err(safe_error(
@@ -253,16 +245,9 @@ impl BudgetFileSink {
         let Some(binding) = &self.transport_binding else {
             return Ok(());
         };
-        let total = match binding.budget.used.lock() {
-            Ok(used) => *used,
-            Err(_) => {
-                self.signal.cancel();
-                return Err(safe_error(
-                    io::ErrorKind::Other,
-                    "transport ingress observation unavailable",
-                ));
-            }
-        };
+        let total = binding
+            .observed_bytes()
+            .inspect_err(|_| self.signal.cancel())?;
         self.charge_ingress_total(total)
     }
 

@@ -1,0 +1,7 @@
+# M0 read-only transport ingress observer
+
+Add a backend-only cloneable TransportIngressObserver created by the validated transport. Private fields retain only Arc<Mutex<u64>> and original AttemptContext, not Budget/credentials/cancellation/transport internals. observed_bytes returns cumulative raw socket ingress or a sanitized poisoned-lock error; observations remain available after cancellation/consumption. matches_transfer checks historical exact attempt identity, not freshness, complete transfer, admission or approval.
+
+Migrate the closed BudgetFileSink write/completion accounting to this API, removing direct private Budget/context access. No generic callbacks, setters, renderer/IPC, filesystem, network execution, credential or cleanup access. Snapshot can wait on the read mutex under existing transport deadline/cancellation checks, with no nonblocking/OS-latency/process isolation claim.
+
+Tests exercise initial zero, completed count vs final report, consumption/cancellation/clone/thread persistence, same repository and same pack across distinct attempts, sanitized poison refusal, and existing native real-Git/budget/store refusal flow. R5.8/M0 integration seam only: production budget ownership/worker-store handoff/live per-read enforcement/persisted receipt/credentials/platform/human/milestone gates remain. Version0.0.17/no release; branch atop81 and main eventual integration baseline requiring current-head CI/no blocking findings.
