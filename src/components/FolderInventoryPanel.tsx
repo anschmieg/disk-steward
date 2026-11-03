@@ -32,10 +32,12 @@ export type FolderInventory = {
 
 export default function FolderInventoryPanel({
   native,
+  active = true,
   onBusyChange,
   onOpenPlan,
 }: {
   native: boolean;
+  active?: boolean;
   onOpenPlan?: () => void;
   onBusyChange: (busy: boolean) => void;
 }) {
@@ -45,6 +47,8 @@ export default function FolderInventoryPanel({
   const evidenceHeadingRef = useRef<HTMLHeadingElement>(null);
   const inspectorReturnRef = useRef<HTMLButtonElement | null>(null);
   const queryRef = useRef<HTMLInputElement>(null);
+  const chooseRef = useRef<HTMLButtonElement>(null);
+  const focusChooseAfterClear = useRef(false);
   const [snapshot, setSnapshot] = useState<FolderInventory | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -53,11 +57,15 @@ export default function FolderInventoryPanel({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [sort, setSort] = useState<"name" | "size" | "allocated">("size");
   useEffect(() => {
-    if (snapshot) headingRef.current?.focus();
-  }, [snapshot]);
+    if (active && snapshot) headingRef.current?.focus();
+    else if (active && focusChooseAfterClear.current) {
+      chooseRef.current?.focus();
+      focusChooseAfterClear.current = false;
+    }
+  }, [snapshot, active]);
   useEffect(() => {
-    if (selectedId !== null) evidenceHeadingRef.current?.focus();
-  }, [selectedId]);
+    if (active && selectedId !== null) evidenceHeadingRef.current?.focus();
+  }, [selectedId, active]);
   const inspect = async (entryId?: string | null, nextPage = false) => {
     if (activeRequest.current || !native) return;
     if ((nextPage || entryId !== undefined) && !snapshot) return;
@@ -140,6 +148,35 @@ export default function FolderInventoryPanel({
       onBusyChange(false);
     }
   };
+  const clearFolder = async () => {
+    if (!native || !snapshot || activeRequest.current) return;
+    activeRequest.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    setMessage("");
+    try {
+      await invoke<void>("clear_folder_inventory", {
+        request: { expectedObservationId: snapshot.observationId },
+      });
+      focusChooseAfterClear.current = true;
+      inspectorReturnRef.current = null;
+      setSnapshot(null);
+      setSelectedId(null);
+      setImported(false);
+      setQuery("");
+      setMessage(
+        "Folder scope cleared. Retained directory handles and enumeration state were released. Saved plan and review metadata remain.",
+      );
+    } catch {
+      setMessage(
+        "The folder scope could not be cleared. The historical view is retained; choose the folder again to refresh its state.",
+      );
+    } finally {
+      activeRequest.current = false;
+      setBusy(false);
+      onBusyChange(false);
+    }
+  };
   const selected = snapshot?.entries.find((entry) => entry.id === selectedId);
   const total = BigInt(snapshot?.regularFileLogicalBytes ?? "0");
   const entries = [...(snapshot?.entries ?? [])]
@@ -170,6 +207,7 @@ export default function FolderInventoryPanel({
       </p>
       <button
         className="button secondary"
+        ref={chooseRef}
         onClick={() => void inspect()}
         disabled={busy || !native}
       >
@@ -179,6 +217,18 @@ export default function FolderInventoryPanel({
       <p role="status">{message}</p>
       {snapshot && (
         <>
+          <button
+            className="button secondary"
+            disabled={busy || !native}
+            onClick={() => void clearFolder()}
+          >
+            Clear folder scope
+          </button>
+          <p>
+            Clearing releases this app’s retained directory handles and
+            in-memory observations. Previously saved plan and review metadata
+            remain.
+          </p>
           <nav aria-label="Folder location">
             <ol>
               {snapshot.breadcrumbs.map((label, index) => (

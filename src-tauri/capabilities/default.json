@@ -12,6 +12,7 @@
     "allow-inspect-selected-folder-entries",
     "allow-navigate-folder-inventory",
     "allow-continue-folder-inventory",
+    "allow-clear-folder-inventory",
     "allow-preview-native-review",
     "allow-get-example-plan",
     "allow-edit-example-plan",
