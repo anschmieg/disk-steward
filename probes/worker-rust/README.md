@@ -376,3 +376,20 @@ live check, including immediate reservation-growth and lifecycle retry refusal.
 Reopening must retain the same identity and reservation. A later observation
 failure cannot undo this latch; it does not establish completed reconciliation,
 cleanup eligibility or verified remote content.
+
+After coordinated admission, indexed-worker errors also pass through an explicit
+live-registry finalizer. While the original lease remains held, it reads and
+validates the exact admitted row and records `NeedsReconciliation` with its
+actual prior Registered, Active or Stopped state. An already latched row must
+retain a valid prior state, identity and reservation. Missing, mismatched or
+unexpected lifecycle rows refuse this fallback without being adopted or reset.
+The original operation error is retained; inability to validate or persist the
+latch is reported alongside it.
+
+This fallback does not infer child shutdown, reader join or observed allocation,
+and does not acknowledge a stopped budget job or confirm cleanup. Errors after
+the deliberate registry close keep their original error: both close points
+already require a validated live latch, and the fallback does not reopen or retry
+a control path. Process termination or storage failure can still prevent durable
+recording; restart reconciliation and the other recorded platform gates remain
+necessary.
