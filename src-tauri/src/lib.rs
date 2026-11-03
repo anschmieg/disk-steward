@@ -88,6 +88,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             foundation_status,
             check_selected_folder_access,
+            folder_inventory::pytest_records::inspect_pytest_cache_records,
+            folder_inventory::pytest_records::cancel_pytest_cache_inspection,
             folder_inventory::duplicate_compare::compare_observed_files,
             folder_inventory::duplicate_compare::cancel_duplicate_comparison,
             folder_inventory::inspect_selected_folder_entries,

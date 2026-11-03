@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-pytest-cache-records"
+description = "Enables the inspect_pytest_cache_records command without any pre-configured scope."
+commands.allow = ["inspect_pytest_cache_records"]
+
+[[permission]]
+identifier = "deny-inspect-pytest-cache-records"
+description = "Denies the inspect_pytest_cache_records command without any pre-configured scope."
+commands.deny = ["inspect_pytest_cache_records"]
