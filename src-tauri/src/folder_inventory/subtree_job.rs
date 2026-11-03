@@ -9,6 +9,7 @@ use disk_steward_core::{InventoryItemId, RevisionId};
 use rustix::fs::{fstat, openat, statat, AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 const MAX_DEPTH: usize = 16;
 const MAX_ENTRIES: u32 = 65_536;
 const MAX_BATCH_ENTRIES: u32 = 512;
+const MAX_REPLAY_BATCHES: u32 = 128;
 const MAX_JOB_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const SYSTEM_BOUNDARY_NAMES: [&[u8]; 8] = [
     b"Library", b"System", b"Volumes", b"Network", b"dev", b"private", b"proc", b"sys",
@@ -86,6 +88,9 @@ pub(super) struct SubtreeJob {
     root_fd: OwnedFd,
     root_device: u64,
     root_label: String,
+    root_stamp: super::checkpoint_store::RootStamp,
+    transcript: Sha256,
+    completed_batches: u32,
     frames: Vec<Frame>,
     entries_observed: u32,
     files_observed: u32,
@@ -111,8 +116,24 @@ impl SubtreeJob {
         policy: SummaryExclusionPolicy,
         revision: RevisionId,
     ) -> Result<Self, &'static str> {
-        let started = Instant::now();
-        super::validate_session_bindings(session, started, Duration::from_secs(2))?;
+        Self::start_with_deadline(
+            session,
+            policy,
+            revision,
+            Instant::now(),
+            Duration::from_secs(2),
+        )
+    }
+
+    pub(super) fn start_with_deadline(
+        session: &Session,
+        policy: SummaryExclusionPolicy,
+        revision: RevisionId,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Self, &'static str> {
+        let duration = duration.min(Duration::from_secs(2));
+        super::validate_session_bindings(session, started, duration)?;
         if session.observation_id != session.snapshot.observation_id {
             return Err("The folder observation is stale. Inspect the current folder again.");
         }
@@ -136,24 +157,32 @@ impl SubtreeJob {
         {
             return Err("The selected folder changed. Inspect it again.");
         }
-        policy.ensure_ancestor_scope_allowed(&root_fd, Instant::now(), Duration::from_secs(2))?;
+        let root_stamp = super::checkpoint_replay::stamp(&baseline)?;
+        let mut transcript = Sha256::new();
+        transcript.update(b"disk-steward-subtree-transcript-v1\0");
+        policy.ensure_ancestor_scope_allowed(&root_fd, started, duration)?;
         let dir = Dir::read_from(&root_fd)
             .map_err(|_| "The selected folder could not be read safely.")?;
-        super::validate_session_bindings(session, started, Duration::from_secs(2))?;
+        super::validate_session_bindings(session, started, duration)?;
+        let persistent_root_fd = openat(
+            &root_fd,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "The selected folder could not be opened safely.")?;
+        super::validate_session_bindings(session, started, duration)?;
         Ok(Self {
             scan_id: InventoryItemId::new(),
             observation_id: session.observation_id,
             revision,
             policy,
-            root_fd: openat(
-                &root_fd,
-                ".",
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|_| "The selected folder could not be opened safely.")?,
+            root_fd: persistent_root_fd,
             root_device: session.root_device,
             root_label: source.label.clone(),
+            root_stamp,
+            transcript,
+            completed_batches: 0,
             frames: vec![Frame {
                 fd: root_fd,
                 dir,
@@ -190,6 +219,89 @@ impl SubtreeJob {
     }
     pub(super) fn policy(&self) -> &SummaryExclusionPolicy {
         &self.policy
+    }
+
+    pub(super) fn root_stamp(&self) -> &super::checkpoint_store::RootStamp {
+        &self.root_stamp
+    }
+    pub(super) fn root_label(&self) -> &str {
+        &self.root_label
+    }
+    pub(super) fn completed_batches(&self) -> u32 {
+        self.completed_batches
+    }
+    pub(super) fn entries_observed(&self) -> u32 {
+        self.entries_observed
+    }
+    pub(super) fn transcript_digest(&self) -> [u8; 32] {
+        let digest = self.transcript.clone().finalize();
+        let mut output = [0; 32];
+        output.copy_from_slice(&digest);
+        output
+    }
+
+    pub(super) fn capture_replay(
+        &self,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<super::subtree_replay::ReplayPayload, &'static str> {
+        let duration = duration.min(Duration::from_secs(2));
+        let guard = || -> Result<(), &'static str> {
+            if started.elapsed() >= duration || self.created_at.elapsed() >= MAX_JOB_LIFETIME {
+                Err("Recursive scan checkpoint exceeded its cooperative time limit.")
+            } else {
+                Ok(())
+            }
+        };
+        guard()?;
+        if self.finished
+            || self.resource_halted
+            || self.completed_batches == 0
+            || self.completed_batches > MAX_REPLAY_BATCHES
+            || self.entries_observed == 0
+            || self.entries_observed > MAX_ENTRIES
+            || self.entries_observed > self.completed_batches.saturating_mul(MAX_BATCH_ENTRIES)
+        {
+            return Err("This recursive scan has no bounded resumable replay state.");
+        }
+        self.validate_stack(&guard)?;
+        self.policy
+            .ensure_ancestor_scope_allowed(&self.root_fd, started, duration)?;
+        let before =
+            fstat(&self.root_fd).map_err(|_| "Selected folder changed. Inspect it again.")?;
+        guard()?;
+        let root_frame = self
+            .frames
+            .first()
+            .ok_or("Recursive scan has no resumable root frame.")?;
+        if !root_metadata_matches(&root_frame.baseline, &before)
+            || is_dataless(&before)
+            || super::checkpoint_replay::stamp(&before)? != self.root_stamp
+        {
+            return Err("Selected folder changed. Inspect it again.");
+        }
+        let payload = super::subtree_replay::ReplayPayload {
+            version: 1,
+            checkpoint_id: InventoryItemId::new(),
+            root_label: self.root_label.clone(),
+            root_stamp: self.root_stamp.clone(),
+            exclusion_revision: self.revision,
+            batches: self.completed_batches,
+            entries_observed: self.entries_observed,
+            transcript: self.transcript_digest(),
+        };
+        super::subtree_replay::validate_payload(&payload)?;
+        self.validate_stack(&guard)?;
+        let after =
+            fstat(&self.root_fd).map_err(|_| "Selected folder changed. Inspect it again.")?;
+        guard()?;
+        if !root_metadata_matches(&before, &after)
+            || is_dataless(&after)
+            || super::checkpoint_replay::stamp(&after)? != self.root_stamp
+        {
+            return Err("Selected folder changed. Inspect it again.");
+        }
+        Ok(payload)
     }
 
     pub(super) fn advance(
@@ -265,6 +377,7 @@ impl SubtreeJob {
             let metadata = match metadata {
                 Ok(stat) => stat,
                 Err(_) => {
+                    self.record_transcript_entry(raw, top + 1, None, b"metadata_unavailable")?;
                     self.unreadable_entries = self.unreadable_entries.saturating_add(1);
                     self.coverage_complete = false;
                     self.stop_reason.get_or_insert("entry_metadata_unavailable");
@@ -273,36 +386,44 @@ impl SubtreeJob {
             };
             let kind = FileType::from_raw_mode(metadata.st_mode);
             if kind == FileType::Directory && self.policy.excludes(&metadata) {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"excluded_directory")?;
                 self.mark_skipped();
                 self.excluded_directories = self.excluded_directories.saturating_add(1);
                 continue;
             }
             // One deterministic primary reason is recorded for each skipped entry.
             if raw.first() == Some(&b'.') {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"hidden")?;
                 self.skip(|coverage| coverage.hidden_entries += 1);
                 continue;
             }
             if is_dataless(&metadata) {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"dataless")?;
                 self.skip(|coverage| coverage.dataless_entries += 1);
                 continue;
             }
             if kind == FileType::Symlink {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"symbolic_link")?;
                 self.skip(|coverage| coverage.symbolic_links += 1);
                 continue;
             }
             if metadata.st_dev as u64 != self.root_device {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"cross_volume")?;
                 self.skip(|coverage| coverage.cross_volume_entries += 1);
                 continue;
             }
             if kind == FileType::RegularFile {
                 self.observe_file(&metadata)?;
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"regular_file")?;
                 continue;
             }
             if kind != FileType::Directory {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"nonregular")?;
                 self.skip(|coverage| coverage.nonregular_entries += 1);
                 continue;
             }
             if is_managed_boundary(raw) {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"managed_boundary")?;
                 self.skip(|coverage| coverage.managed_boundaries += 1);
                 continue;
             }
@@ -310,10 +431,12 @@ impl SubtreeJob {
                 .iter()
                 .any(|boundary| raw.eq_ignore_ascii_case(boundary))
             {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"system_boundary")?;
                 self.skip(|coverage| coverage.system_boundaries += 1);
                 continue;
             }
             if self.frames.len() >= MAX_DEPTH {
+                self.record_transcript_entry(raw, top + 1, Some(&metadata), b"depth_limited")?;
                 self.skip(|coverage| coverage.depth_limited_directories += 1);
                 self.stop_reason.get_or_insert("depth_limit");
                 continue;
@@ -358,6 +481,12 @@ impl SubtreeJob {
                     }
                     self.validate_stack(&guard)?;
                     guard()?;
+                    self.record_transcript_entry(
+                        raw,
+                        top + 1,
+                        Some(&named_after),
+                        b"inaccessible",
+                    )?;
                     self.skip(|coverage| coverage.inaccessible_directories += 1);
                     self.stop_reason.get_or_insert("directory_access_denied");
                     continue;
@@ -377,6 +506,7 @@ impl SubtreeJob {
             let child_dir =
                 Dir::read_from(&child_fd).map_err(|_| "A folder could not be read safely.")?;
             guard()?;
+            self.record_transcript_entry(raw, top + 1, Some(&child_stat), b"descend")?;
             self.directories_visited = self.directories_visited.saturating_add(1);
             self.frames.push(Frame {
                 fd: child_fd,
@@ -389,6 +519,10 @@ impl SubtreeJob {
         self.validate_stack(&guard)?;
         self.policy
             .ensure_ancestor_scope_allowed(&self.root_fd, started, duration)?;
+        self.completed_batches = self
+            .completed_batches
+            .checked_add(1)
+            .ok_or("Recursive scan exceeded the supported batch count.")?;
         Ok(self.progress(processed))
     }
 
@@ -428,6 +562,41 @@ impl SubtreeJob {
     fn mark_skipped(&mut self) {
         self.skipped_entries = self.skipped_entries.saturating_add(1);
         self.coverage_complete = false;
+    }
+
+    fn record_transcript_entry(
+        &mut self,
+        raw_name: &[u8],
+        depth: usize,
+        metadata: Option<&Stat>,
+        decision: &[u8],
+    ) -> Result<(), &'static str> {
+        let depth = u32::try_from(depth).map_err(|_| "Subtree depth is unavailable.")?;
+        let name_len = u32::try_from(raw_name.len()).map_err(|_| "Folder name is too long.")?;
+        let decision_len =
+            u32::try_from(decision.len()).map_err(|_| "Subtree decision is unavailable.")?;
+        self.transcript.update(b"\0entry-v1\0");
+        self.transcript.update(depth.to_be_bytes());
+        self.transcript.update(name_len.to_be_bytes());
+        self.transcript.update(raw_name);
+        match metadata {
+            Some(stat) => {
+                self.transcript.update([1]);
+                let stamp = super::checkpoint_replay::stamp(stat)?;
+                let encoded = serde_json::to_vec(&stamp)
+                    .map_err(|_| "Subtree metadata could not be fingerprinted.")?;
+                let encoded_len = u32::try_from(encoded.len())
+                    .map_err(|_| "Subtree metadata could not be fingerprinted.")?;
+                self.transcript.update(encoded_len.to_be_bytes());
+                self.transcript.update(encoded);
+            }
+            None => {
+                self.transcript.update([0]);
+            }
+        }
+        self.transcript.update(decision_len.to_be_bytes());
+        self.transcript.update(decision);
+        Ok(())
     }
 
     fn skip(&mut self, count_reason: impl FnOnce(&mut CoverageBreakdown)) {

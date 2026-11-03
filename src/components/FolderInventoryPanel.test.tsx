@@ -1258,3 +1258,125 @@ test("page observation timing stays historical on failed refresh and flags devic
   await screen.findByText(/could not be refreshed reliably/);
   expect(timing.textContent).toBe(before);
 });
+
+test("recursive checkpoint save uses the exact paused scan and inspected CAS reference", async () => {
+  const info = {
+    checkpointId: "tree-cp-2",
+    rootLabel: "Chosen folder",
+    entriesObserved: 512,
+    batches: 1,
+  };
+  let finishBatch: (value: typeof chunkProgress) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishBatch = resolve;
+        }),
+    )
+    .mockResolvedValueOnce({ ...info, checkpointId: "tree-cp-1" })
+    .mockResolvedValueOnce(info);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Pause subtree scan" }));
+  finishBatch(chunkProgress);
+  await screen.findByText(/paused at a batch boundary/);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Save paused recursive scan" }),
+  );
+  await screen.findByText(/checkpoint saved/);
+  expect(invoke).toHaveBeenNthCalledWith(3, "get_subtree_checkpoint");
+  expect(invoke).toHaveBeenNthCalledWith(4, "save_subtree_checkpoint", {
+    request: {
+      expectedObservationId: sample.observationId,
+      scanId: "scan-1",
+      expectedCheckpointId: "tree-cp-1",
+    },
+  });
+});
+
+test("recursive resume is explicit and installs validated progress without auto-scanning", async () => {
+  const info = {
+    checkpointId: "tree-cp-7",
+    rootLabel: "Saved tree",
+    entriesObserved: 512,
+    batches: 1,
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(info)
+    .mockResolvedValueOnce({ snapshot: sample, progress: chunkProgress });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Resume saved recursive scan" }),
+  );
+  await screen.findByRole("region", { name: "Subtree metadata summary" });
+  expect(invoke).toHaveBeenNthCalledWith(2, "resume_subtree_checkpoint", {
+    request: { expectedCheckpointId: info.checkpointId },
+  });
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(screen.getByText("Paused; more metadata remains.")).toBeVisible();
+});
+
+test("recursive resume cancellation preserves the current observation", async () => {
+  const info = {
+    checkpointId: "tree-cp-cancel",
+    rootLabel: "Saved tree",
+    entriesObserved: 8,
+    batches: 1,
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce(info)
+    .mockResolvedValueOnce(null);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Resume saved recursive scan" }),
+  );
+  await screen.findByText(/resume selection canceled/i);
+  expect(screen.getByRole("heading", { name: "Chosen folder" })).toBeVisible();
+  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(invoke).toHaveBeenCalledTimes(3);
+});
+
+test("recursive checkpoint failure preserves the prior folder and forgetting uses its known ID", async () => {
+  const info = {
+    checkpointId: "tree-cp-9",
+    rootLabel: "Chosen folder",
+    entriesObserved: 4,
+    batches: 1,
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce(info)
+    .mockResolvedValueOnce(undefined)
+    .mockResolvedValueOnce(info)
+    .mockRejectedValueOnce(new Error("private path"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Inspect saved recursive checkpoint" }),
+  );
+  await screen.findByText(/Saved recursive checkpoint: Chosen folder/);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Forget saved recursive checkpoint" }),
+  );
+  await screen.findByText(/checkpoint forgotten/);
+  expect(invoke).toHaveBeenNthCalledWith(3, "clear_subtree_checkpoint", {
+    request: { expectedCheckpointId: info.checkpointId },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Resume saved recursive scan" }),
+  );
+  await screen.findByText(/operation could not be verified/);
+  expect(screen.getByRole("heading", { name: "Chosen folder" })).toBeVisible();
+  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(screen.queryByText(/private path/)).not.toBeInTheDocument();
+});

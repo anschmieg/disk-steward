@@ -28,7 +28,7 @@ impl FolderCheckpointState {
     }
 }
 #[cfg(unix)]
-fn private_directory(base: &Path) -> Result<PathBuf, String> {
+pub(super) fn private_directory(base: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let fail = || "Private checkpoint storage is unavailable.".to_owned();
     std::fs::create_dir_all(base).map_err(|_| fail())?;

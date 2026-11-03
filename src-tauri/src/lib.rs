@@ -76,6 +76,12 @@ pub fn run() {
             app.manage(
                 folder_inventory::checkpoint_commands::FolderCheckpointState::open(app.handle()),
             );
+            #[cfg(unix)]
+            app.manage(
+                folder_inventory::subtree_checkpoint_commands::SubtreeCheckpointState::open(
+                    app.handle(),
+                ),
+            );
             app.manage(summary_control::SummaryControlState::default());
             Ok(())
         })
@@ -90,6 +96,10 @@ pub fn run() {
             folder_inventory::checkpoint_commands::save_folder_checkpoint,
             folder_inventory::checkpoint_commands::resume_folder_checkpoint,
             folder_inventory::checkpoint_commands::clear_folder_checkpoint,
+            folder_inventory::subtree_checkpoint_commands::get_subtree_checkpoint,
+            folder_inventory::subtree_checkpoint_commands::save_subtree_checkpoint,
+            folder_inventory::subtree_checkpoint_commands::resume_subtree_checkpoint,
+            folder_inventory::subtree_checkpoint_commands::clear_subtree_checkpoint,
             folder_inventory::clear_folder_inventory,
             folder_inventory::inspect_folder_tree_summary,
             folder_inventory::subtree_commands::start_subtree_scan,

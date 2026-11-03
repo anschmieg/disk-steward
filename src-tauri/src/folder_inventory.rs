@@ -53,9 +53,34 @@ mod checkpoint_replay;
 #[cfg(unix)]
 pub(crate) mod checkpoint_store;
 #[cfg(unix)]
+pub(crate) mod subtree_checkpoint_commands;
+#[cfg(unix)]
+mod subtree_checkpoint_store;
+#[cfg(unix)]
 pub(crate) mod subtree_commands;
 #[cfg(unix)]
 pub(crate) mod subtree_job;
+#[cfg(unix)]
+mod subtree_replay;
+#[cfg(not(unix))]
+pub(crate) mod subtree_checkpoint_commands {
+    #[tauri::command]
+    pub(crate) async fn get_subtree_checkpoint() -> Result<(), String> {
+        Err("Recursive checkpoints are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn save_subtree_checkpoint() -> Result<(), String> {
+        Err("Recursive checkpoints are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn resume_subtree_checkpoint() -> Result<(), String> {
+        Err("Recursive checkpoints are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn clear_subtree_checkpoint() -> Result<(), String> {
+        Err("Recursive checkpoints are unsupported on this platform.".into())
+    }
+}
 #[cfg(unix)]
 mod tree_summary;
 #[cfg(not(unix))]
