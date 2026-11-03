@@ -325,6 +325,43 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         {
             return Err("partial payload observation or complete-payload refusal mismatch".into());
         }
+        let latched = registry
+            .require_reconciliation(FIXTURE_ID, RState::Registered)
+            .map_err(|error| format!("latch interrupted registry attempt: {error}"))?;
+        if latched.state != RState::NeedsReconciliation
+            || latched.prior_state != Some(RState::Registered)
+            || latched.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+            || (
+                latched.parent_dev,
+                latched.parent_ino,
+                latched.root_dev,
+                latched.root_ino,
+            ) != (parent.0, parent.1, root.0, root.1)
+        {
+            return Err("live reconciliation latch changed store identity or reservation".into());
+        }
+        match registry.reserve(
+            FIXTURE_ID,
+            store::WORKER_PAYLOAD_RESERVATION,
+            store::WORKER_PAYLOAD_RESERVATION * 2,
+        ) {
+            Err(RegistryError::ReconciliationRequired) => {}
+            Err(other) => {
+                return Err(format!(
+                    "partial retry refused for unexpected reason: {other}"
+                ))
+            }
+            Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
+        }
+        match registry.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
+            Err(RegistryError::InvalidTransition) => {}
+            Err(other) => {
+                return Err(format!(
+                    "latched attempt transition refused unexpectedly: {other}"
+                ))
+            }
+            Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+        }
         let live_state = store
             .inspect_state()
             .map_err(|error| format!("inspect interrupted store: {error}"))?;
@@ -370,7 +407,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             }
             Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
         }
-        println!("worker_joined=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
         return Ok(());
     }
     if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {

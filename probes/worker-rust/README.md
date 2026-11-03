@@ -291,3 +291,10 @@ The child validates a journal claim from the trusted supervisor, not the SQLite
 row itself. The closed supervisor is responsible for ordering and checking the
 registry admission before journal binding. Same-user mutation races and dynamic
 reservation revocation are not established by this immutable fixture.
+
+The partial-payload fixture also persists `NeedsReconciliation` through the
+live registry before reopening it, after confirmed child shutdown and retained
+prefix inspection. It checks immediate reservation-growth and lifecycle retry
+refusal, then requires reopening to preserve the same identity, prior Registered
+state and 128 KiB reservation. `reconciliation_latched=true` reports this
+bookkeeping check; it is not a completed reconciliation or cleanup receipt.

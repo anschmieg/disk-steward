@@ -405,6 +405,7 @@ fn indexed_partial_payload_fails_before_readiness_and_retains_reservation() {
         "partial_payload_validated=true",
         "partial_payload_written=2048",
         "complete_payload_refused=true",
+        "reconciliation_latched=true",
         "reopened_reconciliation=true",
         "prior_registered=true",
         "reserved_bytes=131072",
