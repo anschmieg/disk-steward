@@ -461,29 +461,54 @@ fn capture_fixture_ref_manifest(root: &PrivateRoot, source_repo: &str) -> Requir
             "-C",
             source_repo,
             "for-each-ref",
-            "--format=%(refname) %(objectname) %(objecttype)",
+            "--format=%(refname) %(objectname) %(objecttype) %(symref)",
         ],
         b"",
     )
     .unwrap();
-    let inputs = current_refs
+    let mut inputs = current_refs
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
         .map(|line| {
             let parts: Vec<_> = line.split(|b| *b == b' ').collect();
-            assert_eq!(parts.len(), 3);
+            assert_eq!(parts.len(), 4);
             let kind = match parts[2] {
                 b"commit" => GitObjectKind::Commit,
                 b"tag" => GitObjectKind::Tag,
                 _ => panic!("unexpected fixture ref kind"),
             };
             RequiredRefInput {
+                symref_target: (!parts[3].is_empty()).then_some(parts[3]),
                 name: parts[0],
                 oid: hex_oid(std::str::from_utf8(parts[1]).unwrap()),
                 kind,
             }
         })
         .collect::<Vec<_>>();
+    let head = checked_git(
+        root,
+        &["-C", source_repo, "rev-parse", "--verify", "HEAD"],
+        b"",
+    )
+    .unwrap();
+    let symbolic = run_git(
+        root,
+        &["-C", source_repo, "symbolic-ref", "-q", "HEAD"],
+        b"",
+        None,
+    )
+    .unwrap();
+    let target = match symbolic.status.code() {
+        Some(0) => Some(symbolic.stdout.strip_suffix(b"\n").unwrap()),
+        Some(1) => None,
+        _ => panic!("unexpected fixture symbolic HEAD failure"),
+    };
+    inputs.push(RequiredRefInput {
+        name: b"HEAD",
+        oid: hex_oid(&object_id(&head).unwrap()),
+        kind: GitObjectKind::Commit,
+        symref_target: target,
+    });
     RequiredRefManifest::capture(
         &inputs,
         &CancellationHandle::new(),
@@ -654,7 +679,7 @@ fn run_real_git_verification() {
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
-    assert_eq!(named.coverage().required_object_count(), 3);
+    assert_eq!(named.coverage().required_object_count(), 4);
     assert_eq!(
         named
             .unmatched_remote_refs()
@@ -739,6 +764,80 @@ fn run_real_git_verification() {
             .kind(),
         io::ErrorKind::InvalidData
     );
+
+    let before_head_change = advertised_closure
+        .check_required_refs(
+            &expected_repository,
+            &fetch_report,
+            &renamed,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/renamed",
+        ],
+        b"",
+    )
+    .unwrap();
+    let switched = capture_fixture_ref_manifest(&root, &source_repo);
+    assert_eq!(renamed.entries()[0].oid(), switched.entries()[0].oid());
+    assert_eq!(switched.entries()[0].name(), b"HEAD");
+    assert_eq!(
+        switched.entries()[0].symref_target(),
+        Some(b"refs/heads/renamed".as_slice())
+    );
+    assert!(before_head_change
+        .recheck_manifest(
+            &expected_repository,
+            &switched,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .is_err());
+    let symbolic_coverage = advertised_closure
+        .check_required_refs(
+            &expected_repository,
+            &fetch_report,
+            &switched,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(symbolic_coverage
+        .unmatched_remote_refs()
+        .any(|(entry, reason)| entry.name() == b"HEAD"
+            && reason == RemoteRefMismatch::DifferentSymrefTarget));
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "--no-deref",
+            "HEAD",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    let detached = capture_fixture_ref_manifest(&root, &source_repo);
+    assert_eq!(switched.entries()[0].oid(), detached.entries()[0].oid());
+    assert_eq!(detached.entries()[0].symref_target(), None);
+    assert!(symbolic_coverage
+        .recheck_manifest(
+            &expected_repository,
+            &detached,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .is_err());
 
     let closure = check_pack_graph_closure(
         &decoded_pack,
