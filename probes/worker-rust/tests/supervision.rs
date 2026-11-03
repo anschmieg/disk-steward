@@ -361,3 +361,67 @@ fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() 
     assert!(!report.contains("synthetic-payload-parent-only"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-payload-parent-only"));
 }
+
+#[test]
+fn indexed_partial_payload_fails_before_readiness_and_retains_reservation() {
+    for args in [
+        vec!["--run-indexed-store-payload-partial", "/tmp/caller-path"],
+        vec![
+            "--run-indexed-store-payload-partial",
+            "--confirm-own-store-cleanup",
+        ],
+        vec!["--child", "store-payload-partial", "extra"],
+    ] {
+        let output = probe().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    let missing = probe()
+        .args(["--child", "store-payload-partial"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+
+    let output = probe()
+        .arg("--run-indexed-store-payload-partial")
+        .env(
+            "DISK_STEWARD_WORKER_ENV_SENTINEL",
+            "synthetic-partial-payload-parent-only",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(report.lines().count(), 1);
+    for evidence in [
+        "worker_joined=true",
+        "store_stopped=true",
+        "partial_payload_validated=true",
+        "partial_payload_written=2048",
+        "complete_payload_refused=true",
+        "reopened_reconciliation=true",
+        "prior_registered=true",
+        "reserved_bytes=131072",
+        "reservation_retry_refused=true",
+        "cleanup=not_authorized",
+    ] {
+        assert!(report.contains(evidence), "{report}");
+    }
+    let high_water = report
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("partial_payload_high_water_bytes="))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((2048..=131072).contains(&high_water));
+    assert!(!report.contains("synthetic-partial-payload-parent-only"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("synthetic-partial-payload-parent-only")
+    );
+}

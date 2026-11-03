@@ -130,6 +130,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
         [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(IndexedWorkerMode::Stall),
         [flag] if flag == "--run-indexed-store-handoff" => run_indexed_store_worker(IndexedWorkerMode::DescriptorOnly),
         [flag] if flag == "--run-indexed-store-payload" => run_indexed_store_worker(IndexedWorkerMode::Payload),
+        [flag] if flag == "--run-indexed-store-payload-partial" => run_indexed_store_worker(IndexedWorkerMode::PartialPayload),
         [flag, confirm] if flag == "--run-store-cleanup" && confirm == "--confirm-own-store-cleanup" => run_store_worker_with_cleanup(true),
         [flag] if flag == "--run-store-cleanup" => Err("refusing store cleanup without --confirm-own-store-cleanup".into()),
         [flag] if flag == "--run" => {
@@ -162,7 +163,7 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, --run-indexed-store-handoff, --run-indexed-store-payload, or --run-store-cleanup --confirm-own-store-cleanup".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, --run-indexed-store-handoff, --run-indexed-store-payload, --run-indexed-store-payload-partial, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
 }
 
@@ -171,6 +172,7 @@ enum IndexedWorkerMode {
     Stall,
     DescriptorOnly,
     Payload,
+    PartialPayload,
 }
 
 fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
@@ -212,6 +214,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         IndexedWorkerMode::Stall => "stall",
         IndexedWorkerMode::DescriptorOnly => "store-handoff",
         IndexedWorkerMode::Payload => "store-payload",
+        IndexedWorkerMode::PartialPayload => "store-payload-partial",
     };
     let mut child = Command::new(exe)
         .env_clear()
@@ -251,6 +254,114 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             }
         }
     };
+    if mode == IndexedWorkerMode::PartialPayload {
+        let failure_deadline = Instant::now() + OUTER_DEADLINE;
+        let receive_time = failure_deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(receive_time) {
+            Ok(ReaderEvent::Finished {
+                bytes: 0,
+                failed: false,
+            }) => {}
+            Ok(event) => {
+                return finish_after_error(
+                    child,
+                    reader,
+                    rx,
+                    format!("partial payload child emitted unexpected stdout event: {event:?}"),
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return finish_after_error(
+                    child,
+                    reader,
+                    rx,
+                    "partial payload child did not finish before deadline".into(),
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return finish_after_error(
+                    child,
+                    reader,
+                    rx,
+                    "partial payload reader stopped without a result".into(),
+                )
+            }
+        }
+        let status = match wait_for_child_exit(&mut child, failure_deadline) {
+            Ok(status) => status,
+            Err(error) => return finish_after_error(child, reader, rx, error),
+        };
+        if let Err(error) = stop_and_reap(&mut child) {
+            let _ = reader.join();
+            return Err(format!(
+                "partial payload child shutdown unconfirmed: {error}"
+            ));
+        }
+        if reader.join().is_err() {
+            return Err("partial payload reader join failed; stop receipt withheld".into());
+        }
+        if status.code() != Some(86) {
+            return Err(
+                "partial payload child did not report the fixed injected write failure".into(),
+            );
+        }
+        let receipt = StopReceipt::confirmed(store.token(), pid);
+        store
+            .record_stopped(&receipt)
+            .map_err(|error| format!("record interrupted worker stop: {error}"))?;
+        let partial = store
+            .inspect_stopped_worker_partial_payload(&receipt)
+            .map_err(|_| "retained partial payload validation refused".to_owned())?;
+        if partial.written_bytes != store::PARTIAL_PAYLOAD_FIXTURE_BYTES
+            || partial.high_water_bytes > RESERVATION
+            || store.inspect_stopped_worker_payload(&receipt).is_ok()
+        {
+            return Err("partial payload observation or complete-payload refusal mismatch".into());
+        }
+        let live_state = store
+            .inspect_state()
+            .map_err(|error| format!("inspect interrupted store: {error}"))?;
+        drop(registry);
+        drop(store);
+        let mut reopened = VerificationStoreRegistry::open(&registry_path)
+            .map_err(|error| format!("reopen interrupted registry: {error}"))?;
+        let record = reopened
+            .get(FIXTURE_ID)
+            .map_err(|error| format!("read interrupted registry: {error}"))?
+            .ok_or("interrupted registry row disappeared")?;
+        if record.reserved_bytes != RESERVATION
+            || record.state != RState::NeedsReconciliation
+            || record.prior_state != Some(RState::Registered)
+            || (
+                record.parent_dev,
+                record.parent_ino,
+                record.root_dev,
+                record.root_ino,
+            ) != (parent.0, parent.1, root.0, root.1)
+        {
+            return Err("interrupted registry identity/state mismatch".into());
+        }
+        match reopened.reserve(FIXTURE_ID, RESERVATION, RESERVATION * 2) {
+            Err(RegistryError::ReconciliationRequired) => {}
+            Err(other) => {
+                return Err(format!(
+                    "partial retry refused for unexpected reason: {other}"
+                ))
+            }
+            Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
+        }
+        match reopened.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
+            Err(RegistryError::InvalidTransition) => {}
+            Err(other) => {
+                return Err(format!(
+                    "partial retry lifecycle refused unexpectedly: {other}"
+                ))
+            }
+            Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+        }
+        println!("worker_joined=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reopened_reconciliation=true prior_registered=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes);
+        return Ok(());
+    }
     if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
         return finish_after_error(child, reader, rx, e);
     }
@@ -492,6 +603,14 @@ fn run_child(args: &[String]) -> Result<(), String> {
             stdout.flush().map_err(|_| "child readiness flush failed")?;
             thread::sleep(CHILD_HOLD);
             Ok(())
+        }
+        [mode] if mode == "store-payload-partial" => {
+            if store::write_worker_stdin_partial_payload().is_err() {
+                // Fixed synthetic failure exit after the shared writer charged
+                // the observed partial allocation. Never signal readiness.
+                std::process::exit(86);
+            }
+            Err("fixed partial payload probe unexpectedly completed".into())
         }
         [mode] if mode == "store-abandon" => run_store_abandon_child(),
         _ => Err("invalid private child mode".into()),
@@ -842,6 +961,31 @@ fn stop_and_reap(child: &mut Child) -> Result<(), String> {
             }
             None => format!("wait for fixed child: {wait_error}"),
         })
+}
+
+fn wait_for_child_exit(child: &mut Child, deadline: Instant) -> Result<ExitStatus, String> {
+    const MAX_POLLS: usize = 512;
+    const POLL_INTERVAL: Duration = Duration::from_millis(2);
+    for _ in 0..MAX_POLLS {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll fixed child exit: {error}"))?
+        {
+            if Instant::now() >= deadline {
+                break;
+            }
+            return Ok(status);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(POLL_INTERVAL));
+    }
+    Err("fixed child exit was not observed before deadline".into())
 }
 
 fn finish_after_error<T>(

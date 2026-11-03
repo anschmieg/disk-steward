@@ -233,3 +233,27 @@ composition only: no Git transfer, durable byte receipt, directory/index
 footprint accounting, OS hard latency/process-tree/RSS guarantee, private
 authentication, atomicity against same-user interference or milestone completion
 is established. Current-head platform CI remains required.
+
+## Partial payload failure before readiness
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-payload-partial`
+checks a separate fixed failure path. The environment-cleared child receives
+only the identity-bound store directory, writes a deterministic 2 KiB prefix
+through the shared payload accounting core, then injects a write error. It exits
+with a fixed failure status and emits no readiness bytes. This does not simulate
+a real disk-full error or arbitrary kill timing.
+
+The parent requires bounded empty stdout completion, exact child shutdown and
+reader join, and the expected exit status before inspecting the partial file.
+The complete-payload inspector must reject it. A separate fixed partial
+observation checks the prefix, EOF, private metadata, held and named identity,
+and unchanged metadata under the same cooperative readback deadline. The
+observation is evidence of an incomplete attempt, never successful verification.
+
+The 128 KiB reservation remains retained. Because readiness never succeeded,
+the registry never becomes Active; reopening requires reconciliation with prior
+Registered state and refuses retry and reservation growth. The file remains in
+the task-owned fixture. No cleanup authority or source-repository access is
+added. This is process-exit evidence, not synchronized power-loss durability,
+production worker isolation, global store accounting, credential validation or
+milestone acceptance.

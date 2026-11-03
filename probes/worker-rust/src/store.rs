@@ -101,10 +101,16 @@ pub(crate) struct WorkerPayloadObservation {
     pub(crate) high_water_bytes: u64,
 }
 
+pub(crate) const PARTIAL_PAYLOAD_FIXTURE_BYTES: u64 = payload::PARTIAL_FIXTURE_BYTES;
+
 /// Run the fixed synthetic payload writer against the validated worker stdin
 /// directory capability. No paths or payload parameters are accepted.
 pub(crate) fn write_worker_stdin_payload() -> Result<payload::PayloadReport, StoreError> {
     handoff::write_stdin_payload()
+}
+
+pub(crate) fn write_worker_stdin_partial_payload() -> Result<payload::PayloadReport, StoreError> {
+    handoff::write_stdin_payload_partial()
 }
 
 impl OwnedStore {
@@ -123,6 +129,13 @@ impl OwnedStore {
         receipt: &crate::StopReceipt,
     ) -> Result<WorkerPayloadObservation, StoreError> {
         handoff::inspect_stopped_worker_payload(self, receipt)
+    }
+
+    pub(crate) fn inspect_stopped_worker_partial_payload(
+        &self,
+        receipt: &crate::StopReceipt,
+    ) -> Result<WorkerPayloadObservation, StoreError> {
+        handoff::inspect_stopped_worker_partial_payload(self, receipt)
     }
 
     pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {
