@@ -395,3 +395,22 @@ bind the body to its tree type and object ID, verify referenced object types and
 presence, and validate relevant graphs before making any product decision.
 Tests cover raw non-UTF-8 names, every canonical mode, malformed/truncated entries,
 ordering/duplicate traps, limits, and Git-generated tree correspondence.
+
+### Structural commit links
+
+`parse_sha1_commit` extracts a tree ID and ordered parent IDs from one supplied
+SHA-1 commit body. It requires canonical link headers, nonempty author/committer
+headers in the supported order, optional-header framing, and a blank separator.
+Optional signature and mergetag continuations remain uninterpreted; the message
+after the separator is opaque. Duplicate/misplaced core headers, malformed IDs,
+NUL/CR header bytes and orphan continuations are refused.
+
+Experimental limits are 16 MiB input, 64 KiB headers, 8,192 bytes per line,
+2,048 physical header lines and 1,024 parents; callers may lower the parent cap.
+Searches and parent allocation are bounded with cooperative attempt controls.
+The parser does not bind object type/hash, validate identity or timestamp syntax,
+verify signatures, perform full fsck, or prove linked-object presence or graph
+completeness. It may reject historical/noncanonical commits. No cleanup authority
+follows from its result. Tests include root and merge objects produced by Git,
+ordered parent correspondence, optional continuations, malformed/core-order
+cases, limits, interruption and opaque binary message boundaries.
