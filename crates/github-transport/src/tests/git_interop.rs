@@ -546,7 +546,9 @@ fn run_real_git_verification() {
     let root = server.join().expect("fixture server panicked").unwrap();
     let report = report_result.unwrap();
     let fetch_report = fetch_result.unwrap();
-    pack_sink.sync_and_observe().unwrap();
+    let advertised_closure = pack_sink
+        .decode_download(&fetch_report, 4096, Instant::now() + Duration::from_secs(5))
+        .unwrap();
     let pack = pack_sink.contents().unwrap();
     let checksum = check_sha1_pack_checksum(
         &mut std::io::Cursor::new(&pack),
@@ -565,14 +567,7 @@ fn run_real_git_verification() {
     )
     .unwrap();
     assert_eq!(decoded_pack.objects().len(), 4);
-    let advertised_closure = decode_advertised_pack(
-        &fetch_report,
-        &pack,
-        4096,
-        &CancellationHandle::new(),
-        Instant::now() + Duration::from_secs(5),
-    )
-    .unwrap();
+
     assert_eq!(advertised_closure.decoded().objects().len(), 4);
     assert_eq!(advertised_closure.graph().reachable_objects(), 4);
     assert_eq!(

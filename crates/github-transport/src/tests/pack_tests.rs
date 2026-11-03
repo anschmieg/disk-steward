@@ -15,7 +15,7 @@ fn pack_fixture_with_framing(
     )
 }
 
-fn pack_fixture_with_refs(
+pub(super) fn pack_fixture_with_refs(
     body: Vec<u8>,
     truncated_http: bool,
     advertised: Vec<u8>,
@@ -72,7 +72,7 @@ fn pack_fixture_with_refs(
     )
 }
 
-fn pack_body(payload: &[u8]) -> Vec<u8> {
+pub(super) fn pack_body(payload: &[u8]) -> Vec<u8> {
     let mut body = ref_packet(b"packfile\n");
     let mut sideband = vec![1];
     sideband.extend_from_slice(payload);

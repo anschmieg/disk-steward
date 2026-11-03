@@ -206,36 +206,160 @@ impl BudgetFileSink {
         Ok(record.reserved_bytes)
     }
 
+    /// Test-only composition over this still-owned file. Observable identity or
+    /// content changes refuse completion; later mutations still require renewed
+    /// validation and this returns no persistent acceptance or cleanup receipt.
+    pub(super) fn decode_download(
+        &mut self,
+        report: &crate::PackTransferReport,
+        max_decoded_bytes: usize,
+        deadline: std::time::Instant,
+    ) -> io::Result<crate::AdvertisedPackReport> {
+        let result = (|| {
+            self.signal.check()?;
+            crate::check_deadline(deadline)?;
+            if !report.is_complete_transfer() {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "pack transfer incomplete",
+                ));
+            }
+            self.sync_and_observe()?;
+            let before = self.snapshot()?;
+            if before.len != report.bytes_written() {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "pack file length does not match transfer",
+                ));
+            }
+            let bytes = self.contents()?;
+            self.signal.check()?;
+            crate::check_deadline(deadline)?;
+            let checked = crate::decode_advertised_pack(
+                report,
+                &bytes,
+                max_decoded_bytes,
+                &self.signal,
+                deadline,
+            )?;
+            if self.snapshot()? != before {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "pack file changed during decode",
+                ));
+            }
+            self.signal.check()?;
+            crate::check_deadline(deadline)?;
+            Ok(checked)
+        })();
+        if result.is_err() {
+            self.signal.cancel();
+        }
+        result
+    }
+
     pub(super) fn contents(&self) -> io::Result<Vec<u8>> {
+        self.contents_with(|file, buffer, offset| file.read_at(buffer, offset))
+    }
+
+    fn snapshot(&self) -> io::Result<Snapshot> {
         self.validate_identity()?;
-        let length = self.file.metadata()?.len();
+        Ok(Snapshot::from(&self.file.metadata()?))
+    }
+
+    fn contents_with(
+        &self,
+        mut read_at: impl FnMut(&File, &mut [u8], u64) -> io::Result<usize>,
+    ) -> io::Result<Vec<u8>> {
+        let before = self.snapshot()?;
+        let length = before.len;
         if length > self.logical_limit {
             return Err(safe_error(
                 io::ErrorKind::InvalidData,
                 "pack sink contents exceed limit",
             ));
         }
-        let mut contents = vec![
-            0;
-            usize::try_from(length).map_err(|_| {
-                safe_error(
-                    io::ErrorKind::InvalidData,
-                    "pack sink contents size invalid",
-                )
-            })?
-        ];
+        let size = usize::try_from(length).map_err(|_| {
+            safe_error(
+                io::ErrorKind::InvalidData,
+                "pack sink contents size invalid",
+            )
+        })?;
+        let mut contents = Vec::new();
+        contents.try_reserve_exact(size).map_err(|_| {
+            safe_error(
+                io::ErrorKind::OutOfMemory,
+                "pack sink contents allocation failed",
+            )
+        })?;
+        contents.resize(size, 0);
         let mut offset = 0usize;
-        while offset < contents.len() {
-            let read = self.file.read_at(&mut contents[offset..], offset as u64)?;
-            if read == 0 {
-                return Err(safe_error(
-                    io::ErrorKind::UnexpectedEof,
-                    "pack sink contents changed",
-                ));
+        let mut interrupted = 0u8;
+        while offset < size {
+            let amount = (size - offset).min(8192);
+            match read_at(
+                &self.file,
+                &mut contents[offset..offset + amount],
+                offset as u64,
+            ) {
+                Ok(count) if count <= amount => {
+                    if count == 0 {
+                        return Err(safe_error(
+                            io::ErrorKind::UnexpectedEof,
+                            "pack sink contents changed",
+                        ));
+                    }
+                    offset += count;
+                    interrupted = 0;
+                }
+                Ok(_) => {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "pack sink returned invalid read count",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupted += 1;
+                    if interrupted > 16 {
+                        return Err(safe_error(
+                            io::ErrorKind::Interrupted,
+                            "pack sink read interrupted repeatedly",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
             }
-            offset += read;
         }
-        self.validate_identity()?;
+
+        interrupted = 0;
+        loop {
+            let mut probe = [0u8; 1];
+            match read_at(&self.file, &mut probe, length) {
+                Ok(0) => break,
+                Ok(_) => {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "pack sink contents grew during read",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interrupted += 1;
+                    if interrupted > 16 {
+                        return Err(safe_error(
+                            io::ErrorKind::Interrupted,
+                            "pack sink read interrupted repeatedly",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self.snapshot()? != before {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "pack sink contents changed during read",
+            ));
+        }
         Ok(contents)
     }
 
@@ -460,4 +584,217 @@ impl Write for BudgetFileSink {
 
 fn safe_error(kind: io::ErrorKind, message: &'static str) -> io::Error {
     io::Error::new(kind, message)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot {
+    len: u64,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    nlink: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl From<&fs::Metadata> for Snapshot {
+    fn from(metadata: &fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.mode(),
+            nlink: metadata.nlink(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sink_with_pack() -> (PrivateRoot, BudgetFileSink, Vec<u8>) {
+        let root = PrivateRoot::create().unwrap();
+        let mut sink = BudgetFileSink::new(&root, crate::CancellationHandle::new()).unwrap();
+        let pack = b"PACK\0\0\0\x02".to_vec();
+        sink.write_all(&pack).unwrap();
+        (root, sink, pack)
+    }
+
+    #[test]
+    fn reads_contents_and_checks_eof() {
+        let (_root, sink, pack) = sink_with_pack();
+        assert_eq!(sink.contents().unwrap(), pack);
+    }
+
+    #[test]
+    fn refuses_growth_during_read() {
+        let (_root, sink, _pack) = sink_with_pack();
+        let mut changed = false;
+        let result = sink.contents_with(|file, buffer, offset| {
+            let count = file.read_at(buffer, offset)?;
+            if !changed {
+                file.set_len(16)?;
+                changed = true;
+            }
+            Ok(count)
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn refuses_truncation_during_read() {
+        let (_root, sink, _pack) = sink_with_pack();
+        let mut changed = false;
+        let result = sink.contents_with(|file, buffer, offset| {
+            let count = file.read_at(buffer, offset)?;
+            if !changed {
+                file.set_len(2)?;
+                changed = true;
+            }
+            Ok(count)
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bounds_interrupted_reads() {
+        let (_root, sink, _pack) = sink_with_pack();
+        let mut calls = 0;
+        let error = sink
+            .contents_with(|_, _, _| {
+                calls += 1;
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            })
+            .unwrap_err();
+        assert_eq!(calls, 17);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn rejects_impossible_read_count() {
+        let (_root, sink, _pack) = sink_with_pack();
+        let error = sink
+            .contents_with(|_, buffer, _| Ok(buffer.len() + 1))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_length_above_limit_before_reading() {
+        let root = PrivateRoot::create().unwrap();
+        let sink =
+            BudgetFileSink::new_with_limit(&root, crate::CancellationHandle::new(), 4).unwrap();
+        let mut writer = File::options()
+            .write(true)
+            .open(root.path.join(NAME))
+            .unwrap();
+        writer.write_all(b"12345").unwrap();
+        let called = std::cell::Cell::new(false);
+        let error = sink
+            .contents_with(|_, _, _| {
+                called.set(true);
+                Ok(0)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!called.get());
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use crate::tests::{
+        graph_tests::{hex, oid, pack_bytes},
+        pack_tests::{pack_body, pack_fixture_with_refs},
+    };
+    use std::time::{Duration, Instant};
+
+    fn download() -> (PrivateRoot, BudgetFileSink, crate::PackTransferReport) {
+        let root = PrivateRoot::create().unwrap();
+        let payload = b"x".to_vec();
+        let id = oid(crate::GitObjectKind::Blob, &payload);
+        let bytes = pack_bytes(&[(crate::GitObjectKind::Blob, payload)]);
+        let (transport, server) = pack_fixture_with_refs(
+            pack_body(&bytes),
+            false,
+            format!("{} refs/tags/blob\n", hex(&id)).into_bytes(),
+        );
+        let mut sink = BudgetFileSink::new(&root, transport.cancellation_handle()).unwrap();
+        let report = transport.download_advertised_pack(&mut sink).unwrap();
+        server.join().unwrap();
+        assert!(report.is_complete_transfer());
+        (root, sink, report)
+    }
+    #[test]
+    fn owned_file_decode_binds_native_identity_and_transfer_bytes() {
+        let (_root, mut sink, report) = download();
+        let checked = sink
+            .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(checked.decoded().objects().len(), 1);
+        assert_eq!(checked.graph().reachable_objects(), 1);
+    }
+    #[test]
+    fn changed_file_or_name_refuses_and_cancels_the_attempt() {
+        for case in 0..4 {
+            let (root, mut sink, report) = download();
+            match case {
+                0 => sink.file.set_len(report.bytes_written() + 1).unwrap(),
+                1 => {
+                    sink.file.write_at(b"X", 0).unwrap();
+                }
+                2 => fs::hard_link(&sink.path, root.path.join("extra-link")).unwrap(),
+                3 => {
+                    let renamed = root.path.join("renamed");
+                    fs::rename(&sink.path, &renamed).unwrap();
+                    std::os::unix::fs::symlink(&renamed, &sink.path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(sink
+                .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+                .is_err());
+            assert!(sink.signal.is_cancelled());
+        }
+    }
+    #[test]
+    fn metadata_change_during_read_refuses_even_at_equal_length() {
+        let (_root, sink, _report) = download();
+        let mut changed = false;
+        let error = sink
+            .contents_with(|file, bytes, offset| {
+                let count = file.read_at(bytes, offset)?;
+                if !changed {
+                    file.set_times(
+                        fs::FileTimes::new()
+                            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(60)),
+                    )?;
+                    changed = true;
+                }
+                Ok(count)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+    #[test]
+    fn decode_controls_refuse_without_a_checked_file_result() {
+        let (_root, mut sink, report) = download();
+        assert_eq!(
+            sink.decode_download(&report, 4096, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(sink.signal.is_cancelled());
+    }
 }
