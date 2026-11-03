@@ -1141,3 +1141,75 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 implementation checkpoint feat/m0-pack-stream-binding atop73c637e65 preserving local notes. Read AGENTS/ROADMAP/design freshrequiredcoverage/receiptbudgets/latest scope+progress, actual worktrees untouched/no builders/free3.3GiB above2GiBreserve/headroom; no cache cleanup or watchedPR polling. Luna bounded pack.rs accepted-byte digest wrapper/root decoder cap+hash guard and source review. Reports expose SHA256 only for complete Git+HTTP operation; hash valid sink-reportedaccepted prefixes/shortwrites, no bytes onInterrupted/error and no partialdigest. Decode requires exactcount+digestmatch before bounded parsing, input16MiBcap before8KiBcooperativehash. Clarifies acceptedstreamcontent binding, not physicalsinkpersistence/fileidentity/fsync/sourceauth orcleanup. Pinsha2=0.10.9 alreadycached/locked (onlydirectdependency edge added, no packageversion changes).
 
 2026-11-03 streambinding validation:146transport tests PASS/7 exact-childhelpers ignored by ordinary harness with parents running, including supervised realGit reserved-file fetch/decode/closure/coverage/strictreceiver flow. Pythonhashlib independentSHA256 of PACKopaque fixture bytes ed2cf8c3289ae21bfcc63b511e4e7cb82b50e6b0cd67c43bf0f6903bb1a07433 matches complete/short+InterruptedSink reports; partial/protocol/incomplete reports expose no digest. Same-length independently valid alternativepack with identicaladvertisedroot anddifferentunreachableblob passes standalone decode+closure but is rejected by original transferdigest; originalbytesaccepted. Strict all-target offlineClippy/fmt/version0.0.17/diff PASS locally on macOS; freshcurrentheadCI required. No physicalpersistence/productionworker/RSS/credentials/localpreservation/fullfsck/globalstore/human/platform or milestone gate closed. Automation enabled/no release.
+2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
+
+2026-11-03 PR50 integrates updated49 head52e858e/main e44957e; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
+
+2026-11-03 PR49 head52e858e merged to main9635f78 after four current-head build/test successes/no blocking findings; unwatch49. PR50 retargeted main, verified49 ancestor and main-vs49 transport/budget source identical; retained reviewed50 source for squash integration. All dated progress preserved; fresh50 CI required.
+
+2026-11-03 PR50 head935ec0e merged to mainc5997b2 after four current-head build/test successes/no blocking findings; unwatch50. PR51 retargeted main, verified50 ancestor and main-vs50 transport source identical; retained reviewed51 source for squash conflicts. All dated progress preserved; fresh51 CI required.
+
+2026-11-03 PR52 integrates updated51 headaf82b3e/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR53 integrates updated52 head536cf48/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR54 integrates updated53 head5b2a3b8/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR55 integrates updated54 head035c15f/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR56 integrates updated55 head58c17ab/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR57 integrates updated56 head5683a18/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR58 integrates updated57 head67b90d7/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR59 integrates updated58 head72d0da3; append-only progress conflict resolved retaining every dated entry. Registry lease fix retained; no implementation changes. Fresh current-head CI required; existing watch persists.
+
+2026-11-03 PR60 integrates updated59 head018fabb; append-only progress conflict resolved retaining every dated entry. No implementation changes; registry lease fix retained. Staged progress-only/diff check PASS; no rebuild warranted. Fresh current-head CI required; existing watch persists.
+
+2026-11-03 PR61 integrates updated60 head09d3edd; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR62 integrates updated61 head7642218; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR63 integrates updated62 head0d27032; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR64 integrates updated63 head75d13da; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR65 integrates updated64 head237ab53; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR66 integrates updated65 head7d7fa32; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR67 integrates updated66 headedadad4; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR68 integrates updated67 headb446ec9; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR69 integrates updated68 head2a39383; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR70 integrates updated69 head4fd7371; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR71 integrates updated70 head3440042; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR72 integrates updated71 headbd537c0; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 PR73 integrates updated72 head05d9752; append-only progress conflict resolved retaining every dated entry. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists.
+
+2026-11-03 durable current checkpoint PR74 https://github.com/anschmieg/disk-steward/pull/74 head0630add branchfeat/m0-pack-stream-binding/base73. Linked/awaiting freshCI+review watch;146local transport tests/strict offlineClippy/fmt/version/diff PASS. Preserve thisbranch/localnote not stale73. Automation enabled; meaningful safe progress remains owned-store productionworker/fileidentity+receiptbinding/local inventory and other milestoneacceptance work. No release/completionclaim.
+
+2026-11-03 PR57 conflict wake completed: head7cc2875 integrates56 head2e73ccf/mainfb2c452; append-only progress conflict/every dated entry retained/staged progress-only/diff check PASS. Implementation unchanged; no rebuild warranted, fresh current-head CI required/existing watch persists. Current PR74 branch0630add and targeted-stashed notes restored; automation enabled.
+
+2026-11-03 PR72 conflict wake completed: head05d9752 integrates71 headbd537c0; append-only progress conflict/every dated entry retained/staged progress-only/diff check PASS. Implementation unchanged and registry lease fix retained; no rebuild warranted, fresh current-head CI required/existing watch persists. Current PR74 branch0630add and targeted-stashed notes restored; automation enabled.
+
+2026-11-03 PR60 green wake: actual OPEN head09d3edd544fb028c58353c3f9ac12fe6d6a91749/four required build-test jobs SUCCESS/MERGEABLE/no inline findings; Sourcery SKIPPED and Copilot quota COMMENTED not approval. Still based on unmerged59 test/m0-reservation-process-death (018fabb already ancestor), not main, so no merge or unnecessary push/rebuild. Linux and macOS checks at this downstream head include inherited registry lease fix; this is current-head CI evidence, not broad production lifecycle acceptance. Existing watch/local PR74 branch0630add and notes preserved; automation enabled.
+
+2026-11-03 PR58 wake completed:72d0da3 four required CI jobs SUCCESS/no inline findings but conflicting unmerged featurebase57, no merge. Newheadfcf755a integrates57 head7cc2875/mainfb2c452, progress-only conflict/every dated line preserved/diff PASS/implementation unchanged. No rebuild warranted; fresh-head CI required/existing watch retained. Current PR74 branch0630add and targeted-stashed notes restored; automation enabled.
+
+2026-11-03 PR74 guide wake: read full Sourcery comment6593215165 and inline review comments (none). Descriptive guide accurately captures completion-gated sink-accepted SHA256, length/digest/cap predecode guards, regression coverage and explicit persistence/fileidentity/fsync/authentication/productionworker/cleanup exclusions. Guide is not review approval or milestone acceptance. Actual OPEN head0630add9454b577cb4aff24de3e5a1e27f079e4c/base73 confirmed; Copilot quota COMMENTED supplies no review. No actionable finding/code change or rebuild warranted; existing watch/local notes preserved/automation enabled.
+
+2026-11-03 PR59 conflict wake completed: headca60952 integrates58 headfcf755a/mainfb2c452; append-only progress conflict/every dated entry retained/staged progress-only/diff check PASS. Implementation unchanged and registry lease fix retained; no rebuild warranted, fresh current-head CI required/existing watch persists. Current PR74 branch0630add and targeted-stashed notes restored; automation enabled.
+
+2026-11-03 PR73 conflict wake completed: head9a07b0b integrates72 head05d9752; append-only progress conflict/every dated entry retained/staged progress-only/diff check PASS. Implementation unchanged and registry lease fix retained; no rebuild warranted, fresh current-head CI required/existing watch persists. Current PR74 branch0630add and targeted-stashed notes restored; automation enabled.
+
+2026-11-03 PR60 conflict wake completed: head83c7af4 integrates59 headca60952/mainfb2c452; append-only progress conflict/every dated entry retained/staged progress-only/diff check PASS. Implementation unchanged and registry lease fix retained; no rebuild warranted, fresh current-head CI required/existing watch persists. Current PR74 branch0630add and targeted-stashed notes restored; automation enabled.
+
+2026-11-03 PR74 integrates updated73 head9a07b0b; append-only progress conflict/every dated entry and targeted-stashed local note preserved. Implementation unchanged including registry lease fix; staged progress-only/diff check PASS. No rebuild warranted; fresh current-head CI required, existing watch persists. Current checkpoint feat/m0-pack-stream-binding, automation enabled.
