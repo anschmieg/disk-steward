@@ -249,3 +249,14 @@ verification with a ten-second per-command budget, while upload-pack RPC
 commands retain a three-second budget. Shared macOS CI exceeded the earlier
 three-second setup budget; the failing child was reaped. These are test-fixture
 limits, not changes to transport or product attempt deadlines.
+
+A completed `PackTransferReport` also exposes `advertised_refs()`: the bounded,
+syntax-validated ref claims read by that download's own `ls-refs` operation and
+used to derive its sorted, deduplicated fetch wants. Claims are withheld if
+Git parsing, sink I/O, cancellation, deadlines or HTTP finalization fail, even
+when partial payload bytes were accepted. Downstream verification can therefore
+use the claims paired with the transferred bytes rather than a separate ref
+observation. These remain unverified remote claims: object integrity, required
+object completeness, relationships, reachability, freshness/retention and an
+atomic remote snapshot still require independent evidence. The real-Git fixture
+checks the reported tip set against its owned source and isolated receiver.
