@@ -73,6 +73,16 @@ fn pack_transfer_completion_is_not_an_object_integrity_claim() {
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(report.is_complete_transfer());
+    let claims = report.advertised_refs().unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].name(), b"HEAD");
+    assert_eq!(
+        claims[0].oid(),
+        &[
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67
+        ]
+    );
     assert_eq!(sink, b"PACKopaque fixture bytes");
     assert_eq!(report.bytes_written(), sink.len() as u64);
     assert_eq!(report.finalization().framing().completed(), 3);
@@ -94,6 +104,7 @@ fn pack_transfer_rejects_protocol_failures_without_complete_report() {
         let report = transport.download_advertised_pack(&mut sink).unwrap();
         server.join().unwrap();
         assert!(!report.is_complete_transfer());
+        assert!(report.advertised_refs().is_none());
         assert!(report.operation_error_kind().is_some());
         assert_eq!(report.bytes_written(), sink.len() as u64);
     }
@@ -123,6 +134,7 @@ fn pack_transfer_reports_actual_partial_sink_bytes_on_failure() {
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
+    assert!(report.advertised_refs().is_none());
     assert_eq!(report.bytes_written(), 3);
     assert_eq!(sink.bytes, b"PAC");
     assert_eq!(report.operation_error_kind(), Some(io::ErrorKind::Other));
@@ -145,6 +157,7 @@ fn oversized_or_empty_tip_set_refuses_fetch_before_sink_io() {
         let report = transport.download_advertised_pack(&mut sink).unwrap();
         server.join().unwrap();
         assert!(!report.is_complete_transfer());
+        assert!(report.advertised_refs().is_none());
         assert_eq!(
             report.operation_error_kind(),
             Some(io::ErrorKind::InvalidData)
@@ -185,6 +198,7 @@ fn sink_cancellation_keeps_accepted_bytes_and_prevents_further_writes() {
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
+    assert!(report.advertised_refs().is_none());
     assert_eq!(
         report.operation_error_kind(),
         Some(io::ErrorKind::ConnectionAborted)
@@ -202,7 +216,9 @@ fn git_flush_cannot_complete_transfer_with_truncated_http_framing() {
     assert_eq!(sink, b"PACKopaque");
     assert_eq!(report.bytes_written(), sink.len() as u64);
     assert!(!report.is_complete_transfer());
+    assert!(report.advertised_refs().is_none());
     assert!(!report.finalization().is_complete());
+    assert!(report.operation_error_kind().is_none());
 }
 
 const BLOCKED_PACK_SINK_READY: &[u8] = b"PACK_SINK_SECOND_WRITE_BLOCKED\n";
