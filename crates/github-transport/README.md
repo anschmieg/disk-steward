@@ -245,7 +245,7 @@ is gated to the registry adapter's Linux/macOS targets. No application or
 renderer calls this test sink.
 
 The fixed system-Git fixture supervises repository setup and local receiver
-verification with a ten-second per-command budget, while upload-pack RPC
+verification with a thirty-second per-command budget, while upload-pack RPC
 commands retain a three-second budget. Shared macOS CI exceeded the earlier
 three-second setup budget; the failing child was reaped. These are test-fixture
 limits, not changes to transport or product attempt deadlines.
@@ -414,3 +414,8 @@ completeness. It may reject historical/noncanonical commits. No cleanup authorit
 follows from its result. Tests include root and merge objects produced by Git,
 ordered parent correspondence, optional continuations, malformed/core-order
 cases, limits, interruption and opaque binary message boundaries.
+The test-only local Git setup/receiver allowance is now thirty seconds after
+macOS CI reaped two cold fixture setup commands at the previous ten-second
+limit. The three-second protocol RPC deadline and production attempt limits
+remain unchanged. This does not turn a timeout into a successful verification;
+commands must still finish successfully within the bounded fixture allowance.
