@@ -31,6 +31,21 @@ pub(crate) struct Progress {
     pub can_continue: bool,
     pub scan_finished: bool,
     pub entries_this_batch: u32,
+    pub coverage_breakdown: CoverageBreakdown,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CoverageBreakdown {
+    pub hidden_entries: u32,
+    pub symbolic_links: u32,
+    pub nonregular_entries: u32,
+    pub cross_volume_entries: u32,
+    pub dataless_entries: u32,
+    pub managed_boundaries: u32,
+    pub system_boundaries: u32,
+    pub depth_limited_directories: u32,
+    pub pending_directories: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +77,7 @@ pub(super) struct SubtreeJob {
     directories_visited: u32,
     skipped_entries: u32,
     excluded_directories: u32,
+    coverage_breakdown: CoverageBreakdown,
     unreadable_entries: u32,
     changed_directories: u32,
     unique_file_logical_bytes: u64,
@@ -134,6 +150,7 @@ impl SubtreeJob {
             directories_visited: 1,
             skipped_entries: 0,
             excluded_directories: 0,
+            coverage_breakdown: CoverageBreakdown::default(),
             unreadable_entries: 0,
             changed_directories: 0,
             unique_file_logical_bytes: 0,
@@ -240,16 +257,25 @@ impl SubtreeJob {
             };
             let kind = FileType::from_raw_mode(metadata.st_mode);
             if kind == FileType::Directory && self.policy.excludes(&metadata) {
-                self.skip();
+                self.mark_skipped();
                 self.excluded_directories = self.excluded_directories.saturating_add(1);
                 continue;
             }
-            if raw.first() == Some(&b'.')
-                || is_dataless(&metadata)
-                || kind == FileType::Symlink
-                || metadata.st_dev as u64 != self.root_device
-            {
-                self.skip();
+            // One deterministic primary reason is recorded for each skipped entry.
+            if raw.first() == Some(&b'.') {
+                self.skip(|coverage| coverage.hidden_entries += 1);
+                continue;
+            }
+            if is_dataless(&metadata) {
+                self.skip(|coverage| coverage.dataless_entries += 1);
+                continue;
+            }
+            if kind == FileType::Symlink {
+                self.skip(|coverage| coverage.symbolic_links += 1);
+                continue;
+            }
+            if metadata.st_dev as u64 != self.root_device {
+                self.skip(|coverage| coverage.cross_volume_entries += 1);
                 continue;
             }
             if kind == FileType::RegularFile {
@@ -257,19 +283,22 @@ impl SubtreeJob {
                 continue;
             }
             if kind != FileType::Directory {
-                self.skip();
+                self.skip(|coverage| coverage.nonregular_entries += 1);
                 continue;
             }
-            if is_managed_boundary(raw)
-                || SYSTEM_BOUNDARY_NAMES
-                    .iter()
-                    .any(|boundary| raw.eq_ignore_ascii_case(boundary))
+            if is_managed_boundary(raw) {
+                self.skip(|coverage| coverage.managed_boundaries += 1);
+                continue;
+            }
+            if SYSTEM_BOUNDARY_NAMES
+                .iter()
+                .any(|boundary| raw.eq_ignore_ascii_case(boundary))
             {
-                self.skip();
+                self.skip(|coverage| coverage.system_boundaries += 1);
                 continue;
             }
             if self.frames.len() >= MAX_DEPTH {
-                self.skip();
+                self.skip(|coverage| coverage.depth_limited_directories += 1);
                 self.stop_reason.get_or_insert("depth_limit");
                 continue;
             }
@@ -347,12 +376,25 @@ impl SubtreeJob {
             can_continue: !self.finished && !self.resource_halted,
             scan_finished: self.finished,
             entries_this_batch,
+            coverage_breakdown: CoverageBreakdown {
+                pending_directories: if self.finished {
+                    0
+                } else {
+                    self.frames.len() as u32
+                },
+                ..self.coverage_breakdown.clone()
+            },
         }
     }
 
-    fn skip(&mut self) {
+    fn mark_skipped(&mut self) {
         self.skipped_entries = self.skipped_entries.saturating_add(1);
         self.coverage_complete = false;
+    }
+
+    fn skip(&mut self, count_reason: impl FnOnce(&mut CoverageBreakdown)) {
+        self.mark_skipped();
+        count_reason(&mut self.coverage_breakdown);
     }
 
     fn observe_file(&mut self, metadata: &Stat) -> Result<(), &'static str> {
@@ -546,6 +588,14 @@ mod tests {
         assert!(pages
             .iter()
             .take(pages.len() - 1)
+            .all(|page| page.coverage_breakdown.pending_directories > 0));
+        assert_eq!(final_page.coverage_breakdown.pending_directories, 0);
+        let serialized = serde_json::to_value(final_page).unwrap();
+        assert_eq!(serialized["coverageBreakdown"]["pendingDirectories"], 0);
+        assert_eq!(serialized["coverageBreakdown"]["datalessEntries"], 0);
+        assert!(pages
+            .iter()
+            .take(pages.len() - 1)
             .all(|page| page.can_continue && !page.scan_finished));
         assert_eq!(final_page.summary.entries_observed, 4_200);
         assert_eq!(final_page.summary.files_observed, 4_200);
@@ -564,6 +614,7 @@ mod tests {
     #[test]
     fn nested_hardlinks_hidden_symlink_and_excluded_folder_follow_summary_policy() {
         use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("nested");
         let excluded = root.path().join("excluded");
@@ -574,6 +625,12 @@ mod tests {
         std::fs::write(excluded.join("secret"), b"ignored").unwrap();
         std::fs::write(root.path().join(".hidden"), b"ignored").unwrap();
         symlink(root.path().join("visible"), root.path().join("link")).unwrap();
+        symlink(
+            root.path().join("visible"),
+            root.path().join(".hidden-link"),
+        )
+        .unwrap();
+        let _socket = UnixListener::bind(root.path().join("local.sock")).unwrap();
         let (session, _) = session(root.path());
         let excluded_stat =
             rustix::fs::statat(rustix::fs::CWD, &excluded, AtFlags::SYMLINK_NOFOLLOW).unwrap();
@@ -588,7 +645,30 @@ mod tests {
         assert_eq!(final_page.summary.duplicate_hardlink_names, 1);
         assert_eq!(final_page.summary.unique_file_logical_bytes, "4");
         assert_eq!(final_page.summary.excluded_directories, 1);
+        assert_eq!(final_page.coverage_breakdown.hidden_entries, 2);
+        assert_eq!(final_page.coverage_breakdown.symbolic_links, 1);
+        assert_eq!(final_page.coverage_breakdown.nonregular_entries, 1);
+        assert_eq!(final_page.coverage_breakdown.pending_directories, 0);
+        assert_eq!(final_page.summary.skipped_entries, 5);
         assert!(!final_page.summary.coverage_complete);
+    }
+
+    #[test]
+    fn managed_and_system_boundary_counts_are_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("bundle.app")).unwrap();
+        std::fs::create_dir(root.path().join("lIbRaRy")).unwrap();
+        let (session, _) = session(root.path());
+        let mut job = SubtreeJob::start(
+            &session,
+            SummaryExclusionPolicy::empty_for_tests(),
+            RevisionId::new(),
+        )
+        .unwrap();
+        let final_page = drain(&mut job).pop().unwrap();
+        assert_eq!(final_page.coverage_breakdown.managed_boundaries, 1);
+        assert_eq!(final_page.coverage_breakdown.system_boundaries, 1);
+        assert_eq!(final_page.summary.skipped_entries, 2);
     }
 
     #[test]
@@ -671,6 +751,7 @@ mod tests {
         assert_eq!(final_page.summary.stop_reason, Some("depth_limit"));
         assert_eq!(final_page.summary.files_observed, 1);
         assert_eq!(final_page.summary.unique_file_logical_bytes, "2");
+        assert_eq!(final_page.coverage_breakdown.depth_limited_directories, 1);
         assert!(!final_page.summary.coverage_complete);
     }
 }

@@ -948,6 +948,17 @@ const chunkProgress = {
   canContinue: true,
   scanFinished: false,
   entriesThisBatch: 512,
+  coverageBreakdown: {
+    hiddenEntries: 0,
+    symbolicLinks: 0,
+    nonregularEntries: 0,
+    crossVolumeEntries: 0,
+    datalessEntries: 0,
+    managedBoundaries: 0,
+    systemBoundaries: 0,
+    depthLimitedDirectories: 0,
+    pendingDirectories: 1,
+  },
 };
 
 test("subtree scan advances bounded batches with fresh attempts and preserves the folder page", async () => {
@@ -1070,4 +1081,57 @@ test("discard uses exact scan references and reports release only on native succ
   ).not.toBeInTheDocument();
   expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
   expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+});
+
+test("subtree coverage exposes distinct boundary reasons without implying complete remaining counts", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce({
+      ...chunkProgress,
+      canContinue: false,
+      scanFinished: true,
+      coverageComplete: false,
+      coverageBreakdown: {
+        hiddenEntries: 2,
+        symbolicLinks: 3,
+        nonregularEntries: 4,
+        crossVolumeEntries: 5,
+        datalessEntries: 6,
+        managedBoundaries: 7,
+        systemBoundaries: 8,
+        depthLimitedDirectories: 9,
+        pendingDirectories: 0,
+      },
+    });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  const page = screen.getByRole("table").textContent;
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  const details = await screen.findByRole("region", {
+    name: "Subtree coverage details",
+  });
+  for (const [label, value] of [
+    ["Hidden entries", "2"],
+    ["Symbolic links", "3"],
+    ["Other nonregular entries", "4"],
+    ["Volume crossings", "5"],
+    ["Known dataless entries", "6"],
+    ["Managed directory boundaries", "7"],
+    ["System directory boundaries", "8"],
+    ["Directories beyond the depth limit", "9"],
+    ["Unfinished directory streams", "0"],
+  ]) {
+    expect(
+      within(details).getByText(label).nextElementSibling,
+    ).toHaveTextContent(value);
+  }
+  expect(details).toHaveTextContent("not all remaining directories or files");
+  expect(details).toHaveTextContent(
+    "A zero count does not prove that an area is clean",
+  );
+  expect(screen.getByText("Incomplete subtree coverage.")).toBeInTheDocument();
+  expect(screen.getByRole("table").textContent).toBe(page);
 });

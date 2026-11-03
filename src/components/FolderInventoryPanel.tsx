@@ -60,6 +60,17 @@ type SubtreeProgress = FolderTreeSummary & {
   canContinue: boolean;
   scanFinished: boolean;
   entriesThisBatch: number;
+  coverageBreakdown: {
+    hiddenEntries: number;
+    symbolicLinks: number;
+    nonregularEntries: number;
+    crossVolumeEntries: number;
+    datalessEntries: number;
+    managedBoundaries: number;
+    systemBoundaries: number;
+    depthLimitedDirectories: number;
+    pendingDirectories: number;
+  };
   scanReleased?: boolean;
 };
 
@@ -711,7 +722,7 @@ export default function FolderInventoryPanel({
                 <dd>{treeSummary.directoriesVisited}</dd>
                 <dt>Remembered excluded directories</dt>
                 <dd>{treeSummary.excludedDirectories}</dd>
-                <dt>Skipped entries</dt>
+                <dt>Skipped entries, including remembered exclusions</dt>
                 <dd>{treeSummary.skippedEntries}</dd>
                 <dt>Unreadable entries</dt>
                 <dd>{treeSummary.unreadableEntries}</dd>
@@ -720,6 +731,41 @@ export default function FolderInventoryPanel({
                 <dt>Observed file-object logical bytes</dt>
                 <dd>{treeSummary.uniqueFileLogicalBytes}</dd>
               </dl>
+              {treeSummary.coverageBreakdown && (
+                <section aria-label="Subtree coverage details">
+                  <h4>Why entries were skipped</h4>
+                  <dl>
+                    <dt>Hidden entries</dt>
+                    <dd>{treeSummary.coverageBreakdown.hiddenEntries}</dd>
+                    <dt>Symbolic links</dt>
+                    <dd>{treeSummary.coverageBreakdown.symbolicLinks}</dd>
+                    <dt>Other nonregular entries</dt>
+                    <dd>{treeSummary.coverageBreakdown.nonregularEntries}</dd>
+                    <dt>Volume crossings</dt>
+                    <dd>{treeSummary.coverageBreakdown.crossVolumeEntries}</dd>
+                    <dt>Known dataless entries</dt>
+                    <dd>{treeSummary.coverageBreakdown.datalessEntries}</dd>
+                    <dt>Managed directory boundaries</dt>
+                    <dd>{treeSummary.coverageBreakdown.managedBoundaries}</dd>
+                    <dt>System directory boundaries</dt>
+                    <dd>{treeSummary.coverageBreakdown.systemBoundaries}</dd>
+                    <dt>Directories beyond the depth limit</dt>
+                    <dd>
+                      {treeSummary.coverageBreakdown.depthLimitedDirectories}
+                    </dd>
+                    <dt>Unfinished directory streams</dt>
+                    <dd>{treeSummary.coverageBreakdown.pendingDirectories}</dd>
+                  </dl>
+                  <p>
+                    Each skipped entry has one primary reason. Remembered
+                    exclusions and unreadable entries are counted separately
+                    above. These counts describe encountered boundaries, not
+                    their hidden contents. Unfinished streams count only the
+                    known traversal frontier, not all remaining directories or
+                    files. A zero count does not prove that an area is clean.
+                  </p>
+                </section>
+              )}
               <p>
                 Historical metadata observation, not a consistent filesystem
                 snapshot. Native file-object identities deduplicate hard-link
