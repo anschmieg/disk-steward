@@ -307,6 +307,29 @@ export default function AdvancedPlanPanel({
     descendantPage * 50,
     descendantPage * 50 + 50,
   );
+  // Only the visible page needs display context. Keep the existing traversal
+  // depth bound and avoid materializing paths for the whole 10,000-item plan.
+  const descendantContexts = new Map<string, string>();
+  for (const child of pagedDescendants) {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([child.itemId]);
+    let parentId = child.parentId;
+    while (
+      parentId &&
+      parentId !== inspected?.itemId &&
+      ancestors.length < 64
+    ) {
+      if (seen.has(parentId)) break;
+      seen.add(parentId);
+      const parent = items.get(parentId);
+      if (!parent) break;
+      ancestors.unshift(parent.label);
+      parentId = parent.parentId;
+    }
+    if (parentId !== inspected?.itemId)
+      ancestors.unshift("Incomplete location");
+    descendantContexts.set(child.itemId, ancestors.join(" › "));
+  }
   useEffect(() => setDescendantPage(0), [inspectedId, descendantSearch]);
   const captureFocus = (event: React.FocusEvent<HTMLElement>) => {
     const target = event.target;
@@ -965,6 +988,11 @@ export default function AdvancedPlanPanel({
                           <span>
                             {child.label}
                             <small>{formatBytes(child.logicalBytes)}</small>
+                            {descendantContexts.get(child.itemId) && (
+                              <small>
+                                {descendantContexts.get(child.itemId)}
+                              </small>
+                            )}
                           </span>
                         </label>
                       );

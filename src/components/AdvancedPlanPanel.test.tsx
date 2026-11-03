@@ -178,6 +178,48 @@ describe("AdvancedPlanPanel decisions", () => {
     });
   });
 
+  it("distinguishes same-named descendants by ancestor context and keeps exact identities", () => {
+    const { onEdit } = mount(
+      editorSnapshot([
+        editorItem("project", { label: "Project", kind: "folder" }),
+        editorItem("first-folder", {
+          label: "Design drafts",
+          kind: "folder",
+          parentId: "project",
+        }),
+        editorItem("second-folder", {
+          label: "Published notes",
+          kind: "folder",
+          parentId: "project",
+        }),
+        editorItem("first-notes", {
+          label: "notes.txt",
+          parentId: "first-folder",
+        }),
+        editorItem("second-notes", {
+          label: "notes.txt",
+          parentId: "second-folder",
+        }),
+      ]),
+    );
+    fireEvent.click(screen.getByRole("listitem", { name: /Project/ }));
+    const first = screen.getByRole("checkbox", {
+      name: /notes.txt.*Design drafts/,
+    });
+    const second = screen.getByRole("checkbox", {
+      name: /notes.txt.*Published notes/,
+    });
+    expect(first).not.toBe(second);
+    expect(first).not.toBeChecked();
+    expect(second).not.toBeChecked();
+    fireEvent.click(first);
+    expect(onEdit).toHaveBeenCalledExactlyOnceWith({
+      kind: "excludeDescendants",
+      parentId: "project",
+      itemIds: ["first-notes"],
+    });
+  });
+
   it.each([
     ["busy", { busy: true }],
     ["read only", { readOnly: true }],
