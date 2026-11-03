@@ -85,12 +85,30 @@ export default function AdvancedPlanPanel({
     focusKey: string | null;
     itemId: string | null;
     rowKey: string | null;
-  }>({ focusKey: null, itemId: null, rowKey: null });
+    groupId: string | null;
+  }>({ focusKey: null, itemId: null, rowKey: null, groupId: null });
   const lastRevision = useRef(snapshot.revisionId);
   const pendingFocusRestore = useRef(false);
   const items = useMemo(
     () => new Map(snapshot.items.map((item) => [item.itemId, item])),
     [snapshot.items],
+  );
+  const hiddenRemovedItemIds = useMemo(
+    () =>
+      new Set(
+        snapshot.items
+          .filter((item) => !item.inPlan)
+          .map((item) => item.itemId),
+      ),
+    [snapshot.items],
+  );
+  const hasHiddenRemovedGroupMembers = useMemo(
+    () =>
+      !showRemoved &&
+      snapshot.groups.some((group) =>
+        group.memberIds.some((itemId) => hiddenRemovedItemIds.has(itemId)),
+      ),
+    [showRemoved, snapshot.groups, hiddenRemovedItemIds],
   );
   const maxKnownLogicalBytes = useMemo(
     () => Math.max(0, ...snapshot.items.map((item) => item.logicalBytes ?? 0)),
@@ -258,8 +276,20 @@ export default function AdvancedPlanPanel({
         if (row) {
           const index = rows.indexOf(row);
           requestFocusRow(index);
+          return;
         }
       }
+      if (previous.groupId) {
+        const groupIndex = rows.findIndex(
+          (row) => row.groupId === previous.groupId && !row.item,
+        );
+        if (groupIndex >= 0) {
+          requestFocusRow(groupIndex);
+          return;
+        }
+      }
+      if ((previous.itemId || previous.rowKey) && rows.length > 0)
+        requestFocusRow(0);
     });
   }, [snapshot.revisionId, busy, rows]);
   const descendants = useMemo(() => {
@@ -307,16 +337,43 @@ export default function AdvancedPlanPanel({
     descendantPage * 50,
     descendantPage * 50 + 50,
   );
+  // Only the visible page needs display context. Keep the existing traversal
+  // depth bound and avoid materializing paths for the whole 10,000-item plan.
+  const descendantContexts = new Map<string, string>();
+  for (const child of pagedDescendants) {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([child.itemId]);
+    let parentId = child.parentId;
+    while (
+      parentId &&
+      parentId !== inspected?.itemId &&
+      ancestors.length < 64
+    ) {
+      if (seen.has(parentId)) break;
+      seen.add(parentId);
+      const parent = items.get(parentId);
+      if (!parent) break;
+      ancestors.unshift(parent.label);
+      parentId = parent.parentId;
+    }
+    if (parentId !== inspected?.itemId)
+      ancestors.unshift("Incomplete location");
+    descendantContexts.set(child.itemId, ancestors.join(" › "));
+  }
   useEffect(() => setDescendantPage(0), [inspectedId, descendantSearch]);
   const captureFocus = (event: React.FocusEvent<HTMLElement>) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
     const keyed = target.closest<HTMLElement>("[data-editor-focus]");
     const row = target.closest<HTMLElement>("[data-editor-row]");
+    const rowKey = row?.dataset.editorRow ?? null;
     focusContext.current = {
       focusKey: keyed?.dataset.editorFocus ?? null,
       itemId: row?.dataset.itemId ?? null,
-      rowKey: row?.dataset.editorRow ?? null,
+      rowKey,
+      groupId: rowKey
+        ? (rows.find((entry) => entry.key === rowKey)?.groupId ?? null)
+        : null,
     };
   };
   const setChoice = (item: EditorItem, choice: PlanChoice) =>
@@ -479,6 +536,11 @@ export default function AdvancedPlanPanel({
               Show removed items
             </label>
           </div>
+          {hasHiddenRemovedGroupMembers && (
+            <p className="ap-window-note" aria-live="polite">
+              Show removed items before changing a group that contains them.
+            </p>
+          )}
           {normalizedQuery && (
             <p className="ap-window-note">
               Summary totals include the whole plan, including findings hidden
@@ -510,6 +572,22 @@ export default function AdvancedPlanPanel({
                 if (!item) {
                   const label = group?.label ?? "Other findings";
                   const count = group?.memberIds.length ?? 0;
+                  const hasHiddenRemovedMembers = Boolean(
+                    group &&
+                    !showRemoved &&
+                    group.memberIds.some((itemId) =>
+                      hiddenRemovedItemIds.has(itemId),
+                    ),
+                  );
+                  const groupChoiceDisabled =
+                    editsBlocked ||
+                    Boolean(normalizedQuery) ||
+                    hasHiddenRemovedMembers;
+                  const groupChoiceTitle = normalizedQuery
+                    ? "Clear search before group-wide changes"
+                    : hasHiddenRemovedMembers
+                      ? "Show removed items before group-wide changes"
+                      : undefined;
                   return (
                     <div
                       key={row.key}
@@ -578,12 +656,8 @@ export default function AdvancedPlanPanel({
                           aria-label={`Set all eligible ${label} items`}
                         >
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -595,12 +669,8 @@ export default function AdvancedPlanPanel({
                             Include group
                           </button>
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -612,12 +682,8 @@ export default function AdvancedPlanPanel({
                             Keep group
                           </button>
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -965,6 +1031,11 @@ export default function AdvancedPlanPanel({
                           <span>
                             {child.label}
                             <small>{formatBytes(child.logicalBytes)}</small>
+                            {descendantContexts.get(child.itemId) && (
+                              <small>
+                                {descendantContexts.get(child.itemId)}
+                              </small>
+                            )}
                           </span>
                         </label>
                       );
