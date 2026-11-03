@@ -1,0 +1,34 @@
+.folder-inventory {
+  padding: 24px;
+}
+.folder-inventory p {
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.folder-inventory table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 16px;
+  text-align: left;
+}
+.folder-inventory caption {
+  text-align: left;
+  padding: 12px 0;
+}
+.folder-inventory th,
+.folder-inventory td {
+  padding: 10px 12px;
+  border-bottom: 1px solid currentColor;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.folder-inventory td:nth-child(3) {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.folder-inventory select {
+  max-width: 100%;
+  margin: 8px;
+  padding: 8px;
+  font: inherit;
+}

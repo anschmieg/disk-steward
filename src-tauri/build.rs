@@ -3,6 +3,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "foundation_status",
             "check_selected_folder_access",
+            "inspect_selected_folder_entries",
             "preview_native_review",
             "get_example_plan",
             "edit_example_plan",

@@ -9,6 +9,7 @@
     "core:default",
     "allow-foundation-status",
     "allow-check-selected-folder-access",
+    "allow-inspect-selected-folder-entries",
     "allow-preview-native-review",
     "allow-get-example-plan",
     "allow-edit-example-plan",
