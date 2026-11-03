@@ -559,6 +559,35 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
             .unwrap()
     );
     assert!(entry.header_bytes() <= 10);
+    let inflated = inflate_pack_representation(
+        &pack[12 + entry.header_bytes()..],
+        entry.inflated_bytes(),
+        512,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let object_type = match entry.kind() {
+        PackEntryKind::Commit => "commit",
+        PackEntryKind::Tree => "tree",
+        PackEntryKind::Blob => "blob",
+        PackEntryKind::Tag => "tag",
+        _ => unreachable!(),
+    };
+    let raw_object = checked_git(
+        &root,
+        &[
+            "-C",
+            &inspection_repo,
+            "cat-file",
+            object_type,
+            first_object,
+        ],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(inflated.bytes(), raw_object);
+
     let mut damaged_pack = pack.clone();
     *damaged_pack.last_mut().unwrap() ^= 1;
     assert!(check_sha1_pack_checksum(
@@ -784,4 +813,82 @@ fn unreconciled_registry_refuses_payload_creation() {
     assert!(signal.is_cancelled());
     assert!(!root.path.join("pack.download").exists());
     assert_durable_reservation_blocks_reopen(&root);
+}
+
+#[test]
+fn delta_reconstruction_matches_independent_strict_git_import() {
+    // Fixed pack produced independently with Python hashlib/zlib: blob base
+    // plus REF_DELTA. No repository, encoder or compressed input from a user.
+    let pack: &[u8] = &[
+        80, 65, 67, 75, 0, 0, 0, 2, 0, 0, 0, 2, 60, 120, 156, 203, 72, 205, 201, 201, 87, 40, 207,
+        47, 202, 73, 81, 4, 0, 30, 137, 4, 126, 125, 188, 119, 116, 167, 177, 141, 235, 29, 123,
+        208, 33, 45, 52, 36, 106, 155, 18, 96, 174, 23, 120, 156, 227, 17, 156, 192, 198, 154, 84,
+        148, 88, 150, 58, 145, 141, 13, 0, 22, 41, 3, 102, 222, 12, 54, 222, 168, 174, 204, 8, 78,
+        88, 154, 157, 199, 46, 90, 122, 96, 231, 197, 7,
+    ];
+    let root = PrivateRoot::create().unwrap();
+    let receiver = create_receiver(&root, "delta-receiver.git").unwrap();
+    let receiver_arg = receiver_path_arg(&receiver).unwrap();
+    checked_git(
+        &root,
+        &[
+            "--git-dir",
+            receiver_arg,
+            "index-pack",
+            "--strict",
+            "--stdin",
+        ],
+        pack,
+    )
+    .unwrap();
+    let git_result = checked_git(
+        &root,
+        &[
+            "--git-dir",
+            receiver_arg,
+            "cat-file",
+            "blob",
+            "799d6e2806898251c4b4be06ec68ca7a32bb8c31",
+        ],
+        b"",
+    )
+    .unwrap();
+    let base_header = parse_sha1_pack_entry_header(&pack[12..], 12, 512).unwrap();
+    assert_eq!(base_header.kind(), PackEntryKind::Blob);
+    let base_start = 12 + base_header.header_bytes();
+    let base = inflate_pack_representation(
+        &pack[base_start..],
+        base_header.inflated_bytes(),
+        512,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let delta_offset = base_start + base.compressed_bytes();
+    let delta_header =
+        parse_sha1_pack_entry_header(&pack[delta_offset..], delta_offset as u64, 512).unwrap();
+    assert!(matches!(
+        delta_header.kind(),
+        PackEntryKind::ReferenceDelta { .. }
+    ));
+    let delta_start = delta_offset + delta_header.header_bytes();
+    let delta = inflate_pack_representation(
+        &pack[delta_start..],
+        delta_header.inflated_bytes(),
+        512,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(delta_start + delta.compressed_bytes() + 20, pack.len());
+    let reconstructed = reconstruct_git_delta(
+        base.bytes(),
+        delta.bytes(),
+        17,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(git_result, b"hello braveworld!");
+    assert_eq!(reconstructed, git_result);
 }
