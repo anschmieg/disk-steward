@@ -14,7 +14,8 @@ use disk_steward_core::{
     SessionId, SupportedOperation,
 };
 use disk_steward_fixture_lifecycle::{
-    FixtureLifecycle, FixtureSnapshot, FixtureStatus, LifecycleError, SessionSnapshot,
+    FixtureLifecycle, FixtureProfile, FixtureSnapshot, FixtureStatus, LifecycleError,
+    SessionSnapshot,
 };
 use disk_steward_review_plan::{PlanView, ReviewPlanStore};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -1226,6 +1227,13 @@ impl DemoExecutionService {
             let (lifecycle, _) = FixtureLifecycle::reopen(&self.root, id).map_err(map_lifecycle)?;
             self.lifecycle = Some(lifecycle);
         }
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.profile() != FixtureProfile::SyntheticV1)
+        {
+            return Err(DemoError::NeedsInspection);
+        }
         self.lifecycle
             .as_ref()
             .map(FixtureLifecycle::session_id)
@@ -2027,6 +2035,37 @@ mod tests {
         assert!(status.fixtures.iter().all(|f| f.status
             != disk_steward_fixture_lifecycle::FixtureStatus::Available
             || f.action_id != serde_json::from_str(&action).unwrap()));
+    }
+
+    #[test]
+    fn demo_refuses_durable_pytest_profile_even_with_valid_session_binding() {
+        let (dir, mut service, plan) = fixture_service();
+        let (pytest, before) = FixtureLifecycle::create_pytest_corpus(
+            dir.path(),
+            [plan.actions[0].id, plan.actions[1].id],
+        )
+        .unwrap();
+        let session = serde_json::to_string(&pytest.session_id()).unwrap();
+        service
+            .control
+            .execute(
+                "UPDATE control SET session_id=?1 WHERE singleton=1",
+                [&session],
+            )
+            .unwrap();
+        service.lifecycle = Some(pytest);
+        assert_eq!(service.status().unwrap_err(), DemoError::NeedsInspection);
+        assert_eq!(
+            service.lifecycle.as_ref().unwrap().snapshot().unwrap(),
+            before
+        );
+        service.lifecycle = None;
+        // The legacy reopen entry point cannot discover the distinct corpus root.
+        assert_eq!(service.status().unwrap_err(), DemoError::FixtureUnavailable);
+        assert!(service.lifecycle.is_none());
+        let (_, after) =
+            FixtureLifecycle::reopen_pytest_corpus(dir.path(), before.session_id).unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

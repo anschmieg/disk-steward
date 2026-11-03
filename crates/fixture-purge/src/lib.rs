@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use disk_steward_core::{PlanId, ReceiptId, ReviewId, RevisionId, SessionId, SupportedOperation};
-use disk_steward_fixture_lifecycle::{FixtureLifecycle, FixtureStatus, PurgeItemOutcome};
+use disk_steward_fixture_lifecycle::{
+    FixtureLifecycle, FixtureProfile, FixtureStatus, PurgeItemOutcome,
+};
 use disk_steward_review_plan::ReviewPlanStore;
 
 const CONTROL_DB: &str = "fixture-purge-control-v1.sqlite3";
@@ -238,6 +240,9 @@ impl FixturePurgeService {
         expected_revision: RevisionId,
         targets: Vec<PurgeTarget>,
     ) -> Result<PreparedPurgeReview, PurgeError> {
+        if lifecycle.profile() != FixtureProfile::SyntheticV1 {
+            return Err(PurgeError::UnsupportedSchema);
+        }
         if targets.is_empty() || targets.len() > MAX_TARGETS {
             return Err(PurgeError::InvalidInput);
         }
@@ -398,6 +403,9 @@ impl FixturePurgeService {
         plan: &ReviewPlanStore,
         prepared: &PreparedPurgeReview,
     ) -> Result<(), PurgeError> {
+        if lifecycle.profile() != FixtureProfile::SyntheticV1 {
+            return Err(PurgeError::UnsupportedSchema);
+        }
         let plan_view = plan.get_plan().map_err(|_| PurgeError::StaleRevision)?;
         if plan_view.plan_id != prepared.plan_id || plan_view.revision_id != prepared.revision_id {
             return Err(PurgeError::StaleRevision);
@@ -844,6 +852,9 @@ fn validate_claimed_execution(
     attempts: &[disk_steward_core::AttemptId],
     now: i64,
 ) -> Result<(), PurgeError> {
+    if lifecycle.profile() != FixtureProfile::SyntheticV1 {
+        return Err(PurgeError::UnsupportedSchema);
+    }
     if attempts.is_empty()
         || attempts.len() > MAX_TARGETS
         || attempts.len() != prepared.targets.len()
@@ -1421,6 +1432,47 @@ mod tests {
 
     fn fixed_clock(now: i64) -> Box<dyn Fn() -> i64 + Send + Sync> {
         Box::new(move || now)
+    }
+
+    #[test]
+    fn synthetic_purge_adapter_refuses_pytest_profile_before_claim_or_mutation() {
+        let (dir, _) = demo_root();
+        let now = 1_700_000_000_000;
+        let (mut service, mut synthetic, plan, targets, view) =
+            service_with_staged(dir.path(), 1, fixed_clock(now));
+        let prepared = service
+            .prepare_purge_review(&mut synthetic, &plan, view.revision_id, targets.clone())
+            .unwrap();
+        let ids = [view.actions[0].id, view.actions[1].id];
+        let (mut pytest, before) = FixtureLifecycle::create_pytest_corpus(dir.path(), ids).unwrap();
+        assert!(matches!(
+            service.prepare_purge_review(&mut pytest, &plan, view.revision_id, targets),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let rows: i64 = service
+            .control
+            .query_row("SELECT count(*) FROM purge_reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(matches!(
+            service.revalidate(&pytest, &plan, &prepared),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        assert!(matches!(
+            service.execute_claimed_batch(
+                &mut pytest,
+                disk_steward_core::ExecutionId::new(),
+                &prepared,
+                vec![disk_steward_core::AttemptId::new()]
+            ),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        assert_eq!(
+            service.read_stored_review(&prepared.review_id).unwrap(),
+            prepared
+        );
+        assert_eq!(pytest.snapshot().unwrap(), before);
+        assert!(!service.has_uncertainty().unwrap());
     }
 
     #[test]
