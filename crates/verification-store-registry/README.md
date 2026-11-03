@@ -10,7 +10,12 @@ private regular database file (or creates the database with private mode). A
 nonblocking process lease prevents simultaneous registry owners. On every
 successful open, unfinished records are classified as
 `needs_reconciliation`; this crate never retries work or declares it complete.
-Reconciliation is intentionally outside this M0 API.
+Reconciliation is intentionally outside this M0 API. The lease guard explicitly
+unlocks after the SQLite connection closes, so a briefly inherited or duplicated
+file descriptor cannot extend normal owner-drop lifetime. Closing such an old
+duplicate cannot unlock a subsequent owner's independently opened lease. If
+unlocking fails, ordinary close remains the fallback and acquisition still
+fails closed; no retry or ownership bypass is introduced.
 
 Supported filesystem enforcement is limited to Linux and macOS. Other targets
 are refused. Paths must come from a trusted backend; this is not a renderer API.

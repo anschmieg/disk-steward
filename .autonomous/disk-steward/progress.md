@@ -1000,3 +1000,46 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR68 integrates updated67 head29eb882; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
 
 2026-11-03 PR69 integrates updated68 head0b4ef7f; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+2026-11-03 PR48 head89fd136 merged to main e44957e after four current-head build/test successes/no blocking findings; unwatch48. PR49 retargeted main, verified48 ancestor and main-vs48 transport source identical, retained reviewed49 source for squash conflicts. All dated progress preserved; fresh49 CI required.
+
+2026-11-03 PR49 head52e858e merged to main9635f78 after four current-head build/test successes/no blocking findings; unwatch49. PR50 retargeted main, verified49 ancestor and main-vs49 transport/budget source identical; retained reviewed50 source for squash integration. All dated progress preserved; fresh50 CI required.
+
+2026-11-03 PR51 integrates updated50 head935ec0e/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR52 integrates updated51 head11e87bd/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR53 integrates updated52 head544e563/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR54 integrates updated53 headf1934d1/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR55 integrates updated54 headbe2cddd/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR56 integrates updated55 headf1056e3/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR57 integrates updated56 head14cef45/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR58 integrates updated57 headca97aa9/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR59 integrates updated58 head31cc1fd/main9635f78; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR59 Ubuntu failure head256eb42/run41552842612/job125644432229: direct completed-job log (run still in progress so gh run log unavailable) shows github-transport unreconciled_registry_refuses_payload_creation final reopen atline685 failed LeaseHeld;82transport tests passed. Existing lease relied on final descriptor close; Linux flock manual confirms duplicate/fork descriptors share open-file-description lock until explicit unlock or all closes. Deterministic owner-drop-with-duplicate regression reproduced LeaseHeld locally BEFORE fix. RegistryLease guard now explicitly Unlocks after connection field drops (field order), also wraps acquired lease before fallible initialization so failure paths release; unlock failure retains close fallback/fail-closed acquisition. Test verifies live-owner exclusion, immediate reopen with old duplicate alive, and old duplicate close cannot unlock new owner. This reproduces a mechanism consistent with concurrent spawn inheritance, not direct proof of runner scheduling. Final19registry unit+2process-death parent+83transport tests PASS (ignored exact children run by parents),32worker unit+10supervision PASS, strict registry/transport Clippy/fmt/version0.0.17/diff PASS. Initial worker test command used directory name rather than packageID and was corrected to disk-steward-worker-probe; no implementation failure. No retry/poll/safety relaxation/dependency change/user data mutation. Current66 local notes targeted-stashed/preserved; fresh Linux/current59 CI required, host5.1GiB free/automation enabled.
+
+2026-11-03 PR60 integrates updated59 headd268fa6 including explicit registry lease release regression fix; append-only progress conflict/all dated entries retained, registry source/docs merge cleanly. Required registry/transport validation before push and fresh current-head CI; existing watch persists.
+
+2026-11-03 PR61 Ubuntu failure e20e0a2/run41552896382/job125644614176: direct job log confirms same final registry reopen LeaseHeld in unreconciled_registry_refuses_payload_creation,88transport tests passed. Integrated60 head4c53970 carrying deterministic duplicate-descriptor lease fix59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh Linux CI required/existing watch persists.
+
+2026-11-03 PR62 Ubuntu failure1610f17/run41553569408/job125646842569: direct log confirms same registry final reopen LeaseHeld in unreconciled_registry_refuses_payload_creation,92transport tests passed. Integrated61 head7942e04 carrying deterministic duplicate-descriptor lease repair59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh Linux CI required/existing watch persists.
+
+2026-11-03 PR63 integrates updated62 headd4b9092 carrying explicit registry lease repair59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR64 integrates updated63 head98e4a67 carrying explicit registry lease repair59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR65 integrates updated64 head7edc509 carrying explicit registry lease repair59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR66 integrates updated65 headcad77a7 carrying explicit registry lease repair59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR67 integrates updated66 head8220adb carrying explicit registry lease repair59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR68 integrates updated67 head1536810 carrying explicit registry lease repair59d268fa6; append-only progress conflict/all dated entries preserved/registry source merges cleanly. Required registry/transport validation before push/fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR69 integrates updated68 heada3070af including registry lease guard fix. Append-only progress conflict resolved preserving every dated entry; tag/transport source unchanged.127transport+19registry unit+2registry process-death parent tests PASS, strict all-target registry/transport Clippy/fmt/version0.0.17/diff PASS on macOS. No fresh Linux fix claim; current-head CI remains required and existing watch persists. No milestone or cleanup scope changes.
