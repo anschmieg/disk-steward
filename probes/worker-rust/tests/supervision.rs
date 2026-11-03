@@ -216,3 +216,41 @@ fn fixed_payload_command_caps_writes_and_rejects_extra_authority() {
     assert_eq!(String::from_utf8(output.stdout).unwrap(),
         "payload_written=32768 payload_limit=32768 cap_reached=true state=NeedsReconciliation cleanup=not_authorized\n");
 }
+
+#[test]
+fn fixed_worker_launches_discard_parent_environment() {
+    const SENTINEL: &str = "DISK_STEWARD_WORKER_ENV_SENTINEL";
+    // Negative control proves the private child actually detects inheritance;
+    // the sentinel value must never be copied into diagnostics.
+    let direct = probe()
+        .args(["--child", "stall"])
+        .env(SENTINEL, "synthetic-parent-only-value")
+        .output()
+        .expect("run inheritance negative control");
+    assert!(!direct.status.success());
+    assert!(direct.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&direct.stderr).contains("synthetic-parent-only-value"));
+    for flag in [
+        "--run",
+        "--run-store-worker",
+        "--run-store-reinspect",
+        "--run-indexed-store-worker",
+    ] {
+        let output = probe()
+            .arg(flag)
+            .env(SENTINEL, "synthetic-parent-only-value")
+            .output()
+            .expect("run environment-cleared fixed parent");
+        assert!(
+            output.status.success(),
+            "{flag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("reader_joined=true") || stdout.contains("worker_joined=true"),
+            "{flag}: {stdout}"
+        );
+        assert!(!stdout.contains("synthetic-parent-only-value"));
+    }
+}

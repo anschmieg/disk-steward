@@ -191,6 +191,7 @@ fn run_indexed_store_worker() -> Result<(), String> {
     }
     let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(exe)
+        .env_clear()
         .arg("--child")
         .arg("stall")
         .stdin(Stdio::null())
@@ -308,6 +309,7 @@ fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
     let mut store = store::OwnedStore::create().map_err(|e| format!("create owned store: {e}"))?;
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
+        .env_clear()
         .arg("--child")
         .arg("stall")
         .stdin(Stdio::null())
@@ -395,6 +397,10 @@ fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
+    // Fixed probe check for the closed launch boundary; this is not process isolation.
+    if env::var_os("DISK_STEWARD_WORKER_ENV_SENTINEL").is_some() {
+        return Err("child environment sentinel present".into());
+    }
     match args {
         [mode] if mode == "flood" => {
             let mut stdout = io::stdout().lock();
@@ -442,6 +448,7 @@ fn run_store_reinspect() -> Result<(), String> {
     let deadline = start + OUTER_DEADLINE;
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let mut child = Command::new(exe)
+        .env_clear()
         .arg("--child")
         .arg("store-abandon")
         .stdin(Stdio::null())
@@ -559,6 +566,7 @@ fn supervise(case: Case) -> Result<Report, String> {
     let deadline = start + OUTER_DEADLINE;
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
+        .env_clear()
         .arg("--child")
         .arg(case.child_mode())
         .stdin(Stdio::null())
