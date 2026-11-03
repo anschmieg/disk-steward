@@ -4113,12 +4113,19 @@ mod tests {
 
     #[test]
     fn outer_deadline_stops_actual_candidate_tls_handshake() {
+        assert_outer_deadline_stops_child(
+            "tests::candidate_tls_blocked_handshake_child",
+            OUTER_CHILD_READY,
+        );
+    }
+
+    fn assert_outer_deadline_stops_child(exact_test: &'static str, ready_marker: &'static [u8]) {
         let executable = std::env::current_exe().expect("current test executable");
         let outer_deadline = Instant::now() + Duration::from_secs(3);
         let mut child = Command::new(executable)
             .arg("--ignored")
             .arg("--exact")
-            .arg("tests::candidate_tls_blocked_handshake_child")
+            .arg(exact_test)
             .arg("--nocapture")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -4155,7 +4162,7 @@ mod tests {
                         Ok(_) => {
                             captured[used] = byte[0];
                             used += 1;
-                            if !matched && captured[..used].ends_with(OUTER_CHILD_READY) {
+                            if !matched && captured[..used].ends_with(ready_marker) {
                                 matched = true;
                                 let _ = tx.send(OutputEvent::Ready);
                             }
@@ -4207,7 +4214,7 @@ mod tests {
 
         assert!(
             ready,
-            "child did not validate and report the real TLS GET: {readiness:?}"
+            "child did not validate and report the expected blocked stage: {readiness:?}"
         );
         assert!(
             matches!(before_stop, Ok(None)),
