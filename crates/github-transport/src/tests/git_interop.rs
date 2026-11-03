@@ -450,6 +450,7 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let fetch_transport = candidate_transport(fetch_repository, &tls, address);
     let mut pack_sink = BudgetFileSink::new(&root, fetch_transport.cancellation_handle()).unwrap();
+    let inspection_repo = repo.clone();
     let expected_commit = commit.clone();
     let expected_tag = tag_object.clone();
     let server = thread::spawn(move || -> io::Result<PrivateRoot> {
@@ -535,6 +536,29 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     assert_eq!(checksum.version(), 2);
     assert_eq!(checksum.declared_object_count(), 4);
     assert_eq!(checksum.checksum().as_slice(), &pack[pack.len() - 20..]);
+    let entry = parse_sha1_pack_entry_header(&pack[12..], 12, 512).unwrap();
+    let first_object = match entry.kind() {
+        PackEntryKind::Commit => &commit,
+        PackEntryKind::Tree => &tree,
+        PackEntryKind::Blob => &blob,
+        PackEntryKind::Tag => &tag_object,
+        _ => panic!("first fixture object cannot have a delta base"),
+    };
+    let object_size = checked_git(
+        &root,
+        &["-C", &inspection_repo, "cat-file", "-s", first_object],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(
+        entry.inflated_bytes(),
+        std::str::from_utf8(&object_size)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    );
+    assert!(entry.header_bytes() <= 10);
     let mut damaged_pack = pack.clone();
     *damaged_pack.last_mut().unwrap() ^= 1;
     assert!(check_sha1_pack_checksum(
