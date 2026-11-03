@@ -1,6 +1,8 @@
 //! Rebuilds a page cursor from a private, explicit checkpoint without storing a source path.
 
 #[cfg(unix)]
+use super::checkpoint_prefix::CheckpointPrefix;
+#[cfg(unix)]
 use super::checkpoint_store::{Payload, RootStamp};
 #[cfg(unix)]
 use super::{
@@ -43,19 +45,37 @@ pub(super) fn capture(
         .last()
         .ok_or("Folder observation is unavailable. Choose a folder again.")?;
     let entries_seen = cursor.entries_seen;
+    let replay_names = match cursor.replay_prefix.names() {
+        Some(names) => names,
+        None => {
+            return Err(match cursor.replay_prefix.blocker() {
+                Some("invalid_component") => {
+                    "A folder name cannot be represented safely in a checkpoint. Continue browsing; this page cannot be saved."
+                }
+                Some("allocation_limit") => {
+                    "Checkpoint tracking could not retain the bounded page prefix. Continue browsing; this page cannot be saved."
+                }
+                Some(_) => {
+                    "The page prefix exceeds the checkpoint budget. Continue browsing; this page cannot be saved."
+                }
+                None => "The page prefix is unavailable for checkpointing.",
+            });
+        }
+    };
     if !session.snapshot.can_continue
+        || !session.snapshot.can_checkpoint
         || session.snapshot.page_number != cursor.page_number
         || session.snapshot.entries_seen != entries_seen.to_string()
         || cursor.identity != frame.identity
         || !(1..MAX_PAGES_PER_DIRECTORY).contains(&cursor.page_number)
         || entries_seen == 0
         || entries_seen > MAX_CHECKPOINT_NAMES as u64
-        || cursor.replay_names.len() != entries_seen as usize
-        || cursor.replay_names.len() > MAX_CHECKPOINT_NAMES
+        || replay_names.len() != entries_seen as usize
+        || replay_names.len() > MAX_CHECKPOINT_NAMES
     {
         return Err("Folder paging state cannot be checkpointed safely.");
     }
-    validate_replay_names(&cursor.replay_names)?;
+    validate_replay_names(replay_names)?;
     let before = fstat(&frame.fd).map_err(|_| "Folder observation changed. Inspect it again.")?;
     if started.elapsed() >= MAX_DURATION
         || identity(&before) != frame.identity
@@ -80,7 +100,7 @@ pub(super) fn capture(
         entries_seen,
         root_stamp,
         exclusion_revision,
-        replay_names: cursor.replay_names.clone(),
+        replay_names: replay_names.to_vec(),
     })
 }
 
@@ -164,7 +184,7 @@ pub(super) fn resume(
         identity: frame.identity,
         page_number: payload.page_number,
         entries_seen: payload.entries_seen,
-        replay_names: payload.replay_names.clone(),
+        replay_prefix: CheckpointPrefix::from_names(payload.replay_names.clone())?,
     };
     let root_device = session.root_device;
     let root_label = frame.label.clone();
