@@ -87,6 +87,354 @@ pub(super) fn validate_stdin() -> Result<(), StoreError> {
     validate_root_descriptor(&stdin)
 }
 
+/// Run the single fixed payload operation against the validated stdin
+/// directory capability. The child's path is never reconstructed.
+pub(super) fn write_stdin_payload() -> Result<super::payload::PayloadReport, StoreError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::AsFd;
+        let stdin = std::io::stdin();
+        let descriptor = rustix::io::dup(stdin.as_fd())?;
+        let root = File::from(descriptor);
+        write_payload_from_root(&root)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_payload_from_root(root: &File) -> Result<super::payload::PayloadReport, StoreError> {
+    validate_root_descriptor(root)?;
+    let binding = capture_bound_journal(root)?;
+    super::payload::write_worker_payload(root, |has_payload, payload_id| {
+        verify_bound_root(root, &binding, has_payload, payload_id)
+    })
+}
+
+/// Inspect the fixed payload only after this exact worker has been stopped.
+pub(super) fn inspect_stopped_worker_payload(
+    store: &OwnedStore,
+    receipt: &crate::StopReceipt,
+) -> Result<super::WorkerPayloadObservation, StoreError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !store.worker_stdin_issued
+            || store.poisoned
+            || store.cleanup_started
+            || receipt.pid() == 0
+            || receipt.token() != store.token
+            || store.phase != Phase::Stopped(receipt.pid())
+        {
+            return Err(StoreError::InvalidJournal);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        store.inspect_state()?;
+        verify_owned_stopped_root(store)?;
+        check_readback_deadline(deadline)?;
+        let fd = open_payload(&store.root)?;
+        let before = fd.metadata()?;
+        super::payload::validate_payload_metadata(&before, None, super::payload::LIMIT)?;
+        let payload_id = (before.dev(), before.ino());
+        let high_water = super::payload::payload_high_water_from_metadata(&before)?;
+        let before_stamp = PayloadStamp::from(&before);
+        verify_owned_stopped_root(store)?;
+        read_and_verify_payload(&fd, deadline)?;
+        let after = fd.metadata()?;
+        super::payload::validate_payload_metadata(&after, Some(payload_id), super::payload::LIMIT)?;
+        if PayloadStamp::from(&after) != before_stamp {
+            return Err(StoreError::InvalidIdentity);
+        }
+        let named = open_payload(&store.root)?;
+        let named_metadata = named.metadata()?;
+        super::payload::validate_payload_metadata(
+            &named_metadata,
+            Some(payload_id),
+            super::payload::LIMIT,
+        )?;
+        if PayloadStamp::from(&named_metadata) != before_stamp {
+            return Err(StoreError::InvalidIdentity);
+        }
+        verify_owned_stopped_root(store)?;
+        store.inspect_state()?;
+        if PayloadStamp::from(&fd.metadata()?) != before_stamp {
+            return Err(StoreError::InvalidIdentity);
+        }
+        check_readback_deadline(deadline)?;
+        Ok(super::WorkerPayloadObservation {
+            written_bytes: super::payload::LIMIT,
+            high_water_bytes: high_water,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (store, receipt);
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct BoundJournal {
+    root_id: (u64, u64),
+    journal_id: (u64, u64),
+    bytes: Vec<u8>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn capture_bound_journal(root: &File) -> Result<BoundJournal, StoreError> {
+    let root_id = validate_worker_root(root)?;
+    super::require_entries(root, &["owner.journal"])?;
+    let (journal_id, bytes) = read_named_journal(root)?;
+    if parse_journal_prefix(&bytes, root_id, std::process::id())? != JournalState::Bound {
+        return Err(StoreError::InvalidJournal);
+    }
+    super::require_entries(root, &["owner.journal"])?;
+    Ok(BoundJournal {
+        root_id,
+        journal_id,
+        bytes,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_bound_root(
+    root: &File,
+    binding: &BoundJournal,
+    has_payload: bool,
+    payload_id: Option<(u64, u64)>,
+) -> Result<(), StoreError> {
+    if validate_worker_root(root)? != binding.root_id {
+        return Err(StoreError::InvalidIdentity);
+    }
+    let expected = if has_payload {
+        &["owner.journal", super::payload::NAME][..]
+    } else {
+        &["owner.journal"][..]
+    };
+    super::require_entries(root, expected)?;
+    let (journal_id, bytes) = read_named_journal(root)?;
+    if journal_id != binding.journal_id || bytes != binding.bytes {
+        return Err(StoreError::InvalidJournal);
+    }
+    if parse_journal_prefix(&bytes, binding.root_id, std::process::id())? != JournalState::Bound {
+        return Err(StoreError::InvalidJournal);
+    }
+    match (has_payload, payload_id) {
+        (false, None) => Ok(()),
+        (true, Some(expected_id)) => {
+            let payload = open_payload(root)?;
+            let metadata = payload.metadata()?;
+            super::payload::validate_payload_metadata(
+                &metadata,
+                Some(expected_id),
+                metadata.len(),
+            )?;
+            if super::identity(&payload)? != expected_id {
+                return Err(StoreError::InvalidIdentity);
+            }
+            Ok(())
+        }
+        _ => Err(StoreError::InvalidIdentity),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_worker_root(root: &File) -> Result<(u64, u64), StoreError> {
+    super::validate_private_directory(root)?;
+    let stat = rustix::fs::fstat(root)?;
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(StoreError::InvalidIdentity);
+    }
+    super::identity(root)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_named_journal(root: &File) -> Result<((u64, u64), Vec<u8>), StoreError> {
+    use rustix::fs::{openat, OFlags};
+    let descriptor = openat(
+        root,
+        "owner.journal",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let mut journal = File::from(descriptor);
+    let before = journal.metadata()?;
+    validate_journal_metadata(&before)?;
+    let journal_id = (before.dev(), before.ino());
+    let bytes = read_bounded_marker(&mut journal)?;
+    let after = journal.metadata()?;
+    validate_journal_metadata(&after)?;
+    if (after.dev(), after.ino()) != journal_id || bytes.len() > JOURNAL_LIMIT {
+        return Err(StoreError::InvalidJournal);
+    }
+    let named_bytes = read_named_marker_contents(root, journal_id)?;
+    if named_bytes != bytes {
+        return Err(StoreError::InvalidJournal);
+    }
+    Ok((journal_id, bytes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_named_marker_contents(root: &File, expected_id: (u64, u64)) -> Result<Vec<u8>, StoreError> {
+    use rustix::fs::{openat, OFlags};
+    let descriptor = openat(
+        root,
+        "owner.journal",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let mut named = File::from(descriptor);
+    let before = named.metadata()?;
+    validate_journal_metadata(&before)?;
+    if (before.dev(), before.ino()) != expected_id {
+        return Err(StoreError::InvalidJournal);
+    }
+    let bytes = read_bounded_marker(&mut named)?;
+    let after = named.metadata()?;
+    validate_journal_metadata(&after)?;
+    if (after.dev(), after.ino()) != expected_id
+        || bytes.len() > JOURNAL_LIMIT
+        || super::identity(&named)? != expected_id
+    {
+        return Err(StoreError::InvalidJournal);
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_payload(root: &File) -> Result<File, StoreError> {
+    use rustix::fs::{openat, OFlags};
+    Ok(File::from(openat(
+        root,
+        super::payload::NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_owned_stopped_root(store: &OwnedStore) -> Result<(), StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    if validate_worker_root(&store.root)? != store.root_id {
+        return Err(StoreError::InvalidIdentity);
+    }
+    super::require_entries(&store.root, &["owner.journal", super::payload::NAME])?;
+    let (journal_id, bytes) = read_named_journal(&store.root)?;
+    if Some(journal_id) != store.journal_id || bytes != store.journal_contents().as_bytes() {
+        return Err(StoreError::InvalidJournal);
+    }
+    let metadata = open_payload(&store.root)?.metadata()?;
+    super::payload::validate_payload_metadata(&metadata, None, super::payload::LIMIT)?;
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(StoreError::InvalidIdentity);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PayloadStamp {
+    id: (u64, u64),
+    len: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    blocks: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl From<&std::fs::Metadata> for PayloadStamp {
+    fn from(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            id: (metadata.dev(), metadata.ino()),
+            len: metadata.len(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            uid: metadata.uid(),
+            blocks: metadata.blocks(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_readback_deadline(deadline: Instant) -> Result<(), StoreError> {
+    if Instant::now() >= deadline {
+        return Err(StoreError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "worker payload readback deadline",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_and_verify_payload(file: &File, deadline: Instant) -> Result<(), StoreError> {
+    use std::os::unix::fs::FileExt;
+    let mut buffer = [0u8; 4096];
+    let mut offset = 0u64;
+    let mut interruptions = 0;
+    while offset < super::payload::LIMIT {
+        let want = (super::payload::LIMIT - offset).min(buffer.len() as u64) as usize;
+        let mut got = 0usize;
+        while got < want {
+            check_readback_deadline(deadline)?;
+            let read = file.read_at(&mut buffer[got..want], offset + got as u64);
+            check_readback_deadline(deadline)?;
+            match read {
+                Ok(0) => return Err(StoreError::InvalidIdentity),
+                Ok(count) => {
+                    got += count;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    interruptions += 1;
+                    if interruptions > 16 {
+                        return Err(StoreError::Io(error));
+                    }
+                }
+                Err(error) => return Err(StoreError::Io(error)),
+            }
+        }
+        for (index, byte) in buffer[..want].iter().enumerate() {
+            let absolute = offset + index as u64;
+            let expected = (((absolute as usize).wrapping_mul(31) + 17) % 251 + 1) as u8;
+            if *byte != expected {
+                return Err(StoreError::InvalidIdentity);
+            }
+        }
+        offset += want as u64;
+    }
+    let mut eof_probe = [0u8; 1];
+    loop {
+        check_readback_deadline(deadline)?;
+        let read = file.read_at(&mut eof_probe, super::payload::LIMIT);
+        check_readback_deadline(deadline)?;
+        match read {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(StoreError::InvalidIdentity),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                interruptions += 1;
+                if interruptions > 16 {
+                    return Err(StoreError::Io(error));
+                }
+            }
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn validate_stdin() -> Result<(), StoreError> {
     Err(StoreError::UnsupportedPlatform)
@@ -538,5 +886,90 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&marker).unwrap(), before);
         assert_eq!(store.phase, Phase::Created);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fixed_payload_writer_refuses_wrong_binding_before_creation() {
+        let pid = std::process::id();
+        let foreign_pid = if pid == u32::MAX { pid - 1 } else { pid + 1 };
+        let mut wrong_pid = OwnedStore::create().unwrap();
+        wrong_pid.bind_worker(foreign_pid).unwrap();
+        assert!(write_payload_from_root(&wrong_pid.root).is_err());
+        super::super::require_entries(&wrong_pid.root, &["owner.journal"]).unwrap();
+
+        let wrong_root = OwnedStore::create().unwrap();
+        let foreign_root = (wrong_root.root_id.0.wrapping_add(1), wrong_root.root_id.1);
+        std::fs::write(
+            wrong_root.parent_path.join("store/owner.journal"),
+            format!(
+                "disk-steward-worker-store-v1\n{}\n{}:{}\n{}:{}\nbound:{pid}\n",
+                wrong_root.token,
+                wrong_root.parent_id.0,
+                wrong_root.parent_id.1,
+                foreign_root.0,
+                foreign_root.1
+            ),
+        )
+        .unwrap();
+        assert!(write_payload_from_root(&wrong_root.root).is_err());
+        super::super::require_entries(&wrong_root.root, &["owner.journal"]).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fixed_payload_writer_refuses_a_second_attempt_without_changing_file() {
+        let mut store = OwnedStore::create().unwrap();
+        let descriptor = store.worker_stdin_once().unwrap();
+        store.bind_worker(std::process::id()).unwrap();
+        let first = write_payload_from_root(&descriptor).unwrap();
+        assert_eq!(first.written_bytes, super::super::payload::LIMIT);
+        let path = store
+            .parent_path
+            .join("store")
+            .join(super::super::payload::NAME);
+        let before = std::fs::read(&path).unwrap();
+        assert!(write_payload_from_root(&descriptor).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn stopped_payload_inspection_requires_receipt_and_refuses_changed_file() {
+        let mut store = OwnedStore::create().unwrap();
+        let descriptor = store.worker_stdin_once().unwrap();
+        let pid = std::process::id();
+        store.bind_worker(pid).unwrap();
+        write_payload_from_root(&descriptor).unwrap();
+        let receipt = crate::StopReceipt::confirmed(store.token(), pid);
+        assert!(store.inspect_stopped_worker_payload(&receipt).is_err());
+        store.record_stopped(&receipt).unwrap();
+        let file = open_payload(&store.root).unwrap();
+        assert!(matches!(
+            read_and_verify_payload(&file, Instant::now()),
+            Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        let wrong_token = crate::StopReceipt::confirmed("other-token", pid);
+        assert!(store.inspect_stopped_worker_payload(&wrong_token).is_err());
+        let observation = store.inspect_stopped_worker_payload(&receipt).unwrap();
+        assert_eq!(observation.written_bytes, super::super::payload::LIMIT);
+        assert!(observation.high_water_bytes >= observation.written_bytes);
+
+        let wrong_pid = if pid == u32::MAX { pid - 1 } else { pid + 1 };
+        let wrong_receipt = crate::StopReceipt::confirmed(store.token(), wrong_pid);
+        assert!(store
+            .inspect_stopped_worker_payload(&wrong_receipt)
+            .is_err());
+
+        let path = store
+            .parent_path
+            .join("store")
+            .join(super::super::payload::NAME);
+        let mut corrupt = std::fs::read(&path).unwrap();
+        corrupt[100] ^= 0x5a;
+        std::fs::write(&path, &corrupt).unwrap();
+        assert!(store.inspect_stopped_worker_payload(&receipt).is_err());
+        std::fs::write(&path, b"short").unwrap();
+        assert!(store.inspect_stopped_worker_payload(&receipt).is_err());
     }
 }

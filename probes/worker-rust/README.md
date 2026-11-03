@@ -203,3 +203,33 @@ hard latency under OS stalls, atomicity against same-user interference, power-lo
 durability or production verification ownership. Linux/macOS paths are supported
 by the probe; this change was locally exercised on macOS arm64 and still needs
 current-head cross-platform CI.
+
+## Fixed payload through the worker descriptor
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-payload`
+adds a separate fixed synthetic write to the directory handoff. The parent
+commits the same 128 KiB identity-bound reservation before launch. The child
+validates its bound directory capability, then writes only `payload.bin` with
+the existing deterministic 32 KiB generator through the shared accounting core.
+That core preserves native free-space sampling, the 2 GiB reserve plus 1 MiB
+headroom, admission checks, allocation-aware high-water charges, partial-write
+accounting, exclusive no-follow creation, identity checks and synchronization.
+The original in-process payload mode uses that same core.
+
+Readiness requires the full fixed write. After exact child shutdown and reader
+join, the parent requires the matching stop receipt and stopped journal before
+readback. It checks all bytes through a held descriptor, exact file metadata,
+size and identity, named-file identity and metadata, EOF, and final unchanged
+metadata. Readback has a cooperative one-second deadline and bounded reads and
+interruptions. The report requires payload high-water usage within the committed
+reservation; reopening the registry must still yield reconciliation-required
+state with the reservation retained. Neither success nor failure deletes the
+payload or authorizes cleanup.
+
+The command accepts no path, data, FD number, endpoint, credential or cleanup
+argument. Missing/wrong capabilities, repeat writes, changed journals/files and
+unconfirmed worker stop refuse acceptance. This is synthetic worker/store
+composition only: no Git transfer, durable byte receipt, directory/index
+footprint accounting, OS hard latency/process-tree/RSS guarantee, private
+authentication, atomicity against same-user interference or milestone completion
+is established. Current-head platform CI remains required.
