@@ -72,6 +72,10 @@ pub fn run() {
             app.manage(general_plan::GeneralPlanState::open(app.handle()));
             app.manage(global_exclusions::ExclusionState::open(app.handle()));
             app.manage(folder_inventory::FolderInventoryState::default());
+            #[cfg(unix)]
+            app.manage(
+                folder_inventory::checkpoint_commands::FolderCheckpointState::open(app.handle()),
+            );
             app.manage(summary_control::SummaryControlState::default());
             Ok(())
         })
@@ -82,6 +86,10 @@ pub fn run() {
             folder_inventory::navigate_folder_inventory,
             folder_inventory::continue_folder_inventory,
             folder_inventory::refresh_folder_inventory,
+            folder_inventory::checkpoint_commands::get_folder_checkpoint,
+            folder_inventory::checkpoint_commands::save_folder_checkpoint,
+            folder_inventory::checkpoint_commands::resume_folder_checkpoint,
+            folder_inventory::checkpoint_commands::clear_folder_checkpoint,
             folder_inventory::clear_folder_inventory,
             folder_inventory::inspect_folder_tree_summary,
             folder_inventory::cancel_folder_tree_summary,

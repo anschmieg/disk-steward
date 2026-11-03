@@ -760,3 +760,120 @@ test("failed refresh preserves historical page, filter and selected evidence, wi
   expect(refresh).toBeEnabled();
   expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
 });
+
+const savedCheckpoint = {
+  checkpointId: "checkpoint-1",
+  rootLabel: "Chosen folder",
+  pageNumber: 1,
+  entriesSeen: "3",
+};
+
+test("checkpoint save is explicit, compares existing revision and leaves the current page unchanged", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce(savedCheckpoint)
+    .mockResolvedValueOnce({
+      ...savedCheckpoint,
+      checkpointId: "checkpoint-2",
+    });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  expect(invoke).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  expect(invoke).toHaveBeenCalledTimes(1);
+  const before = screen.getByRole("table").textContent;
+  fireEvent.click(
+    screen.getByRole("button", { name: "Save folder checkpoint" }),
+  );
+  await screen.findByText(/Folder checkpoint saved locally/);
+  expect(invoke).toHaveBeenNthCalledWith(2, "get_folder_checkpoint");
+  expect(invoke).toHaveBeenNthCalledWith(3, "save_folder_checkpoint", {
+    request: {
+      expectedObservationId: "observation-1",
+      expectedCheckpointId: "checkpoint-1",
+    },
+  });
+  expect(screen.getByRole("table").textContent).toBe(before);
+  expect(
+    screen.getByRole("region", { name: "Saved folder checkpoint" }),
+  ).toHaveTextContent("page 1");
+});
+
+test("resume loads only the typed checkpoint and updates scope only after native success", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(savedCheckpoint)
+    .mockResolvedValueOnce({
+      ...sample,
+      observationId: "resumed",
+      pageNumber: 2,
+    });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Resume saved folder scan" }),
+  );
+  await screen.findByText(/Resumed at the page after the saved checkpoint/);
+  expect(invoke).toHaveBeenNthCalledWith(2, "resume_folder_checkpoint", {
+    request: { expectedCheckpointId: "checkpoint-1" },
+  });
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+  expect(screen.getByRole("heading", { name: "Chosen folder" })).toHaveFocus();
+});
+
+test("canceled resume and failed checkpoint operations preserve historical page and saved checkpoint", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce(savedCheckpoint)
+    .mockResolvedValueOnce(null)
+    .mockRejectedValueOnce(new Error("private checkpoint path"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "Alpha" },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Resume saved folder scan" }),
+  );
+  await screen.findByText(/Resume selection canceled/);
+  expect(screen.getByRole("searchbox")).toHaveValue("Alpha");
+  fireEvent.click(
+    screen.getByRole("button", { name: "Forget saved checkpoint" }),
+  );
+  await screen.findByText(
+    /checkpoint operation could not be verified reliably/,
+  );
+  expect(invoke).toHaveBeenLastCalledWith("clear_folder_checkpoint", {
+    request: { expectedCheckpointId: "checkpoint-1" },
+  });
+  expect(
+    screen.getByRole("region", { name: "Saved folder checkpoint" }),
+  ).toBeVisible();
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+  expect(screen.queryByText(/private checkpoint path/)).not.toBeInTheDocument();
+});
+
+test("successful forgetting clears only checkpoint UI while completed pages cannot be saved", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce({ ...sample, canContinue: false })
+    .mockResolvedValueOnce(savedCheckpoint)
+    .mockResolvedValueOnce(null)
+    .mockResolvedValueOnce(undefined);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  expect(
+    screen.getByRole("button", { name: "Save folder checkpoint" }),
+  ).toBeDisabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Resume saved folder scan" }),
+  );
+  await screen.findByText(/Resume selection canceled/);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Forget saved checkpoint" }),
+  );
+  await screen.findByText(/Saved checkpoint forgotten/);
+  expect(
+    screen.queryByRole("region", { name: "Saved folder checkpoint" }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+});
