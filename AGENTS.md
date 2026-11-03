@@ -7,3 +7,13 @@
 - The product investigates storage and builds editable, evidence-backed cleanup plans. No unattended destructive actions or execution based solely on model confidence.
 - No generic renderer filesystem, shell, SQL, credential, or execution access. Do not implement real cleanup outside a validated milestone's scope.
 - Run appropriate formatting, type, build, and behavioral checks. Record failures and unverified platform claims honestly.
+
+## Durable progress merges
+
+`.autonomous/disk-steward/progress.md` is an append-only evidence log. Its exact
+path uses Git's built-in union merge driver to retain concurrent additions.
+After merging, verify that all dated entries from both parent versions remain
+and append an explicit current branch/head checkpoint. Union output can reorder
+or duplicate entries: line order alone never establishes the active checkpoint.
+Review edits or removals of existing evidence manually; this driver does not
+resolve contradictory claims. Other files retain normal merge behavior.
