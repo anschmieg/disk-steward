@@ -553,7 +553,11 @@ repository; both check context before and after their work. URL aliases, case or
 an old report does not renew its lifetime.
 
 Context checks refuse at 15 minutes on either clock, invalid/backward readings,
-or a repository mismatch. `is_complete_transfer` still describes historical
+or a repository mismatch. An observed expiry or invalid-clock result is terminal
+for that attempt and shared by existing and future clones; a later clock correction
+cannot revive it. The first terminal clock failure is retained under concurrent
+checks. A wrong expected repository is a per-call mismatch and does not invalidate
+the correctly bound attempt. `is_complete_transfer` still describes historical
 transfer completion; it does not mean evidence is currently usable. Counts-only
 coverage results likewise do not replace a fresh context check at later use.
 The original attempt begins at transport construction, conservatively before ref

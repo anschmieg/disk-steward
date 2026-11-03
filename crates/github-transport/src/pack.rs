@@ -45,6 +45,7 @@ impl PackTransferReport {
     /// Require a complete transfer, the expected exact repository, and an age
     /// below fifteen minutes on both monotonic and wall clocks from transport
     /// construction in this process.
+    /// Clock expiry/invalidity remains terminal across clones of this attempt.
     /// This is not a durable receipt, retention promise or cleanup authorization.
     pub fn check_context(&self, expected: &crate::RepositoryUrl) -> io::Result<()> {
         if !self.is_complete_transfer() {

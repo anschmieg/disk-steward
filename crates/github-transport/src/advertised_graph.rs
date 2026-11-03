@@ -53,6 +53,7 @@ impl AdvertisedPackReport {
     }
 
     /// Recheck exact repository binding and in-process dual-clock expiry.
+    /// Observed clock failures remain terminal across this attempt's clones.
     pub fn check_context(&self, expected: &crate::RepositoryUrl) -> io::Result<()> {
         self.context.check(expected)
     }
