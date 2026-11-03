@@ -1,5 +1,5 @@
 //! Bounded, shallow metadata inventory for one folder selected by a native dialog.
-//! Navigation opens only explicitly requested observed folders; file contents are never opened.
+//! Navigation reads metadata only. Explicit duplicate comparison separately reads selected files with consent.
 
 use disk_steward_core::InventoryItemId;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,23 @@ pub(crate) mod checkpoint_commands {
     }
 }
 
+#[cfg(unix)]
+pub(crate) mod duplicate_compare;
+#[cfg(unix)]
+mod duplicate_content;
+#[cfg(unix)]
+mod duplicate_scope;
+#[cfg(not(unix))]
+pub(crate) mod duplicate_compare {
+    #[tauri::command]
+    pub(crate) async fn compare_observed_files() -> Result<(), String> {
+        Err("Selected-file comparison is unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn cancel_duplicate_comparison() -> Result<(), String> {
+        Err("Selected-file comparison is unsupported on this platform.".into())
+    }
+}
 pub(crate) mod allocation_map;
 #[cfg(unix)]
 mod checkpoint_prefix;
@@ -561,6 +578,7 @@ struct DirectoryFrame {
 #[cfg(unix)]
 struct ObservedEntry {
     id: InventoryItemId,
+    content_stamp: Option<checkpoint_store::RootStamp>,
     name: Vec<u8>,
     identity: DirectoryIdentity,
     file_type: rustix::fs::FileType,
@@ -1093,6 +1111,11 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             navigation_blocker,
         });
         observed_entries.push(ObservedEntry {
+            content_stamp: if file_type == FileType::RegularFile {
+                checkpoint_replay::stamp(&metadata).ok()
+            } else {
+                None
+            },
             id,
             name: raw_name.to_vec(),
             identity: entry_identity,

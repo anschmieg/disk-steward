@@ -295,7 +295,7 @@ test("failed import preserves observed entries and does not automatically retry"
   expect(
     screen.getByRole("button", { name: "Add this page to your plan" }),
   ).toBeEnabled();
-  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(within(screen.getByRole("table")).getByText("Zeta")).toBeVisible();
   expect(invoke).toHaveBeenCalledTimes(3);
   expect(screen.queryByText(/private database path/)).not.toBeInTheDocument();
 });
@@ -390,7 +390,7 @@ test("next page uses only the current observation ID, replaces rows, resets filt
   });
   fireEvent.click(screen.getByRole("button", { name: "Inspect Alpha" }));
   fireEvent.click(screen.getByRole("button", { name: "Next page" }));
-  await screen.findByText("Later file");
+  await within(screen.getByRole("table")).findByText("Later file");
   expect(invoke).toHaveBeenNthCalledWith(2, "continue_folder_inventory", {
     request: { expectedObservationId: "observation-1" },
   });
@@ -416,7 +416,7 @@ test("failed page continuation closes the UI continuation without discarding the
   await screen.findByRole("heading", { name: "Chosen folder" });
   fireEvent.click(screen.getByRole("button", { name: "Next page" }));
   await screen.findByText(/Enumeration could not continue reliably/);
-  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(within(screen.getByRole("table")).getByText("Zeta")).toBeVisible();
   expect(screen.getByRole("button", { name: "Next page" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "Choose folder" })).toBeEnabled();
   expect(invoke).toHaveBeenCalledTimes(2);
@@ -494,7 +494,7 @@ test("failed scope clear keeps the observation and does not claim release", asyn
   await screen.findByRole("heading", { name: "Chosen folder" });
   fireEvent.click(screen.getByRole("button", { name: "Clear folder scope" }));
   await screen.findByText(/folder scope could not be cleared/);
-  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(within(screen.getByRole("table")).getByText("Zeta")).toBeVisible();
   expect(screen.getByRole("button", { name: "Next page" })).toBeEnabled();
   expect(screen.queryByText(/Folder scope cleared/)).not.toBeInTheDocument();
   expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
@@ -1365,7 +1365,7 @@ test("recursive resume cancellation preserves the current observation", async ()
   );
   await screen.findByText(/resume selection canceled/i);
   expect(screen.getByRole("heading", { name: "Chosen folder" })).toBeVisible();
-  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(within(screen.getByRole("table")).getByText("Zeta")).toBeVisible();
   expect(invoke).toHaveBeenCalledTimes(3);
 });
 
@@ -1401,7 +1401,7 @@ test("recursive checkpoint failure preserves the prior folder and forgetting use
   );
   await screen.findByText(/operation could not be verified/);
   expect(screen.getByRole("heading", { name: "Chosen folder" })).toBeVisible();
-  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(within(screen.getByRole("table")).getByText("Zeta")).toBeVisible();
   expect(screen.queryByText(/private path/)).not.toBeInTheDocument();
 });
 
@@ -1519,4 +1519,87 @@ test("map group filter preserves whole-page imports and resets only after succes
     screen.queryByRole("button", { name: "Show all map entries" }),
   ).not.toBeInTheDocument();
   expect(screen.getByText(/Showing 3 of 3/)).toBeVisible();
+});
+
+test("explicit duplicate comparison holds the folder operation gate until native work settles", async () => {
+  const observation: FolderInventory = {
+    ...mappedSample,
+    regularFileLogicalBytes: "8",
+    entries: mappedSample.entries.map((entry) =>
+      entry.kind === "file" ? { ...entry, logicalBytes: "4" } : entry,
+    ),
+  };
+  let settle: (value: unknown) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(observation)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          settle = resolve;
+        }),
+    )
+    .mockResolvedValueOnce(undefined);
+  const busy = vi.fn();
+  render(<FolderInventoryPanel native onBusyChange={busy} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  const comparison = screen.getByRole("region", {
+    name: "Compare selected files for exact matches",
+  });
+  const files = within(comparison).getByRole("list", {
+    name: "Regular files on the current page",
+  });
+  fireEvent.click(within(files).getByRole("checkbox", { name: /Alpha/ }));
+  fireEvent.click(within(files).getByRole("checkbox", { name: /Zeta/ }));
+  fireEvent.click(
+    within(comparison).getByRole("checkbox", {
+      name: "Allow local content reads for these selected files",
+    }),
+  );
+  fireEvent.click(
+    within(comparison).getByRole("button", { name: "Compare selected files" }),
+  );
+  const request = vi.mocked(invoke).mock.calls[1][1] as {
+    request: {
+      expectedObservationId: string;
+      entryIds: string[];
+      attemptId: string;
+      allowContentRead: boolean;
+    };
+  };
+  expect(request.request.entryIds).toEqual(["1", "2"]);
+  expect(request.request.expectedObservationId).toBe(observation.observationId);
+  expect(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  ).toBeDisabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  );
+  expect(invoke).toHaveBeenCalledTimes(2);
+  fireEvent.click(
+    within(comparison).getByRole("button", { name: "Cancel comparison" }),
+  );
+  await within(comparison).findByText(/Cancellation signal acknowledged/);
+  expect(invoke).toHaveBeenNthCalledWith(3, "cancel_duplicate_comparison", {
+    request: {
+      expectedObservationId: observation.observationId,
+      attemptId: request.request.attemptId,
+    },
+  });
+  expect(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  ).toBeDisabled();
+  settle({
+    observationId: observation.observationId,
+    comparisonId: "comparison-guard",
+    detectorVersion: "exact-regular-file-v1",
+    filesCompared: 2,
+    bytesRead: "16",
+    groups: [{ id: "matching", entryIds: ["1", "2"], logicalBytes: "4" }],
+  });
+  await within(comparison).findByText(/Comparison completed for 2/);
+  expect(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  ).toBeEnabled();
+  expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
 });

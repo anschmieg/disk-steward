@@ -88,6 +88,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             foundation_status,
             check_selected_folder_access,
+            folder_inventory::duplicate_compare::compare_observed_files,
+            folder_inventory::duplicate_compare::cancel_duplicate_comparison,
             folder_inventory::inspect_selected_folder_entries,
             folder_inventory::navigate_folder_inventory,
             folder_inventory::continue_folder_inventory,

@@ -1,3 +1,4 @@
+import DuplicateComparisonPanel from "./DuplicateComparisonPanel";
 import {
   formatObservationTime,
   observationClockReversed,
@@ -710,7 +711,9 @@ export default function FolderInventoryPanel({
       <p>
         Choose a local folder to inspect up to 512 immediate entries per page.
         Open an observed folder explicitly to explore one level deeper. Links
-        and volume boundaries are not followed; file contents are not read.
+        and volume boundaries are not followed. Inventory reads metadata only;
+        the optional duplicate comparison reads only files you explicitly
+        select.
       </p>
       <button
         className="button secondary"
@@ -1264,6 +1267,17 @@ export default function FolderInventoryPanel({
               <option value="name">Name</option>
             </select>
           </label>
+          <DuplicateComparisonPanel
+            key={snapshot.observationId}
+            snapshot={snapshot}
+            native={native}
+            busy={busy}
+            onBusyChange={(running) => {
+              activeRequest.current = running;
+              setBusy(running);
+              onBusyChange(running);
+            }}
+          />
           <AllocationMap
             allocation={
               mapEvidence ? (snapshot.allocationMap ?? undefined) : undefined
