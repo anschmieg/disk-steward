@@ -101,6 +101,8 @@ fn indexed_store_worker_reopens_as_reconciliation_without_cleanup_authority() {
         "registered_stopped=true",
         "reopened_reconciliation=true",
         "prior_stopped=true",
+        "reserved_bytes=131072",
+        "reservation_retry_refused=true",
         "cleanup=not_authorized",
     ] {
         assert!(report.contains(evidence), "{report}");

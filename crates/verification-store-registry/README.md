@@ -14,8 +14,9 @@ Reconciliation is intentionally outside this M0 API.
 
 Supported filesystem enforcement is limited to Linux and macOS. Other targets
 are refused. Paths must come from a trusted backend; this is not a renderer API.
-This foundation is not yet integrated with store creation, workers, or the
-application lifecycle, and does not establish milestone completion.
+The closed indexed-worker probe exercises registration, reservation and reopen
+bookkeeping around an owned child. The application lifecycle is not integrated,
+and this foundation does not establish milestone completion.
 It assumes a trusted backend supplies the control path and makes no claim of
 protection against hostile path replacement by the same user.
 
@@ -33,3 +34,27 @@ while the database leaf retains no-follow protection, including on macOS paths
 with a system directory symlink. The Linux/macOS implementation is locally
 verified on macOS; other-platform refusal stubs were not cross-compiled.
 This does not protect against a hostile same-user actor racing path validation.
+
+Schema v2 adds `reserve(id, expected_current, new_total)`. Under the exclusive
+lease and an immediate transaction, it admits nondecreasing reservations on
+live registered/active rows, up to 2 GiB per store and 4 GiB across every record
+in that registry. Cleanup-complete reservations remain counted. A stale
+expected value, limit violation, malformed record or reconciliation requirement
+refuses without changing the reservation. There is no release API.
+
+Reservations are caller-supplied admission metadata, not measured allocation or
+reserved filesystem capacity. Callers must persist admission before writes,
+observe actual growth, maintain volume reserve/headroom, and reconcile crashes
+and stores outside their current enumeration. The probe currently uses one
+registry per private store parent; this is not app-wide aggregate enforcement.
+A shared control registry and trusted store lifecycle integration remain gates.
+
+Opening a validated v1 registry migrates it transactionally, preserving identity
+and lifecycle metadata. Every legacy reservation becomes `u64::MAX`, an explicit
+unknown-usage sentinel, including rows marked cleanup-complete. Any unknown
+sentinel or needs-reconciliation row blocks all new reservations; zero is not
+inferred for legacy data. New registrations start with zero admission metadata.
+Reservations survive reopen, while unfinished rows become needs-reconciliation.
+Unknown/future/malformed schemas are refused before migration. No reconciliation
+or release operation is supplied yet, and lifecycle labels grant no filesystem
+or cleanup authority.
