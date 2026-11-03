@@ -133,6 +133,8 @@ impl RequiredRefManifest {
             }
         }
         check_attempt(cancel, deadline)?;
+        validate_present_symrefs(&entries, cancel, deadline)?;
+        check_attempt(cancel, deadline)?;
         let digest = hash_entries(&entries, cancel, deadline)?;
         check_attempt(cancel, deadline)?;
         Ok(Self { entries, digest })
@@ -159,6 +161,48 @@ impl RequiredRefManifest {
         check_attempt(cancel, deadline)?;
         Ok(())
     }
+}
+
+fn validate_present_symrefs(
+    entries: &[RequiredRefEntry],
+    cancel: &CancellationHandle,
+    deadline: Instant,
+) -> io::Result<()> {
+    // Follow every present link. Missing targets remain caller claims; a walk
+    // longer than the entry count proves that a link cycle was encountered.
+    for start in 0..entries.len() {
+        check_attempt(cancel, deadline)?;
+        let mut current = start;
+        let mut terminated = false;
+        for _ in 0..=entries.len() {
+            check_attempt(cancel, deadline)?;
+            let entry = &entries[current];
+            let Some(target_name) = entry.symref_target.as_deref() else {
+                terminated = true;
+                break;
+            };
+            let Ok(target_index) =
+                entries.binary_search_by(|candidate| candidate.name.as_slice().cmp(target_name))
+            else {
+                terminated = true;
+                break;
+            };
+            let target = &entries[target_index];
+            if entry.oid != target.oid || entry.kind != target.kind {
+                return Err(invalid("required symbolic reference claim mismatch"));
+            }
+            current = target_index;
+            if current == start {
+                return Err(invalid("required symbolic reference cycle"));
+            }
+        }
+        // If a walk still links to a present target after N+1 steps, it must
+        // have entered a cycle, whether or not the cycle contains `start`.
+        if !terminated {
+            return Err(invalid("required symbolic reference cycle"));
+        }
+    }
+    check_attempt(cancel, deadline)
 }
 
 fn validate_claim(input: &RequiredRefInput<'_>) -> io::Result<()> {

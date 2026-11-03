@@ -1,0 +1,5 @@
+# M0 consistency of present symbolic-ref claims
+
+Inactive manifest capture rejects contradictions within the supplied snapshot: every symbolic link to a present entry must match its object ID and kind, and chains among present entries must terminate without cycles. Missing targets remain external caller claims. No extra graph allocation; at most 1024 starts and 1025 hops each, binary search in canonical entries, cooperative controls on every hop. Existing entry/name/aggregate bounds remain unchanged. Digest format stays v2.
+
+Tests cover valid and externally terminating chains, two/three-node cycles, OID/kind mismatch and the maximum 1024-entry chain/cycle. Existing native HEAD-switch/detachment/private-TLS flow remains exercised. R5.2/R5.4 contribution only: no complete inventory, omitted-ref consistency, native atomicity, unborn HEAD, preserved recovery package, receipt, cleanup eligibility, production worker/global store, credential or milestone acceptance. Version0.0.17/no release; branch atop PR78 with main eventual baseline.

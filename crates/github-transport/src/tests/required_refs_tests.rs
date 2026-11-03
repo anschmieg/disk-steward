@@ -277,3 +277,42 @@ fn symbolic_targets_share_the_aggregate_byte_budget() {
     }])
     .is_err());
 }
+
+#[test]
+fn present_symbolic_links_require_matching_identity_and_acyclic_claims() {
+    let link = |name, target| Input {
+        symref_target: Some(target),
+        ..entry(name, 1, K::Blob)
+    };
+    let a = b"refs/tags/a".as_slice();
+    let b = b"refs/tags/b".as_slice();
+    let c = b"refs/tags/c".as_slice();
+    assert!(capture(&[link(a, b), link(b, c), entry(c, 1, K::Blob)]).is_ok());
+    assert!(capture(&[link(a, b), link(b, c)]).is_ok());
+    for inputs in [
+        vec![link(a, b), link(b, a)],
+        vec![link(a, b), link(b, c), link(c, a)],
+        vec![link(a, b), entry(b, 2, K::Blob)],
+        vec![link(a, b), entry(b, 1, K::Tag)],
+    ] {
+        assert_eq!(capture(&inputs).unwrap_err().kind(), ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn maximum_symbolic_chain_terminates_and_cycle_is_refused() {
+    let names = (0..1024)
+        .map(|i| format!("refs/tags/{i:04}").into_bytes())
+        .collect::<Vec<_>>();
+    let mut inputs = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Input {
+            symref_target: names.get(i + 1).map(Vec::as_slice),
+            ..entry(name, 1, K::Blob)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(capture(&inputs).unwrap().entries().len(), 1024);
+    inputs[1023].symref_target = Some(&names[0]);
+    assert_eq!(capture(&inputs).unwrap_err().kind(), ErrorKind::InvalidData);
+}
