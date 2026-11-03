@@ -535,6 +535,15 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     .unwrap();
     assert_eq!(checksum.version(), 2);
     assert_eq!(checksum.declared_object_count(), 4);
+    let decoded_pack = decode_sha1_pack(
+        &pack,
+        4096,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(decoded_pack.objects().len(), 4);
+
     assert_eq!(checksum.checksum().as_slice(), &pack[pack.len() - 20..]);
     let entry = parse_sha1_pack_entry_header(&pack[12..], 12, 512).unwrap();
     let first_object = match entry.kind() {
@@ -607,6 +616,13 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
         )
         .unwrap();
         assert_eq!(actual, hex_oid(oid));
+        let decoded = decoded_pack
+            .objects()
+            .iter()
+            .find(|object| object.oid() == &actual)
+            .unwrap();
+        assert_eq!(decoded.kind(), kind);
+        assert_eq!(decoded.content(), raw);
     }
 
     let mut damaged_pack = pack.clone();
@@ -912,6 +928,20 @@ fn delta_reconstruction_matches_independent_strict_git_import() {
     .unwrap();
     assert_eq!(git_result, b"hello braveworld!");
     assert_eq!(reconstructed, git_result);
+    let decoded = decode_sha1_pack(
+        pack,
+        1024,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(decoded.objects().len(), 2);
+    assert_eq!(decoded.objects()[1].content(), git_result);
+    assert_eq!(
+        decoded.objects()[1].oid(),
+        &hex_oid("799d6e2806898251c4b4be06ec68ca7a32bb8c31")
+    );
+
     assert_eq!(
         git_sha1_object_id(
             GitObjectKind::Blob,
