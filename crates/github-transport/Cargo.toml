@@ -17,5 +17,8 @@ webpki-roots = "=1.0.9"
 verification-budget = { path = "../verification-budget" }
 rcgen = { version = "=0.14.9", default-features = false, features = ["crypto", "ring"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "=1.1.6", features = ["fs"] }
+
 [lints]
 workspace = true

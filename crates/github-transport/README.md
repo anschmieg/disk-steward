@@ -199,3 +199,19 @@ An operation failure cancels the attempt before HTTP finalization, so a sink's
 space refusal cannot trigger a download of the remaining pack merely to drain
 its response. Finalization still records incomplete/failed framing metadata;
 it cannot turn the operation failure into success.
+
+The real-Git Unix fixture now streams the candidate pack into an exclusively
+created private file in its task-owned root. A test-only sink checks held/named
+file and root identities, samples volume free space, asks the shared budget
+controller for admission, and retains observed allocation high-water charges
+around writes and synchronization. The logical fixture limit is 512 bytes;
+reported allocation may exceed it. Independent strict Git import checks still
+use the bounded captured contents. A separate candidate exchange reaches a
+simulated five-byte sink limit and must remain incomplete with its partial
+file bytes and budget charge retained.
+
+This connects transfer and file accounting for one local attempt. It does not
+establish durable aggregate enforcement across stores, directory/journal/index
+overhead, continuously reserved free space or production worker shutdown.
+The five-byte refusal is injected evidence, distinct from the native volume
+reserve sample in the successful fixture. No live GitHub endpoint is used.
