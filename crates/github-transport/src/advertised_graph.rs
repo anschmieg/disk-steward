@@ -104,6 +104,7 @@ pub fn decode_advertised_pack(
         .advertised_refs()
         .filter(|refs| !refs.is_empty() && refs.len() <= MAX_REFS)
         .ok_or_else(|| invalid("advertised reference set invalid"))?;
+    validate_advertised_symrefs(refs, cancellation, deadline)?;
 
     if input.len() > crate::decode::MAX_PACK_BYTES {
         return Err(safe_error(
@@ -166,14 +167,6 @@ pub fn decode_advertised_pack(
             roots.push((*advertised.oid(), required_kind));
         }
 
-        if let Some(target_name) = advertised.symref_target() {
-            let target = find_ref(refs, target_name, cancellation, deadline)?
-                .ok_or_else(|| invalid("symref target is not advertised"))?;
-            if target.oid() != advertised.oid() {
-                return Err(invalid("symref target object does not match"));
-            }
-        }
-
         if let Some(peeled) = advertised.peeled() {
             check_peeled(
                 objects,
@@ -215,22 +208,75 @@ fn find_object<'a>(
     Ok(found)
 }
 
-fn find_ref<'a>(
-    refs: &'a [AdvertisedRef],
+fn validate_advertised_symrefs(
+    refs: &[AdvertisedRef],
+    cancellation: &CancellationHandle,
+    deadline: Instant,
+) -> io::Result<()> {
+    const UNSEEN: u8 = 0;
+    const VISITING: u8 = 1;
+    const DONE: u8 = 2;
+
+    if refs.len() > MAX_REFS {
+        return Err(invalid("advertised reference set invalid"));
+    }
+    let mut states = [UNSEEN; MAX_REFS];
+    let mut path = [0usize; MAX_REFS];
+    for start in 0..refs.len() {
+        check_attempt(cancellation, deadline)?;
+        if states[start] == DONE {
+            continue;
+        }
+        let mut current = start;
+        let mut path_len = 0usize;
+        loop {
+            check_attempt(cancellation, deadline)?;
+            match states[current] {
+                VISITING => return Err(invalid("advertised symbolic reference cycle")),
+                DONE => break,
+                UNSEEN => {}
+                _ => return Err(invalid("invalid advertised symbolic reference state")),
+            }
+
+            states[current] = VISITING;
+            path[path_len] = current;
+            path_len += 1;
+            let reference = &refs[current];
+            let Some(target_name) = reference.symref_target() else {
+                break;
+            };
+            let target_index = find_ref_index(refs, target_name, cancellation, deadline)?
+                .ok_or_else(|| invalid("symref target is not advertised"))?;
+            if refs[target_index].oid() != reference.oid() {
+                return Err(invalid("symref target object does not match"));
+            }
+            current = target_index;
+        }
+
+        while path_len > 0 {
+            check_attempt(cancellation, deadline)?;
+            path_len -= 1;
+            states[path[path_len]] = DONE;
+        }
+    }
+    check_attempt(cancellation, deadline)
+}
+
+fn find_ref_index(
+    refs: &[AdvertisedRef],
     name: &[u8],
     cancellation: &CancellationHandle,
     deadline: Instant,
-) -> io::Result<Option<&'a AdvertisedRef>> {
-    let mut found = None;
-    for candidate in refs {
+) -> io::Result<Option<usize>> {
+    for (index, candidate) in refs.iter().enumerate() {
         check_attempt(cancellation, deadline)?;
         if candidate.name() == name {
-            found = Some(candidate);
-            break;
+            check_attempt(cancellation, deadline)?;
+            return Ok(Some(index));
         }
     }
     check_attempt(cancellation, deadline)?;
-    Ok(found)
+    Ok(None)
 }
 
 fn check_peeled(
