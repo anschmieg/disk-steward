@@ -13,7 +13,10 @@ const GIT: &str = "/usr/bin/git";
 const MAX_GIT_IN: usize = 512;
 const MAX_GIT_OUT: usize = 65_536;
 const MAX_PACK: usize = 512;
-const GIT_DEADLINE: Duration = Duration::from_secs(3);
+// Setup and receiver verification run outside the HTTP attempt. Shared CI can
+// take longer to start a cold system Git; keep RPC supervision at three seconds.
+const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(10);
+const GIT_RPC_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 
 struct PrivateRoot {
@@ -107,12 +110,12 @@ struct GitOutput {
     stdout: Vec<u8>,
 }
 
-fn finish_child(child: &mut Child, start: Instant) -> io::Result<ExitStatus> {
+fn finish_child(child: &mut Child, start: Instant, deadline: Duration) -> io::Result<ExitStatus> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        if start.elapsed() >= GIT_DEADLINE {
+        if start.elapsed() >= deadline {
             let _ = child.kill();
             let status = child.wait()?;
             return Err(safe_error(
@@ -204,7 +207,12 @@ fn run_git(
     if write_result.is_err() {
         let _ = child.kill();
     }
-    let status_result = finish_child(&mut child, start);
+    let deadline = if protocol.is_some() {
+        GIT_RPC_DEADLINE
+    } else {
+        GIT_SETUP_DEADLINE
+    };
+    let status_result = finish_child(&mut child, start, deadline);
     if status_result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
