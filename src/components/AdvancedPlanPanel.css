@@ -586,6 +586,8 @@
 .ap-descendants label span {
   display: grid;
   gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .ap-descendants small {
   font-size: 8px;

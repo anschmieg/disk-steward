@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type {
   PilotContext,
   ReviewPilotRecorder,
@@ -23,6 +23,8 @@ export default function ReviewPilotPanel({
   canStart,
 }: Props) {
   const [code, setCode] = useState("");
+  const [copyPending, setCopyPending] = useState(false);
+  const copyPendingRef = useRef(false);
   const contextValid =
     !!context &&
     context.confirmed &&
@@ -40,6 +42,28 @@ export default function ReviewPilotPanel({
         ? "Recording started."
         : "Load the current editor and enter a valid anonymous participant code.",
     );
+  const copyReport = async () => {
+    if (
+      busy ||
+      copyPendingRef.current ||
+      recorder.phase !== "finished" ||
+      !recorder.report
+    )
+      return;
+    copyPendingRef.current = true;
+    setCopyPending(true);
+    try {
+      const clipboard = navigator.clipboard;
+      if (!clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await clipboard.writeText(JSON.stringify(recorder.report, null, 2));
+      setMessage("Report copied.");
+    } catch {
+      setMessage("Clipboard unavailable. Select and copy the report manually.");
+    } finally {
+      copyPendingRef.current = false;
+      setCopyPending(false);
+    }
+  };
   return (
     <details className="review-pilot-panel" data-review-pilot-controls>
       <summary>Review pilot recording</summary>
@@ -142,12 +166,19 @@ export default function ReviewPilotPanel({
               value={JSON.stringify(recorder.report, null, 2)}
             />
           </label>
+          <button
+            type="button"
+            disabled={busy || copyPending}
+            onClick={() => void copyReport()}
+          >
+            {copyPending ? "Copying report…" : "Copy report"}
+          </button>
         </>
       )}
       {recorder.phase !== "idle" && (
         <button
           type="button"
-          disabled={busy}
+          disabled={busy || copyPending}
           onClick={() => {
             recorder.discard();
             setMessage("Recording discarded.");
