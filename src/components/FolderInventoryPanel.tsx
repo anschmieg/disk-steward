@@ -5,6 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type FolderInventory = {
   rootLabel: string;
+  pageNumber: number;
+  entriesSeen: string;
+  canContinue: boolean;
   observationId: string;
   breadcrumbs: string[];
   canGoBack: boolean;
@@ -53,25 +56,29 @@ export default function FolderInventoryPanel({
   useEffect(() => {
     if (selectedId !== null) evidenceHeadingRef.current?.focus();
   }, [selectedId]);
-  const inspect = async (entryId?: string | null) => {
+  const inspect = async (entryId?: string | null, nextPage = false) => {
     if (activeRequest.current || !native) return;
-    if (entryId !== undefined && !snapshot) return;
+    if ((nextPage || entryId !== undefined) && !snapshot) return;
     activeRequest.current = true;
     setBusy(true);
     onBusyChange(true);
     setMessage("");
     try {
       const next =
-        entryId === undefined
+        entryId === undefined && !nextPage
           ? await invoke<FolderInventory | null>(
               "inspect_selected_folder_entries",
             )
-          : await invoke<FolderInventory>("navigate_folder_inventory", {
-              request: {
-                expectedObservationId: snapshot!.observationId,
-                entryId,
-              },
-            });
+          : nextPage
+            ? await invoke<FolderInventory>("continue_folder_inventory", {
+                request: { expectedObservationId: snapshot!.observationId },
+              })
+            : await invoke<FolderInventory>("navigate_folder_inventory", {
+                request: {
+                  expectedObservationId: snapshot!.observationId,
+                  entryId,
+                },
+              });
       if (next) {
         inspectorReturnRef.current = null;
         setSelectedId(null);
@@ -83,8 +90,14 @@ export default function FolderInventoryPanel({
           "Folder selection canceled. The previous observation is unchanged.",
         );
     } catch {
+      if (nextPage)
+        setSnapshot((previous) =>
+          previous ? { ...previous, canContinue: false } : previous,
+        );
       setMessage(
-        "The folder could not be inspected. Choose it again to retry. Any previous observation remains below.",
+        nextPage
+          ? "Enumeration could not continue reliably. The previous page is historical; choose the folder again to restart."
+          : "The folder could not be inspected. Choose it again to retry. Any previous observation remains below.",
       );
     } finally {
       activeRequest.current = false;
@@ -149,9 +162,9 @@ export default function FolderInventoryPanel({
     >
       <h2 id={titleId}>Explore a folder</h2>
       <p>
-        Choose a local folder to inspect up to 512 immediate entries. Open an
-        observed folder explicitly to explore one level deeper. Links and volume
-        boundaries are not followed; file contents are not read.
+        Choose a local folder to inspect up to 512 immediate entries per page.
+        Open an observed folder explicitly to explore one level deeper. Links
+        and volume boundaries are not followed; file contents are not read.
       </p>
       <button
         className="button secondary"
@@ -192,7 +205,9 @@ export default function FolderInventoryPanel({
           </button>
           <p role="status">
             {snapshot.enumerationComplete
-              ? "Immediate entry enumeration finished."
+              ? snapshot.pageNumber > 1
+                ? "Reached the end of the directory. Only the current page is displayed."
+                : "Immediate entry enumeration finished."
               : "Incomplete immediate entry enumeration."}{" "}
             {snapshot.stopReason
               ? (coverageReasons[snapshot.stopReason] ??
@@ -200,12 +215,24 @@ export default function FolderInventoryPanel({
               : ""}
           </p>
           <p>
-            {snapshot.entries.length} observed entries ·{" "}
+            Page {snapshot.pageNumber} · {snapshot.entriesSeen} entries observed
+            across pages. Each page is a separate historical observation;
+            earlier pages are not retained in this list.
+          </p>
+          <button
+            className="button secondary"
+            disabled={busy || !snapshot.canContinue}
+            onClick={() => void inspect(undefined, true)}
+          >
+            Next page
+          </button>
+          <p>
+            {snapshot.entries.length} observed entries on this page ·{" "}
             {snapshot.unreadableCount} unreadable entries ·{" "}
             {snapshot.directoriesNotTraversed} folders not traversed
           </p>
           <p>
-            Observed regular-file logical sizes total{" "}
+            Current-page regular-file logical sizes total{" "}
             {snapshot.regularFileLogicalBytes} bytes. Hard links are counted per
             name. This is neither occupied disk space nor recoverable space;
             nested contents and shared allocation are unknown.
@@ -223,7 +250,7 @@ export default function FolderInventoryPanel({
               }
               onClick={() => void addToPlan()}
             >
-              Add observed entries to your plan
+              Add this page to your plan
             </button>
             {onOpenPlan && (
               <button
@@ -237,9 +264,9 @@ export default function FolderInventoryPanel({
           </div>
           <p>
             Adding saves the observed file/folder names and metadata locally,
-            including entries hidden by the filter. It does not save source
-            paths or grant cleanup permission. The separate plan starts empty;
-            all imported entries default to Keep and stay blocked.
+            from this page, including entries hidden by the filter. It does not
+            save source paths or grant cleanup permission. The separate plan
+            starts empty; all imported entries default to Keep and stay blocked.
           </p>
           <label>
             Filter observed names{" "}
@@ -276,7 +303,7 @@ export default function FolderInventoryPanel({
             <table>
               <caption>
                 Read-only metadata observation. All entries remain unavailable
-                for cleanup. Size bars use the full observation’s{" "}
+                for cleanup. Size bars use the current page’s{" "}
                 {snapshot.regularFileLogicalBytes} regular-file logical bytes as
                 their denominator; folders have unknown size.
               </caption>
@@ -411,6 +438,8 @@ export default function FolderInventoryPanel({
 }
 
 const coverageReasons: Record<string, string> = {
+  page_limit:
+    "The page limit was reached. Coverage remains incomplete; choose a narrower folder to inspect further.",
   time_limit: "The observation time limit was reached.",
   entry_limit: "The entry limit was reached; more entries may exist.",
   directory_read_error: "The folder iterator became unreadable.",

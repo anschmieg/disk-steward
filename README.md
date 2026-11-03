@@ -1,6 +1,6 @@
 # Disk Steward
 
-Working name; no naming or trademark research performed. Implementation is in progress at 0.0.17. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore/permanent-removal cycle for five disposable files it creates itself. Native file and folder selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. The desktop Explore folder view can inspect up to 512 immediate entries of a natively selected folder using metadata only; recursive scanning and user-file cleanup are not enabled.
+Working name; no naming or trademark research performed. Implementation is in progress at 0.0.17. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore/permanent-removal cycle for five disposable files it creates itself. Native file and folder selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. The desktop Explore folder view can inspect up to 512 immediate entries per page of a natively selected folder using metadata only; recursive scanning and user-file cleanup are not enabled.
 
 ## Product
 
@@ -82,3 +82,7 @@ After exploring a folder, explicitly add the observed file/folder entries to You
 Imported entries default to Keep and remain blocked from cleanup, including when Include is requested. There is no source-path binding or execution approval. Different observations may overlap or describe hard links: plan totals count per-entry logical metadata, not occupied or recoverable space. Unsafe integer sizes or cumulative totals are refused rather than rounded. Refreshing the explorer does not overwrite saved decisions.
 
 The explorer now shows exact per-regular-file reported allocated bytes and link counts from no-follow filesystem metadata, separately from logical length. Allocation sorting and a keyboard-accessible evidence inspector preserve unknown values for folders, links and unsupported entries. Allocation is not summed into occupied/reclaimable totals: hard links and shared storage can overlap, and no deletion outcome follows from block metadata. Invalid or overflowing block observations stay unknown. Saved review evidence includes these observations without adding execution authority.
+
+## Large immediate folders
+
+Use Next page to continue enumerating a selected folder through a backend-held iterator, up to 512 entries per response and 128 pages per directory. Only the current page is retained in the list and eligible for metadata import; logical totals and size bars refer to that page. The cumulative count describes observed entry records, not distinct files or occupied space. An exact-full final page may conservatively offer one empty end page. Directory changes or uncertain continuation close the cursor and require a fresh folder selection. There is no automatic restart or hidden retry. Paging is memory-only, not a durable scan checkpoint; recursive scanning, pause/cancel and cloud/library acceptance remain open.

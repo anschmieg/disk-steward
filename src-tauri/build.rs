@@ -5,6 +5,7 @@ fn main() {
             "check_selected_folder_access",
             "inspect_selected_folder_entries",
             "navigate_folder_inventory",
+            "continue_folder_inventory",
             "preview_native_review",
             "get_example_plan",
             "edit_example_plan",
