@@ -580,3 +580,7 @@ PR21 merged to main d1ec3df after four current-head build/test jobs passed, no b
 2026-11-03 PR50 head935ec0e merged to mainc5997b2 after four current-head build/test successes/no blocking findings; unwatch50. PR51 retargeted main, verified50 ancestor and main-vs50 transport source identical; retained reviewed51 source for squash conflicts. All dated progress preserved; fresh51 CI required.
 
 2026-11-03 PR52 integrates updated51 headaf82b3e/mainc5997b2; append-only progress conflict, every dated entry retained. No implementation changes; fresh current-head CI required/existing watch persists.
+
+2026-11-03 PR51 exactheadaf82b3e four required build/test jobs SUCCESS/no blocking inline findings, Sourcery SKIPPED and Copilot quota COMMENTED not approval. Root source review bounded test-only fixture; merged squash to mainfb2c452 and unwatched51. PR52 retargetedmain; prior51/main crate source identical, retained reviewed52 fixture/README/lib source through squash conflicts, all dated progress preserved. Fresh52 CI required.
+
+2026-11-03 PR52/main integration validation: staged implementation unchanged,68transport tests PASS/1 helper ignored/fmt and diff checks PASS. Mainbaseline nowfb2c452; no authentication/product milestone gate closed. Fresh current-head CI required and existing52 watch persists.
