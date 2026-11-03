@@ -281,3 +281,20 @@ must still fail independent object verification. Tests cover that boundary,
 an independent empty-pack digest vector, fragmented/adversarial readers, and
 the real-Git fixture's pack plus checksum corruption and truncation. Independent
 strict Git receiver verification remains in place.
+
+### Entry header parsing
+
+`parse_sha1_pack_entry_header` is a finite, allocation-free slice parser for one
+SHA-1 pack entry. It returns the kind, declared inflated representation size,
+header length, and any delta base. Checked arithmetic, ten-byte integer limits,
+and a caller size ceiling no greater than 2 GiB reject malformed/oversized
+headers. The parser consumes at most 30 bytes and leaves the compressed tail
+untouched. Tests include every two-byte prefix, overflow/truncation cases, the
+special offset-delta encoding, and the real Git fixture's first entry size
+compared with Git's own object metadata.
+
+For deltas, the size is the inflated instruction stream, not reconstructed object
+size. A backward offset is not proof of an entry boundary, and a reference base
+may be external. No decompression, base resolution, object identity, object count,
+graph completeness or cleanup decision is established by this stage. Callers
+must enforce those checks and separate reconstructed-size/aggregate budgets.
