@@ -425,6 +425,11 @@ impl BudgetController {
         self.jobs.get(&id).ok_or(BudgetError::UnknownJob(id))
     }
 
+    /// Number of retained attempt records, including completed and cleaned jobs.
+    pub fn retained_job_count(&self) -> usize {
+        self.jobs.len()
+    }
+
     pub fn aggregate_stored(&self) -> Result<u64, BudgetError> {
         Ok(self
             .jobs
