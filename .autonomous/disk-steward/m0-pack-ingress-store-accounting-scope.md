@@ -1,0 +1,7 @@
+# M0 combined pack ingress and store accounting fixture
+
+The private BudgetFileSink reconciles its own transfer report's cumulative raw HTTP ingress into its storage BudgetController job before all decode checks. Require accounting success AND Running state: late observations can be accepted for failed jobs, but those jobs cannot produce decoded evidence. Failures cancel the shared attempt without releasing observed storage charges or the identity-bound durable reservation. Incomplete transfers still charge their final ingress observation, and repeated totals charge only deltas.
+
+Actual private-TLS tests cover successful repeated observations/decode, terminal storage failure with late ingress charged, regressed totals, partial file refusal and native real-Git flow. A synthetic over-limit counter injects the 2 GiB+1 condition without transferring/allocating that payload and verifies first-failure preservation; this is not a full-size network test. Reopening retains reservation/NeedsReconciliation and refuses growth. No new cleanup authority or user files.
+
+Completion-time reconciliation only, no per-read callback/shared production transport budget owner, attempt adoption, persisted ingress receipt, production child/store handoff, credential/human/platform/milestone acceptance. Exact same-attempt report is supplied by the closed fixture caller. Version0.0.17/no release; branch atop80, main eventual baseline with current-head CI required.

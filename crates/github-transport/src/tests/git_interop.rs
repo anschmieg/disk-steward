@@ -612,6 +612,10 @@ fn run_real_git_verification() {
     let advertised_closure = pack_sink
         .decode_download(&fetch_report, 4096, Instant::now() + Duration::from_secs(5))
         .unwrap();
+    assert_eq!(
+        pack_sink.ingress_bytes_charged(),
+        fetch_report.finalization().observed_ingress_bytes()
+    );
     let pack = pack_sink.contents().unwrap();
     let checksum = check_sha1_pack_checksum(
         &mut std::io::Cursor::new(&pack),
@@ -1150,6 +1154,14 @@ fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
     assert!(report.advertised_refs().is_none());
     assert_eq!(sink.contents().unwrap(), b"PACKf");
     assert_eq!(report.bytes_written(), 5);
+    assert!(sink
+        .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+        .is_err());
+    assert_eq!(
+        sink.ingress_bytes_charged(),
+        report.finalization().observed_ingress_bytes()
+    );
+    assert!(sink.ingress_bytes_charged() > report.bytes_written());
     let partial_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
     assert!(
         sink.bytes_charged()

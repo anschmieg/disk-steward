@@ -621,3 +621,16 @@ allocation. Each of at most 1,024 entries and present links is processed once,
 with binary target lookup and cancellation/deadline checks during traversal
 and completion.
 It cannot establish consistency of refs omitted by the caller or native atomicity.
+
+The closed private pack-file fixture reconciles the completed transfer's
+cumulative raw HTTP ingress into the same `BudgetController` job that charges
+file allocation, before checking cancellation or decoding. Repeating a total
+charges no duplicate bytes. An incomplete transfer still contributes observed
+ingress; a failed/non-running job cannot yield decoded evidence even if late
+accounting itself is accepted. Counter regressions cancel the fixture without
+reducing prior usage. Tests retain the durable reservation and require
+reconciliation on reopen after refusal, including a synthetic over-limit counter.
+This is completion-time accounting in a task-owned fixture, not live ingress
+callbacks, durable usage receipts, production worker/store integration or a
+multi-gigabyte network enforcement demonstration. Fixture callers supply the
+report from that sink's own attempt; this is not a public report-adoption API.

@@ -197,6 +197,34 @@ impl BudgetFileSink {
             .expect("created budget job remains registered")
     }
 
+    pub(super) fn ingress_bytes_charged(&self) -> u64 {
+        self.budget
+            .snapshot(self.job)
+            .map(|snapshot| snapshot.usage.ingress_bytes)
+            .expect("created budget job remains registered")
+    }
+
+    pub(super) fn reconcile_transfer_ingress(
+        &mut self,
+        report: &crate::PackTransferReport,
+    ) -> io::Result<()> {
+        let accounted = self
+            .budget
+            .record_ingress_total(self.job, report.finalization().observed_ingress_bytes());
+        let running = self
+            .budget
+            .snapshot(self.job)
+            .is_ok_and(|snapshot| snapshot.state == verification_budget::JobState::Running);
+        if accounted.is_err() || !running {
+            self.signal.cancel();
+            return Err(safe_error(
+                io::ErrorKind::Other,
+                "pack sink ingress accounting refused",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn reservation_bytes(&self) -> io::Result<u64> {
         let record = self
             .registry
@@ -215,6 +243,7 @@ impl BudgetFileSink {
         max_decoded_bytes: usize,
         deadline: std::time::Instant,
     ) -> io::Result<crate::AdvertisedPackReport> {
+        self.reconcile_transfer_ingress(report)?;
         let result = (|| {
             self.signal.check()?;
             crate::check_deadline(deadline)?;
@@ -797,5 +826,138 @@ mod decode_tests {
             io::ErrorKind::TimedOut
         );
         assert!(sink.signal.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+    use crate::tests::{
+        graph_tests::{hex, oid, pack_bytes},
+        pack_tests::{pack_body, pack_fixture_with_refs},
+    };
+    use std::time::{Duration, Instant};
+
+    fn download() -> (PrivateRoot, BudgetFileSink, crate::PackTransferReport) {
+        let root = PrivateRoot::create().unwrap();
+        let content = b"ingress".to_vec();
+        let id = oid(crate::GitObjectKind::Blob, &content);
+        let bytes = pack_bytes(&[(crate::GitObjectKind::Blob, content)]);
+        let (transport, server) = pack_fixture_with_refs(
+            pack_body(&bytes),
+            false,
+            format!("{} refs/tags/blob\n", hex(&id)).into_bytes(),
+        );
+        let mut sink = BudgetFileSink::new(&root, transport.cancellation_handle()).unwrap();
+        let report = transport.download_advertised_pack(&mut sink).unwrap();
+        server.join().unwrap();
+        assert!(report.is_complete_transfer());
+        (root, sink, report)
+    }
+
+    #[test]
+    fn repeated_transfer_observations_charge_one_job_without_double_counting() {
+        let (_root, mut sink, report) = download();
+        let total = report.finalization().observed_ingress_bytes();
+        assert!(total > report.bytes_written());
+        let storage = sink.bytes_charged();
+        assert!(storage >= report.bytes_written());
+        for _ in 0..2 {
+            sink.reconcile_transfer_ingress(&report).unwrap();
+        }
+        assert_eq!(sink.ingress_bytes_charged(), total);
+        assert_eq!(sink.bytes_charged(), storage);
+        sink.decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(sink.ingress_bytes_charged(), total);
+        assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+    }
+
+    #[test]
+    fn terminal_budget_refuses_decode_but_charges_late_ingress_and_retains_reservation() {
+        let (root, mut sink, report) = download();
+        let storage = sink.bytes_charged();
+        sink.budget
+            .fail(sink.job, verification_budget::BlockReason::StoreIncomplete)
+            .unwrap();
+        assert!(sink
+            .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+            .is_err());
+        assert_eq!(
+            sink.ingress_bytes_charged(),
+            report.finalization().observed_ingress_bytes()
+        );
+        assert_eq!(sink.bytes_charged(), storage);
+        assert!(sink.signal.check().is_err());
+        assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+        assert!(matches!(
+            sink.budget.snapshot(sink.job).unwrap().state,
+            verification_budget::JobState::Failed {
+                reason: verification_budget::BlockReason::StoreIncomplete,
+                ..
+            }
+        ));
+        drop(sink);
+        super::super::assert_durable_reservation_blocks_reopen(&root);
+    }
+
+    #[test]
+    fn counter_regression_never_releases_charges_or_allows_decode() {
+        let (root, mut sink, report) = download();
+        let ahead = report.finalization().observed_ingress_bytes() + 1;
+        sink.budget.record_ingress_total(sink.job, ahead).unwrap();
+        assert!(sink
+            .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+            .is_err());
+        assert_eq!(sink.ingress_bytes_charged(), ahead);
+        assert!(sink.signal.check().is_err());
+        assert!(matches!(
+            sink.budget.snapshot(sink.job).unwrap().state,
+            verification_budget::JobState::Failed {
+                reason: verification_budget::BlockReason::IngressCounterRegressed,
+                ..
+            }
+        ));
+        drop(sink);
+        super::super::assert_durable_reservation_blocks_reopen(&root);
+    }
+}
+
+#[cfg(test)]
+mod ingress_limit_test {
+    use super::*;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn injected_ingress_limit_preserves_original_failure_and_reserved_store() {
+        // Synthetic counter injection, not a multi-gigabyte network transfer.
+        let root = PrivateRoot::create().unwrap();
+        let (transport, server) = crate::tests::pack_tests::pack_fixture(
+            crate::tests::pack_tests::pack_body(b"PACKfixture"),
+        );
+        let mut sink = BudgetFileSink::new(&root, transport.cancellation_handle()).unwrap();
+        let report = transport.download_advertised_pack(&mut sink).unwrap();
+        server.join().unwrap();
+        let over_limit = verification_budget::PER_REPOSITORY_INGRESS_LIMIT + 1;
+        assert!(sink
+            .budget
+            .record_ingress_total(sink.job, over_limit)
+            .is_err());
+        let stored = sink.bytes_charged();
+        assert!(sink
+            .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+            .is_err());
+        assert_eq!(sink.ingress_bytes_charged(), over_limit);
+        assert_eq!(sink.bytes_charged(), stored);
+        assert!(sink.signal.check().is_err());
+        assert!(matches!(
+            sink.budget.snapshot(sink.job).unwrap().state,
+            verification_budget::JobState::Failed {
+                reason: verification_budget::BlockReason::IngressLimit,
+                ..
+            }
+        ));
+        assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+        drop(sink);
+        super::super::assert_durable_reservation_blocks_reopen(&root);
     }
 }
