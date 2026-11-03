@@ -52,6 +52,23 @@ function mount(
   return { ...view, onEdit, onUndo, onRedo, onRefresh, onReview };
 }
 
+function stubAnimationFrames() {
+  const callbacks: FrameRequestCallback[] = [];
+  const canceled: number[] = [];
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => canceled.push(id));
+  return {
+    callbacks,
+    canceled,
+    run(id: number) {
+      callbacks[id - 1]?.(0);
+    },
+  };
+}
+
 describe("AdvancedPlanPanel decisions", () => {
   it("keeps blocked items out of the Include action", () => {
     const blocked = editorItem("blocked", {
@@ -206,6 +223,7 @@ describe("AdvancedPlanPanel decisions", () => {
           return frames.length;
         },
       );
+      vi.stubGlobal("cancelAnimationFrame", vi.fn());
       const original = editorItem("candidate", {
         label: "Candidate",
         groupIds: ["review-group"],
@@ -278,6 +296,244 @@ describe("AdvancedPlanPanel decisions", () => {
       ).toHaveFocus();
     },
   );
+
+  it("ignores a stale restore after a busy revision and newer Search focus", () => {
+    const frames = stubAnimationFrames();
+    const item = editorItem("focus-item", { label: "Focus item" });
+    const initial = editorSnapshot([item]);
+    const props = {
+      busy: false,
+      confirmed: false,
+      editsConfirmed: true,
+      readOnly: false,
+      onEdit: async () => {},
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+      onReview: async () => {},
+    };
+    const { rerender } = render(
+      <AdvancedPlanPanel snapshot={initial} {...props} />,
+    );
+    act(() => screen.getByRole("button", { name: "Include" }).focus());
+    const revision2 = {
+      ...initial,
+      revisionId: "revision-two",
+      revisionNumber: initial.revisionNumber + 1,
+    };
+    rerender(<AdvancedPlanPanel snapshot={revision2} {...props} />);
+    expect(frames.callbacks).toHaveLength(1);
+
+    const revision3 = {
+      ...revision2,
+      revisionId: "revision-three",
+      revisionNumber: revision2.revisionNumber + 1,
+    };
+    rerender(<AdvancedPlanPanel snapshot={revision3} {...props} busy />);
+    expect(frames.canceled).toEqual([1]);
+    const search = screen.getByRole("searchbox", {
+      name: "Search findings and groups",
+    });
+    act(() => search.focus());
+    act(() => frames.run(1));
+    expect(search).toHaveFocus();
+
+    rerender(<AdvancedPlanPanel snapshot={revision3} {...props} />);
+    expect(frames.callbacks).toHaveLength(2);
+    act(() => frames.run(2));
+    expect(search).toHaveFocus();
+  });
+
+  it("respects newer Search focus even when the scheduled frame is still current", () => {
+    const frames = stubAnimationFrames();
+    const snapshot = editorSnapshot([editorItem("current-focus")]);
+    const props = {
+      busy: false,
+      confirmed: false,
+      onEdit: async () => {},
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+    };
+    const view = render(<AdvancedPlanPanel snapshot={snapshot} {...props} />);
+    act(() => screen.getByRole("button", { name: "Include" }).focus());
+    view.rerender(
+      <AdvancedPlanPanel
+        snapshot={{
+          ...snapshot,
+          revisionId: "current-focus-next",
+          revisionNumber: 2,
+        }}
+        {...props}
+      />,
+    );
+    expect(frames.callbacks).toHaveLength(1);
+    const search = screen.getByRole("searchbox", {
+      name: "Search findings and groups",
+    });
+    act(() => search.focus());
+    act(() => frames.run(1));
+    expect(search).toHaveFocus();
+  });
+
+  it("restores focus within the revised panel when another panel shares item IDs", () => {
+    const frames = stubAnimationFrames();
+    const snapshot = editorSnapshot([
+      editorItem("shared-item", { label: "Shared item" }),
+    ]);
+    const props = {
+      busy: false,
+      confirmed: false,
+      onEdit: async () => {},
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+    };
+    const { rerender } = render(
+      <>
+        <AdvancedPlanPanel key="first" snapshot={snapshot} {...props} />
+        <AdvancedPlanPanel key="second" snapshot={snapshot} {...props} />
+      </>,
+    );
+    const [firstInclude, secondInclude] = screen.getAllByRole("button", {
+      name: "Include",
+    });
+    act(() => secondInclude.focus());
+    rerender(
+      <>
+        <AdvancedPlanPanel key="first" snapshot={snapshot} {...props} />
+        <AdvancedPlanPanel
+          key="second"
+          snapshot={{
+            ...snapshot,
+            revisionId: "second-panel-next",
+            revisionNumber: 2,
+          }}
+          {...props}
+        />
+      </>,
+    );
+    expect(frames.callbacks).toHaveLength(1);
+    act(() => frames.run(1));
+    expect(secondInclude).toHaveFocus();
+    expect(firstInclude).not.toHaveFocus();
+  });
+
+  it("respects focus moved outside the editor before a current restore runs", () => {
+    const frames = stubAnimationFrames();
+    const snapshot = editorSnapshot([editorItem("external-focus")]);
+    const props = {
+      busy: false,
+      confirmed: false,
+      onEdit: async () => {},
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+    };
+    const panel = (next = snapshot) => (
+      <>
+        <button>Outside editor</button>
+        <AdvancedPlanPanel snapshot={next} {...props} />
+      </>
+    );
+    const view = render(panel());
+    act(() => screen.getByRole("button", { name: "Include" }).focus());
+    view.rerender(
+      panel({
+        ...snapshot,
+        revisionId: "external-focus-next",
+        revisionNumber: 2,
+      }),
+    );
+    const outside = screen.getByRole("button", { name: "Outside editor" });
+    act(() => outside.focus());
+    act(() => frames.run(1));
+    expect(outside).toHaveFocus();
+  });
+
+  it("reschedules a legitimate restore after busy clears and ignores canceled callbacks", () => {
+    const frames = stubAnimationFrames();
+    const item = editorItem("resume-item", { label: "Resume item" });
+    const initial = editorSnapshot([item]);
+    const props = {
+      busy: false,
+      confirmed: false,
+      editsConfirmed: true,
+      readOnly: false,
+      onEdit: async () => {},
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+      onReview: async () => {},
+    };
+    const { rerender } = render(
+      <AdvancedPlanPanel snapshot={initial} {...props} />,
+    );
+    act(() => screen.getByRole("button", { name: "Include" }).focus());
+    const revision2 = {
+      ...initial,
+      revisionId: "resume-revision-two",
+      revisionNumber: initial.revisionNumber + 1,
+    };
+    rerender(<AdvancedPlanPanel snapshot={revision2} {...props} />);
+    const revision3 = {
+      ...revision2,
+      revisionId: "resume-revision-three",
+      revisionNumber: revision2.revisionNumber + 1,
+    };
+    rerender(<AdvancedPlanPanel snapshot={revision3} {...props} busy />);
+    act(() => frames.run(1));
+    expect(frames.callbacks).toHaveLength(1);
+
+    rerender(<AdvancedPlanPanel snapshot={revision3} {...props} />);
+    expect(frames.callbacks).toHaveLength(2);
+    act(() => frames.run(2));
+    expect(screen.getByRole("button", { name: "Include" })).toHaveFocus();
+  });
+
+  it("cancels pending restoration on unmount before another editor can match it", () => {
+    const frames = stubAnimationFrames();
+    const item = editorItem("shared-focus", { label: "Shared focus" });
+    const snapshot = editorSnapshot([item]);
+    const props = {
+      busy: false,
+      confirmed: false,
+      editsConfirmed: true,
+      readOnly: false,
+      onEdit: async () => {},
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+      onReview: async () => {},
+    };
+    const { rerender } = render(
+      <>
+        <AdvancedPlanPanel key="first" snapshot={snapshot} {...props} />
+        <AdvancedPlanPanel key="second" snapshot={snapshot} {...props} />
+      </>,
+    );
+    act(() => screen.getAllByRole("button", { name: "Include" })[0].focus());
+    const next = {
+      ...snapshot,
+      revisionId: "shared-focus-revision-two",
+      revisionNumber: snapshot.revisionNumber + 1,
+    };
+    rerender(
+      <>
+        <AdvancedPlanPanel key="first" snapshot={next} {...props} />
+        <AdvancedPlanPanel key="second" snapshot={snapshot} {...props} />
+      </>,
+    );
+    expect(frames.callbacks).toHaveLength(1);
+    rerender(<AdvancedPlanPanel key="second" snapshot={snapshot} {...props} />);
+    expect(frames.canceled).toContain(1);
+    const search = screen.getByRole("searchbox", {
+      name: "Search findings and groups",
+    });
+    act(() => search.focus());
+    act(() => frames.run(1));
+    expect(search).toHaveFocus();
+  });
 
   it("sends the exact descendant exclusion identity set", () => {
     const folder = editorItem("project", { label: "Project", kind: "folder" });
@@ -432,6 +688,104 @@ describe("AdvancedPlanPanel large review navigation", () => {
     fireEvent.keyDown(finalRow, { key: "ArrowUp" });
     expect(
       screen.getByRole("listitem", { name: /Large finding 09999/ }),
+    ).toHaveFocus();
+  });
+
+  it("clamps a scrolled window when a revision removes most visible members", () => {
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    const items = Array.from({ length: 80 }, (_, index) =>
+      editorItem(`revision-${index}`, { groupIds: ["revision-group"] }),
+    );
+    const groups = [
+      editorGroup(
+        "revision-group",
+        items.map((item) => item.itemId),
+      ),
+    ];
+    const view = mount(editorSnapshot(items, groups));
+    const list = screen.getByRole("list", { name: "Grouped plan findings" });
+    list.scrollTop = 79 * 58;
+    fireEvent.scroll(list);
+    expect(
+      within(list).queryByRole("listitem", { name: /^revision-0,/ }),
+    ).not.toBeInTheDocument();
+    view.rerender(
+      <AdvancedPlanPanel
+        snapshot={editorSnapshot(
+          items.map((item, index) => ({ ...item, inPlan: index === 0 })),
+          groups,
+          {
+            revisionId: "fixture-revision-2",
+            revisionNumber: 2,
+          },
+        )}
+        busy={false}
+        confirmed={false}
+        onEdit={view.onEdit}
+        onUndo={view.onUndo}
+        onRedo={view.onRedo}
+        onRefresh={view.onRefresh}
+        onReview={view.onReview}
+      />,
+    );
+    expect(
+      within(list).getByRole("listitem", { name: /^revision-0,/ }),
+    ).toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(list.scrollTop).toBe(0);
+  });
+
+  it("keeps filtered rows visible when a 10,000-item window shrinks from the end", () => {
+    const items = Array.from({ length: 10_000 }, (_, index) =>
+      editorItem(`shrink-${index + 1}`, {
+        label: `Shrink finding ${String(index + 1).padStart(5, "0")}`,
+        groupIds: ["shrink-group"],
+      }),
+    );
+    const snapshot = editorSnapshot(items, [
+      editorGroup(
+        "shrink-group",
+        items.map((item) => item.itemId),
+      ),
+    ]);
+    mount(snapshot);
+    const list = screen.getByRole("list", { name: "Grouped plan findings" });
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 464,
+    });
+    list.scrollTop = 10_000 * 58;
+    fireEvent.scroll(list);
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 10000/ }),
+    ).toBeInTheDocument();
+
+    const search = screen.getByRole("searchbox", {
+      name: "Search findings and groups",
+    });
+    search.focus();
+    fireEvent.change(search, { target: { value: "Shrink finding 00001" } });
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 00001/ }),
+    ).toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    expect(search).toHaveFocus();
+    expect(list.scrollTop).toBe(0);
+
+    fireEvent.change(search, { target: { value: "" } });
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 00001/ }),
+    ).toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem").length).toBeLessThan(100);
+    expect(list.scrollTop).toBe(0);
+    const first = within(list).getByRole("listitem", {
+      name: /Shrink finding 00001/,
+    });
+    first.focus();
+    fireEvent.keyDown(first, { key: "ArrowDown" });
+    expect(
+      within(list).getByRole("listitem", { name: /Shrink finding 00002/ }),
     ).toHaveFocus();
   });
 });
