@@ -4,6 +4,8 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod decode;
+pub use decode::{decode_sha1_pack, DecodedPack, DecodedPackObject};
 mod object_identity;
 pub use object_identity::{git_sha1_object_id, GitObjectKind};
 mod inflate;
@@ -2113,6 +2115,7 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 #[cfg(test)]
 mod tests {
     mod checksum_tests;
+    mod decode_tests;
     mod delta_tests;
     mod entry_header_tests;
     mod failure_tests;
