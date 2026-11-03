@@ -301,19 +301,21 @@ bookkeeping check; it is not a completed reconciliation or cleanup receipt.
 
 ## Fixed six-object footprint observation
 
-The complete indexed payload fixture observes its known parent/store
+The complete and partial indexed payload fixtures observe their known parent/store
 directories, owner journal, payload, registry database and lease after confirmed
-worker shutdown and validated payload readback. It requires exact entry lists,
+worker shutdown and validated payload readback. Each requires exact entry lists,
 private metadata, distinct identities, held/named agreement and unchanged
 metadata across the observation. Unknown entries, SQLite sidecars or changed
 objects refuse the result. Observation uses checked sums of the larger of each
 object's logical length and native allocated blocks, with cooperative deadlines.
 
 The report includes the six-object byte total and count and checks the snapshot
-against 128 KiB. The complete mode charges this observation once into the parent
+against 128 KiB. Both modes charge their observation once into the parent
 budget; the existing reservation still admits the payload. This does not establish
-a whole-store quota or lifetime allocation peak. Partial and descriptor-only modes do not claim this
-observation. Files and reservations remain retained; no cleanup eligibility,
+a whole-store quota or lifetime allocation peak. Descriptor-only and stall modes
+do not claim this observation. Complete and partial observers require their own
+exact payload length and content; neither accepts the other's payload. Files and
+reservations remain retained; no cleanup eligibility,
 recovered-space claim, production aggregate accounting, OS containment or
 milestone acceptance is added.
 The report labels this as `fixture_snapshot=before_registry_reopen`. Reopening
@@ -322,12 +324,12 @@ the value is not a final or maximum footprint for the probe lifecycle.
 
 ## Parent observed-store accounting after worker shutdown
 
-The complete indexed payload fixture charges its validated six-object snapshot
-once into the same parent budget job that admitted the worker. It reports
-`parent_accounting_scope=fixed_six_objects`; the payload observation remains
-separately visible and is not added again. The partial fixture has no validated
-six-object snapshot and charges only payload allocation, reporting
-`parent_accounting_scope=payload_only`.
+The complete and partial indexed payload fixtures each charge their validated
+six-object snapshot once into the same parent budget job that admitted the
+worker. Both report `parent_accounting_scope=fixed_six_objects`; the separate
+payload observation remains visible and is not added again. Partial content is
+still validated as an incomplete 2 KiB prefix, and the complete-payload inspector
+must reject it. The partial snapshot follows its live reconciliation latch.
 
 The supervisor samples free space through the owned directory handle after the
 observation, records the observed bytes, then marks verification incomplete and
@@ -337,10 +339,9 @@ acknowledges the already confirmed worker stop. Reports expose
 and its original failure reason. Repeating settlement refuses before a second
 charge. The fixed observation-bound check also follows charging.
 
-The complete snapshot remains a before-registry-reopen checkpoint. Later SQLite
-writes can change allocation, and earlier peaks remain unknown. Partial mode
-excludes directories, journal and registry bytes. Descriptor-only and stall modes
-do not claim this settlement. Neither a complete synthetic payload nor a stopped
+Both snapshots remain before-registry-reopen checkpoints. Later SQLite writes
+can change allocation, and earlier peaks remain unknown. Descriptor-only and
+stall modes do not claim this settlement. Neither a complete synthetic payload nor a stopped
 child proves remote verification success. The budget retains usage, the registry
 retains its reservation and reconciliation blocker, and no cleanup is confirmed
 or authorized. Continuous parent monitoring, app-wide ownership and production

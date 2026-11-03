@@ -132,7 +132,7 @@ pub(super) fn write_stdin_payload_partial() -> Result<super::payload::PayloadRep
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn write_partial_payload_from_root(
+pub(super) fn write_partial_payload_from_root(
     root: &File,
 ) -> Result<super::payload::PayloadReport, StoreError> {
     validate_root_descriptor(root)?;
