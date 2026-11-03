@@ -1,0 +1,3 @@
+# Preserve both sides of append-only autonomous evidence; verify merged entries
+# and write an explicit current checkpoint as required by AGENTS.md.
+/.autonomous/disk-steward/progress.md merge=union
