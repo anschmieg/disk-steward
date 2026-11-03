@@ -298,3 +298,24 @@ prefix inspection. It checks immediate reservation-growth and lifecycle retry
 refusal, then requires reopening to preserve the same identity, prior Registered
 state and 128 KiB reservation. `reconciliation_latched=true` reports this
 bookkeeping check; it is not a completed reconciliation or cleanup receipt.
+
+## Fixed six-object footprint observation
+
+The complete indexed payload fixture observes its known parent/store
+directories, owner journal, payload, registry database and lease after confirmed
+worker shutdown and validated payload readback. It requires exact entry lists,
+private metadata, distinct identities, held/named agreement and unchanged
+metadata across the observation. Unknown entries, SQLite sidecars or changed
+objects refuse the result. Observation uses checked sums of the larger of each
+object's logical length and native allocated blocks, with cooperative deadlines.
+
+The report includes the six-object byte total and count and checks the snapshot
+against 128 KiB. That is a separate fixture observation: the existing reservation
+still admits the payload, and this does not establish a whole-store quota or
+lifetime allocation peak. Partial and descriptor-only modes do not claim this
+observation. Files and reservations remain retained; no cleanup eligibility,
+recovered-space claim, production aggregate accounting, OS containment or
+milestone acceptance is added.
+The report labels this as `fixture_snapshot=before_registry_reopen`. Reopening
+and later SQLite writes can change control-file allocation after the snapshot;
+the value is not a final or maximum footprint for the probe lifecycle.

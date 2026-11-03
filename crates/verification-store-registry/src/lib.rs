@@ -7,7 +7,7 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix::{
-    fs::{flock, FlockOperation},
+    fs::{flock, open, openat, FlockOperation, OFlags},
     process::geteuid,
 };
 use std::path::Path;
@@ -18,7 +18,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -111,6 +111,47 @@ pub struct StoreRecord {
     pub prior_state: Option<StoreState>,
     /// `u64::MAX` marks a migrated v1 row whose prior usage is unknown.
     pub reserved_bytes: u64,
+}
+
+/// Opaque, stable snapshot of the registry's fixed database and lease files.
+/// It exposes identities and a checked current byte observation, never paths or FDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlFootprint {
+    parent_identity: (u64, u64),
+    database_identity: (u64, u64),
+    lease_identity: (u64, u64),
+    observed_bytes: u64,
+    database_stamp: ControlFileStamp,
+    lease_stamp: ControlFileStamp,
+}
+
+impl ControlFootprint {
+    pub fn parent_identity(self) -> (u64, u64) {
+        self.parent_identity
+    }
+
+    pub fn file_identities(self) -> [(u64, u64); 2] {
+        [self.database_identity, self.lease_identity]
+    }
+
+    /// Sum of `max(file length, native 512-byte block count)` for the two files.
+    pub fn observed_bytes(self) -> u64 {
+        self.observed_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControlFileStamp {
+    identity: (u64, u64),
+    len: u64,
+    blocks: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 #[derive(Debug)]
@@ -513,6 +554,145 @@ impl VerificationStoreRegistry {
         Ok(record)
     }
 
+    /// Observe only the fixed private registry database and lease files.
+    /// This returns no filesystem capability and makes no admission claim.
+    pub fn observe_control_footprint(&self) -> Result<ControlFootprint, RegistryError> {
+        self.validate_lease()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| RegistryError::Storage)?;
+        validate_schema(&tx)?;
+        validate_records(&tx)?;
+        tx.commit().map_err(|_| RegistryError::Storage)?;
+        check_footprint_deadline(deadline)?;
+
+        let parent = open(
+            &self.parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|_| RegistryError::UnsafePath)?;
+        let parent_metadata = rustix::fs::fstat(&parent).map_err(|_| RegistryError::UnsafePath)?;
+        if (
+            parent_metadata.st_dev as u64,
+            parent_metadata.st_ino as u64,
+            parent_metadata.st_uid,
+        ) != self.parent_identity
+            || parent_metadata.st_mode & 0o7777 != 0o700
+            || parent_metadata.st_uid != geteuid().as_raw()
+        {
+            return Err(RegistryError::UnsafePath);
+        }
+        check_footprint_deadline(deadline)?;
+        let database_name = self
+            .database_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RegistryError::UnsafePath)?;
+        let lease_name = self
+            .lease_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RegistryError::UnsafePath)?;
+        let database = File::from(
+            openat(
+                &parent,
+                database_name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| RegistryError::UnsafePath)?,
+        );
+        let lease = File::from(
+            openat(
+                &parent,
+                lease_name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| RegistryError::UnsafePath)?,
+        );
+        check_footprint_deadline(deadline)?;
+        let database_meta = database.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        let lease_meta = lease.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        validate_control_file(
+            &database_meta,
+            Some((self.database_identity.0, self.database_identity.1)),
+        )?;
+        let held_lease_meta = self
+            ._lease
+            .metadata()
+            .map_err(|_| RegistryError::UnsafePath)?;
+        let held_lease_id = (held_lease_meta.dev(), held_lease_meta.ino());
+        validate_control_file(&held_lease_meta, Some(held_lease_id))?;
+        validate_control_file(&lease_meta, Some(held_lease_id))?;
+        let database_stamp = ControlFileStamp::from(&database_meta);
+        let lease_stamp = ControlFileStamp::from(&lease_meta);
+        let database_named =
+            fs::symlink_metadata(&self.database_path).map_err(|_| RegistryError::UnsafePath)?;
+        let lease_named =
+            fs::symlink_metadata(&self.lease_path).map_err(|_| RegistryError::UnsafePath)?;
+        validate_control_file(
+            &database_named,
+            Some((self.database_identity.0, self.database_identity.1)),
+        )?;
+        validate_control_file(&lease_named, Some(lease_stamp.identity))?;
+        if ControlFileStamp::from(&database_named) != database_stamp
+            || ControlFileStamp::from(&lease_named) != lease_stamp
+        {
+            return Err(RegistryError::UnsafePath);
+        }
+        check_footprint_deadline(deadline)?;
+        self.validate_lease()?;
+        let database_after = database.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        let lease_after = lease.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        let database_named_after =
+            fs::symlink_metadata(&self.database_path).map_err(|_| RegistryError::UnsafePath)?;
+        let lease_named_after =
+            fs::symlink_metadata(&self.lease_path).map_err(|_| RegistryError::UnsafePath)?;
+        if ControlFileStamp::from(&database_after) != database_stamp
+            || ControlFileStamp::from(&lease_after) != lease_stamp
+            || ControlFileStamp::from(&database_named_after) != database_stamp
+            || ControlFileStamp::from(&lease_named_after) != lease_stamp
+        {
+            return Err(RegistryError::UnsafePath);
+        }
+        self.validate_lease()?;
+        check_footprint_deadline(deadline)?;
+        let database_bytes = database_stamp.len.max(
+            database_stamp
+                .blocks
+                .checked_mul(512)
+                .ok_or(RegistryError::Storage)?,
+        );
+        let lease_bytes = lease_stamp.len.max(
+            lease_stamp
+                .blocks
+                .checked_mul(512)
+                .ok_or(RegistryError::Storage)?,
+        );
+        let observed_bytes = database_bytes
+            .checked_add(lease_bytes)
+            .ok_or(RegistryError::Storage)?;
+        let parent =
+            fs::symlink_metadata(&self.parent_path).map_err(|_| RegistryError::UnsafePath)?;
+        validate_private_dir(&self.parent_path)?;
+        if (parent.dev(), parent.ino(), parent.uid()) != self.parent_identity {
+            return Err(RegistryError::UnsafePath);
+        }
+        check_footprint_deadline(deadline)?;
+        Ok(ControlFootprint {
+            parent_identity: (self.parent_identity.0, self.parent_identity.1),
+            database_identity: database_stamp.identity,
+            lease_identity: lease_stamp.identity,
+            observed_bytes,
+            database_stamp,
+            lease_stamp,
+        })
+    }
+
     /// Bounded keyset page, at most 256 records. `after` is an opaque store ID cursor.
     pub fn list(
         &self,
@@ -601,6 +781,49 @@ fn read_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoreRecord> {
             .parse()
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_control_file(
+    metadata: &fs::Metadata,
+    expected_id: Option<(u64, u64)>,
+) -> Result<(), RegistryError> {
+    if !metadata.is_file()
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || expected_id.is_some_and(|expected| (metadata.dev(), metadata.ino()) != expected)
+    {
+        return Err(RegistryError::UnsafePath);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl From<&fs::Metadata> for ControlFileStamp {
+    fn from(metadata: &fs::Metadata) -> Self {
+        Self {
+            identity: (metadata.dev(), metadata.ino()),
+            len: metadata.len(),
+            blocks: metadata.blocks(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            uid: metadata.uid(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_footprint_deadline(deadline: Instant) -> Result<(), RegistryError> {
+    if Instant::now() >= deadline {
+        Err(RegistryError::Storage)
+    } else {
+        Ok(())
+    }
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_id(id: &str) -> Result<(), RegistryError> {
@@ -955,6 +1178,9 @@ impl VerificationStoreRegistry {
     pub fn get(&self, _: &str) -> Result<Option<StoreRecord>, RegistryError> {
         Err(RegistryError::UnsupportedPlatform)
     }
+    pub fn observe_control_footprint(&self) -> Result<ControlFootprint, RegistryError> {
+        Err(RegistryError::UnsupportedPlatform)
+    }
     pub fn list(&self, _: Option<&str>, _: usize) -> Result<Vec<StoreRecord>, RegistryError> {
         Err(RegistryError::UnsupportedPlatform)
     }
@@ -1236,6 +1462,22 @@ mod tests {
             r.reserve(id, 1024, 2048),
             Err(RegistryError::ReconciliationRequired)
         ));
+    }
+
+    #[test]
+    fn control_footprint_snapshot_is_stable_and_fixed_to_two_private_files() {
+        let (_dir, path) = setup();
+        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        let before = registry.observe_control_footprint().unwrap();
+        let after = registry.observe_control_footprint().unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before.parent_identity().0, registry.parent_identity.0);
+        assert_eq!(
+            before.file_identities()[0],
+            (registry.database_identity.0, registry.database_identity.1)
+        );
+        assert_ne!(before.file_identities()[0], before.file_identities()[1]);
+        assert!(before.observed_bytes() > 0);
     }
 
     #[test]
@@ -1566,6 +1808,10 @@ mod tests {
             Err(RegistryError::UnsupportedSchema)
         ));
         assert!(matches!(
+            registry.observe_control_footprint(),
+            Err(RegistryError::UnsupportedSchema)
+        ));
+        assert!(matches!(
             registry.require_reconciliation(id, StoreState::Registered),
             Err(RegistryError::UnsupportedSchema)
         ));
@@ -1675,6 +1921,10 @@ mod tests {
             Err(RegistryError::UnsafePath)
         ));
         assert!(matches!(
+            registry.observe_control_footprint(),
+            Err(RegistryError::UnsafePath)
+        ));
+        assert!(matches!(
             registry
                 .require_reconciliation("ffffffffffffffffffffffffffffffff", StoreState::Registered),
             Err(RegistryError::UnsafePath)
@@ -1693,6 +1943,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             registry.get("ffffffffffffffffffffffffffffffff"),
+            Err(RegistryError::UnsafePath)
+        ));
+        assert!(matches!(
+            registry.observe_control_footprint(),
             Err(RegistryError::UnsafePath)
         ));
         assert!(matches!(

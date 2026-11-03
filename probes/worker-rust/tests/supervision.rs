@@ -347,6 +347,8 @@ fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() 
         "descriptor_handoff=true",
         "payload_validated=true",
         "payload_written=32768",
+        "fixture_objects=6",
+        "fixture_snapshot=before_registry_reopen",
         "cleanup=not_authorized",
     ] {
         assert!(report.contains(evidence), "{report}");
@@ -358,6 +360,13 @@ fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() 
         .parse::<u64>()
         .unwrap();
     assert!((32768..=131072).contains(&high_water));
+    let fixture_observed = report
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("fixture_observed_bytes="))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((32768..=131072).contains(&fixture_observed));
     assert!(!report.contains("synthetic-payload-parent-only"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-payload-parent-only"));
 }
