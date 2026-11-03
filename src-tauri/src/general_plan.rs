@@ -304,6 +304,62 @@ pub(crate) async fn import_duplicate_review_items(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImportPytestReviewItemsRequest {
+    expected_observation_id: InventoryItemId,
+    inspection_id: InventoryItemId,
+    expected_revision_id: RevisionId,
+}
+
+/// Imports only native-retained pytest format evidence as blocked review items.
+#[tauri::command]
+pub(crate) async fn import_pytest_review_items(
+    request: ImportPytestReviewItemsRequest,
+    state: tauri::State<'_, GeneralPlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
+    inventory: tauri::State<'_, crate::folder_inventory::FolderInventoryState>,
+    exclusions: tauri::State<'_, crate::global_exclusions::ExclusionState>,
+) -> Result<EditorSnapshot, GeneralPlanError> {
+    let guard = edit_guard(&demo)?;
+    #[cfg(unix)]
+    {
+        let inventory = inventory.inner().clone();
+        let exclusions = exclusions.inner().clone();
+        let expected_revision = request.expected_revision_id;
+        let bundle = tauri::async_runtime::spawn_blocking(move || {
+            let unavailable = || GeneralPlanError {
+                code: "pytest_evidence_unavailable",
+                message: "Pytest format evidence changed or is no longer retained. Inspect those records again before importing.",
+            };
+            let started = std::time::Instant::now();
+            let duration = std::time::Duration::from_secs(2);
+            let (revision, policy) = exclusions.summary_policy(started, duration).map_err(|_| unavailable())?;
+            let bundle = inventory.pytest_review_bundle(request.expected_observation_id, request.inspection_id, &policy, revision, started, duration).map_err(|_| unavailable())?;
+            let (after_revision, after_policy) = exclusions.summary_policy(started, duration).map_err(|_| unavailable())?;
+            if revision != after_revision || policy != after_policy || started.elapsed() >= duration { return Err(unavailable()); }
+            // Policy loading can perform I/O; validate the retained names again
+            // after it before handing metadata to the plan transaction.
+            let revalidated = inventory.pytest_review_bundle(request.expected_observation_id, request.inspection_id, &after_policy, after_revision, started, duration).map_err(|_| unavailable())?;
+            if revalidated != bundle || started.elapsed() >= duration { return Err(unavailable()); }
+            Ok(revalidated)
+        }).await.map_err(|_| unavailable())??;
+        with_store(&state, Profile::Live, move |store| {
+            let _guard = guard;
+            store.append_pytest_evidence(expected_revision, bundle)
+        })
+        .await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (guard, request, state, inventory, exclusions);
+        Err(GeneralPlanError {
+            code: "pytest_evidence_unavailable",
+            message: "Pytest evidence import is unsupported on this platform.",
+        })
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn edit_general_plan(
     request: EditRequest,
@@ -562,6 +618,31 @@ mod tests {
             assert!(
                 serde_json::from_value::<super::ImportDuplicateReviewItemsRequest>(invalid)
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pytest_import_accepts_only_native_references_and_revision() {
+        let observation = serde_json::to_value(disk_steward_core::InventoryItemId::new()).unwrap();
+        let inspection = serde_json::to_value(disk_steward_core::InventoryItemId::new()).unwrap();
+        let revision = serde_json::to_value(disk_steward_core::RevisionId::new()).unwrap();
+        let valid = serde_json::json!({"expectedObservationId":observation,"inspectionId":inspection,"expectedRevisionId":revision});
+        assert!(
+            serde_json::from_value::<super::ImportPytestReviewItemsRequest>(valid.clone()).is_ok()
+        );
+        for (key, value) in [
+            ("path", serde_json::json!("/tmp/untrusted")),
+            ("items", serde_json::json!([])),
+            ("recordCount", serde_json::json!(2)),
+            ("records", serde_json::json!([])),
+            ("detectorVersion", serde_json::json!("forged")),
+            ("profile", serde_json::json!("pilot")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(
+                serde_json::from_value::<super::ImportPytestReviewItemsRequest>(invalid).is_err()
             );
         }
     }

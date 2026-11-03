@@ -274,6 +274,34 @@ impl GeneralPlanStore {
         Ok(snapshot)
     }
 
+    /// Atomically adds a bounded native pytest-cache evidence bundle.
+    /// The operation carries no paths or cleanup authority.
+    pub fn append_pytest_evidence(
+        &mut self,
+        expected_revision: RevisionId,
+        incoming: Vec<InventoryItem>,
+    ) -> StoreResult<EditorSnapshot> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut editor, _) = load_editor(&tx)?;
+        validate_all_reviews(&tx, &editor)?;
+        check_revision(editor.snapshot().revision_id, expected_revision)?;
+        let snapshot = editor.add_pytest_evidence(expected_revision, incoming)?;
+        snapshot
+            .items
+            .iter()
+            .filter_map(|item| item.logical_bytes)
+            .try_fold(0u64, u64::checked_add)
+            .filter(|total| *total <= MAX_SAFE_JS_LOGICAL_BYTES)
+            .ok_or(StoreError::DomainEdit(EditError::InvalidInventory))?;
+        if snapshot.revision_id != expected_revision {
+            save_editor(&tx, &editor)?;
+        }
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
     pub fn undo(&mut self, expected_revision: RevisionId) -> StoreResult<EditorSnapshot> {
         self.history_operation(expected_revision, true)
     }
@@ -746,6 +774,22 @@ mod tests {
         item
     }
 
+    fn pytest_evidence_item(mut item: InventoryItem) -> InventoryItem {
+        item.recovery_lower_bytes = None;
+        item.recovery_upper_bytes = None;
+        item.storage_identity = None;
+        item.blockers.push(Blocker {
+            code: "read_only_pytest".to_owned(),
+            reason: "Read-only pytest cache format evidence; no cleanup authority".to_owned(),
+        });
+        item.evidence.push(disk_steward_plan_model::EvidenceRef {
+            id: EvidenceId::new(),
+            summary: "pytest-cache-format-v1; reference 9.2.0; format only".to_owned(),
+        });
+        item.suggestion.choice = Choice::Keep;
+        item
+    }
+
     #[test]
     fn seeds_persists_edits_history_and_reviews() {
         let (_d, path) = db();
@@ -1048,6 +1092,125 @@ mod tests {
                 ],
                 vec![set],
             ),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(store.get_plan().unwrap(), before);
+    }
+
+    #[test]
+    fn pytest_evidence_append_is_additive_idempotent_and_preserves_frozen_review() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let initial = store.get_plan().unwrap();
+        let existing = metadata_only_item("nodeids.json");
+        let existing_id = existing.id;
+        let appended = store
+            .append_item(initial.revision_id, existing.clone())
+            .unwrap();
+        let edited = store
+            .edit(
+                appended.revision_id,
+                PlanEdit::SetMembership {
+                    item_id: existing_id,
+                    in_plan: false,
+                },
+            )
+            .unwrap();
+        let edited = store
+            .edit(
+                edited.snapshot.revision_id,
+                PlanEdit::SetChoice {
+                    item_id: existing_id,
+                    choice: Choice::Keep,
+                },
+            )
+            .unwrap();
+        let frozen = store.freeze_review(edited.snapshot.revision_id).unwrap();
+        let new_item = metadata_only_item("lastfailed.json");
+        let incoming = vec![
+            pytest_evidence_item(existing.clone()),
+            pytest_evidence_item(new_item.clone()),
+        ];
+        let enriched = store
+            .append_pytest_evidence(edited.snapshot.revision_id, incoming.clone())
+            .unwrap();
+        let old = enriched
+            .items
+            .iter()
+            .find(|row| row.item_id == existing_id)
+            .unwrap();
+        assert!(!old.in_plan);
+        assert_eq!(old.user_choice, Some(Choice::Keep));
+        assert!(old
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "read_only_pytest"));
+        assert_eq!(old.evidence.len(), existing.evidence.len() + 1);
+        let added = enriched
+            .items
+            .iter()
+            .find(|row| row.item_id == new_item.id)
+            .unwrap();
+        assert!(added.in_plan);
+        assert_eq!(added.suggestion.choice, Choice::Keep);
+        assert!(added
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "read_only_pytest"));
+        assert_eq!(store.get_saved_review(frozen.review_id).unwrap(), frozen);
+        let repeated = store
+            .append_pytest_evidence(enriched.revision_id, incoming.clone())
+            .unwrap();
+        assert_eq!(repeated.revision_id, enriched.revision_id);
+        let before = store.get_plan().unwrap();
+        assert!(matches!(
+            store.append_pytest_evidence(RevisionId::new(), incoming.clone()),
+            Err(StoreError::StaleRevision)
+        ));
+        let mut unsafe_item = pytest_evidence_item(existing.clone());
+        unsafe_item.storage_identity = Some("shared".to_owned());
+        assert!(matches!(
+            store.append_pytest_evidence(before.revision_id, vec![unsafe_item]),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        let mut over_limit = pytest_evidence_item(existing.clone());
+        over_limit.logical_bytes = Some(65_537);
+        assert!(matches!(
+            store.append_pytest_evidence(before.revision_id, vec![over_limit]),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        let too_many = vec![
+            pytest_evidence_item(metadata_only_item("a")),
+            pytest_evidence_item(metadata_only_item("b")),
+            pytest_evidence_item(metadata_only_item("c")),
+        ];
+        assert!(matches!(
+            store.append_pytest_evidence(before.revision_id, too_many),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(store.get_plan().unwrap(), before);
+        let undone = store.undo(repeated.revision_id).unwrap();
+        assert_eq!(undone.items.len(), edited.snapshot.items.len());
+        drop(store);
+        let mut reopened = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), undone);
+        let redone = reopened.redo(undone.revision_id).unwrap();
+        assert_eq!(redone.items.len(), repeated.items.len());
+        assert_eq!(reopened.get_saved_review(frozen.review_id).unwrap(), frozen);
+    }
+
+    #[test]
+    fn pytest_evidence_safe_total_failure_rolls_back_transaction() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let mut large = metadata_only_item("near-safe-limit.bin");
+        large.logical_bytes = Some(MAX_SAFE_JS_LOGICAL_BYTES - 10);
+        let initial = store.get_plan().unwrap();
+        let base = store.append_item(initial.revision_id, large).unwrap();
+        let before = store.get_plan().unwrap();
+        let incoming = pytest_evidence_item(metadata_only_item("pytest-record.json"));
+        assert!(matches!(
+            store.append_pytest_evidence(base.revision_id, vec![incoming]),
             Err(StoreError::DomainEdit(EditError::InvalidInventory))
         ));
         assert_eq!(store.get_plan().unwrap(), before);
