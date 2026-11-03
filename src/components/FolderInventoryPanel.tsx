@@ -100,29 +100,38 @@ export default function FolderInventoryPanel({
   useEffect(() => {
     if (active && treeSummary) treeHeadingRef.current?.focus();
   }, [treeSummary, active]);
-  const inspect = async (entryId?: string | null, nextPage = false) => {
+  const inspect = async (
+    entryId?: string | null,
+    pageAction?: "next" | "refresh",
+  ) => {
+    const nextPage = pageAction === "next";
+    const refreshing = pageAction === "refresh";
     if (activeRequest.current || !native) return;
-    if ((nextPage || entryId !== undefined) && !snapshot) return;
+    if ((pageAction || entryId !== undefined) && !snapshot) return;
     activeRequest.current = true;
     setBusy(true);
     onBusyChange(true);
     setMessage("");
     try {
       const next =
-        entryId === undefined && !nextPage
+        entryId === undefined && !pageAction
           ? await invoke<FolderInventory | null>(
               "inspect_selected_folder_entries",
             )
-          : nextPage
-            ? await invoke<FolderInventory>("continue_folder_inventory", {
+          : refreshing
+            ? await invoke<FolderInventory>("refresh_folder_inventory", {
                 request: { expectedObservationId: snapshot!.observationId },
               })
-            : await invoke<FolderInventory>("navigate_folder_inventory", {
-                request: {
-                  expectedObservationId: snapshot!.observationId,
-                  entryId,
-                },
-              });
+            : nextPage
+              ? await invoke<FolderInventory>("continue_folder_inventory", {
+                  request: { expectedObservationId: snapshot!.observationId },
+                })
+              : await invoke<FolderInventory>("navigate_folder_inventory", {
+                  request: {
+                    expectedObservationId: snapshot!.observationId,
+                    entryId,
+                  },
+                });
       if (next) {
         setTreeSummary(null);
         inspectorReturnRef.current = null;
@@ -130,6 +139,10 @@ export default function FolderInventoryPanel({
         setImported(false);
         setSnapshot(next);
         setQuery("");
+        if (refreshing)
+          setMessage(
+            "Folder refreshed. Paging restarted at the first page; saved plan and review metadata are unchanged.",
+          );
       } else
         setMessage(
           "Folder selection canceled. The previous observation is unchanged.",
@@ -142,8 +155,10 @@ export default function FolderInventoryPanel({
         );
       setMessage(
         nextPage
-          ? "Enumeration could not continue reliably. The previous page is historical; choose the folder again to restart."
-          : "The folder could not be inspected. Choose it again to retry. Any previous observation remains below.",
+          ? "Enumeration could not continue reliably. The previous page is historical; refresh this folder or choose it again to restart."
+          : refreshing
+            ? "The current folder could not be refreshed reliably. Its previous page and scope remain unchanged. Choose the folder again if access or identity changed."
+            : "The folder could not be inspected. Choose it again to retry. Any previous observation remains below.",
       );
     } finally {
       activeRequest.current = false;
@@ -341,6 +356,19 @@ export default function FolderInventoryPanel({
           <button
             className="button secondary"
             disabled={busy || !native}
+            onClick={() => void inspect(undefined, "refresh")}
+          >
+            Refresh current folder
+          </button>
+          <p>
+            Refresh retries metadata access for this retained folder and
+            restarts paging at page one. It clears the old subtree summary and
+            inspection on success; saved plan decisions and review metadata stay
+            unchanged.
+          </p>
+          <button
+            className="button secondary"
+            disabled={busy || !native}
             onClick={() => void clearFolder()}
           >
             Clear folder scope
@@ -480,7 +508,7 @@ export default function FolderInventoryPanel({
           <button
             className="button secondary"
             disabled={busy || !snapshot.canContinue}
-            onClick={() => void inspect(undefined, true)}
+            onClick={() => void inspect(undefined, "next")}
           >
             Next page
           </button>

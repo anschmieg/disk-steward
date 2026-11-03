@@ -81,6 +81,7 @@ pub fn run() {
             folder_inventory::inspect_selected_folder_entries,
             folder_inventory::navigate_folder_inventory,
             folder_inventory::continue_folder_inventory,
+            folder_inventory::refresh_folder_inventory,
             folder_inventory::clear_folder_inventory,
             folder_inventory::inspect_folder_tree_summary,
             folder_inventory::cancel_folder_tree_summary,

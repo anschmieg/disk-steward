@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-refresh-folder-inventory"
+description = "Enables the refresh_folder_inventory command without any pre-configured scope."
+commands.allow = ["refresh_folder_inventory"]
+
+[[permission]]
+identifier = "deny-refresh-folder-inventory"
+description = "Denies the refresh_folder_inventory command without any pre-configured scope."
+commands.deny = ["refresh_folder_inventory"]

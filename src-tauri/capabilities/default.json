@@ -12,6 +12,7 @@
     "allow-inspect-selected-folder-entries",
     "allow-navigate-folder-inventory",
     "allow-continue-folder-inventory",
+    "allow-refresh-folder-inventory",
     "allow-clear-folder-inventory",
     "allow-inspect-folder-tree-summary",
     "allow-cancel-folder-tree-summary",
