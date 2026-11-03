@@ -490,6 +490,7 @@ dependencies = [
  "rustix",
  "rustls",
  "verification-budget",
+ "verification-store-registry",
  "webpki-roots",
 ]
 

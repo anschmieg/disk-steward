@@ -2103,7 +2103,7 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 #[cfg(test)]
 mod tests {
     mod failure_tests;
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod git_interop;
     mod pack_tests;
 
