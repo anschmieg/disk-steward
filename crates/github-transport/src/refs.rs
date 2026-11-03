@@ -79,6 +79,16 @@ impl AdvertisedRef {
 }
 
 pub(super) fn read_advertised_refs(t: &mut GitHubTransport) -> io::Result<Vec<AdvertisedRef>> {
+    read_refs(t, false)
+}
+
+pub(super) fn read_advertised_refs_for_fetch(
+    t: &mut GitHubTransport,
+) -> io::Result<Vec<AdvertisedRef>> {
+    read_refs(t, true)
+}
+
+fn read_refs(t: &mut GitHubTransport, require_fetch: bool) -> io::Result<Vec<AdvertisedRef>> {
     let cancellation = t.cancellation_handle();
     let deadline = t.deadline;
     check_deadline(deadline)?;
@@ -113,7 +123,12 @@ pub(super) fn read_advertised_refs(t: &mut GitHubTransport) -> io::Result<Vec<Ad
                 .and_then(|cap| cap.value())
                 .map(|v| v == "sha1")
                 .unwrap_or(false));
-    if protocol != Protocol::V2 || !ls_refs || !sha1 {
+    let fetch_supported = capabilities
+        .iter()
+        .filter(|cap| cap.name() == "fetch")
+        .count()
+        == 1;
+    if protocol != Protocol::V2 || !ls_refs || !sha1 || (require_fetch && !fetch_supported) {
         return Err(safe_error(
             io::ErrorKind::InvalidData,
             "unsupported Git protocol capabilities",
@@ -175,7 +190,7 @@ pub(super) fn read_advertised_refs(t: &mut GitHubTransport) -> io::Result<Vec<Ad
 
 // Third-party transport layers can wrap an I/O cause in ErrorKind::Other.
 // Inspect only bounded cause metadata; never copy diagnostic payloads.
-fn io_failure_kind(error: &io::Error) -> io::ErrorKind {
+pub(super) fn io_failure_kind(error: &io::Error) -> io::ErrorKind {
     let mut cause: &(dyn std::error::Error + 'static) = error;
     for _ in 0..32 {
         if let Some(error) = cause.downcast_ref::<io::Error>() {
@@ -201,7 +216,10 @@ fn io_failure_kind(error: &io::Error) -> io::ErrorKind {
     io::ErrorKind::Other
 }
 
-fn map_client_error(error: gix_transport::client::Error, message: &'static str) -> io::Error {
+pub(super) fn map_client_error(
+    error: gix_transport::client::Error,
+    message: &'static str,
+) -> io::Error {
     use gix_transport::client::Error as ClientError;
 
     let kind = match error {

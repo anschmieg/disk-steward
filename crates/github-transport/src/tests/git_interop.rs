@@ -11,7 +11,6 @@ const GIT: &str = "/usr/bin/git";
 const MAX_GIT_IN: usize = 512;
 const MAX_GIT_OUT: usize = 65_536;
 const MAX_PACK: usize = 512;
-const MAX_PACKETS: usize = 128;
 const GIT_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 
@@ -304,147 +303,6 @@ fn make_repository(root: &PrivateRoot) -> io::Result<(String, String, String, St
     Ok((path_arg.to_owned(), blob, tree, commit, tag_object))
 }
 
-fn fetch_pack(
-    mut transport: GitHubTransport,
-    commit: &str,
-    tag: &str,
-) -> io::Result<(Vec<u8>, HttpFinalizationReport)> {
-    use gix_transport::client::blocking_io::{
-        ExtendedBufRead as _, ReadlineBufRead as _, TransportV2Ext as _,
-    };
-
-    let handshake = gix_transport::client::blocking_io::Transport::handshake(
-        &mut transport,
-        gix_transport::Service::UploadPack,
-        &[],
-    )
-    .map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch handshake failed"))?;
-    let protocol = handshake.actual_protocol;
-    let capabilities = handshake.capabilities.clone();
-    drop(handshake);
-    let fetch_count = capabilities
-        .iter()
-        .filter(|capability| capability.name() == "fetch")
-        .count();
-    let format_count = capabilities
-        .iter()
-        .filter(|capability| capability.name() == "object-format")
-        .count();
-    let sha1 = format_count == 0
-        || (format_count == 1
-            && capabilities
-                .capability("object-format")
-                .and_then(|capability| capability.value())
-                .map(|value| value == "sha1")
-                .unwrap_or(false));
-    if protocol != gix_transport::Protocol::V2 || fetch_count != 1 || !sha1 {
-        return Err(safe_error(
-            io::ErrorKind::InvalidData,
-            "unsupported fetch capabilities",
-        ));
-    }
-    let args: Vec<gix_transport::bstr::BString> = vec![
-        format!("want {commit}").into(),
-        format!("want {tag}").into(),
-        "ofs-delta".into(),
-        "no-progress".into(),
-        "done".into(),
-    ];
-    let mut reader = transport
-        .invoke(
-            "fetch",
-            std::iter::empty::<(&str, Option<&str>)>(),
-            Some(args.into_iter()),
-            false,
-        )
-        .map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch request failed"))?;
-    let first = reader
-        .readline()
-        .ok_or_else(|| safe_error(io::ErrorKind::UnexpectedEof, "fetch response missing"))?
-        .map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch response malformed"))?;
-    if !matches!(
-        first,
-        Ok(gix_transport::packetline::PacketLineRef::Data(
-            b"packfile\n"
-        ))
-    ) {
-        return Err(safe_error(
-            io::ErrorKind::InvalidData,
-            "fetch packfile section missing",
-        ));
-    }
-    let mut pack = Vec::new();
-    let mut packets = 0usize;
-    loop {
-        let Some(line) = reader.readline() else {
-            if reader.stopped_at() == Some(gix_transport::client::MessageKind::Flush) {
-                break;
-            }
-            return Err(safe_error(
-                io::ErrorKind::UnexpectedEof,
-                "fetch pack truncated",
-            ));
-        };
-        packets += 1;
-        if packets > MAX_PACKETS {
-            return Err(safe_error(
-                io::ErrorKind::InvalidData,
-                "fetch packet limit exceeded",
-            ));
-        }
-        let line =
-            line.map_err(|_| safe_error(io::ErrorKind::InvalidData, "fetch packet malformed"))?;
-        match line {
-            Ok(gix_transport::packetline::PacketLineRef::Data(data)) if !data.is_empty() => {
-                match data[0] {
-                    1 => {
-                        let payload = &data[1..];
-                        if payload.len() > MAX_PACK.saturating_sub(pack.len()) {
-                            return Err(safe_error(
-                                io::ErrorKind::InvalidData,
-                                "fetch pack limit exceeded",
-                            ));
-                        }
-                        pack.extend_from_slice(payload);
-                    }
-                    2 => {}
-                    3 => {
-                        return Err(safe_error(
-                            io::ErrorKind::InvalidData,
-                            "fetch server reported failure",
-                        ))
-                    }
-                    _ => {
-                        return Err(safe_error(
-                            io::ErrorKind::InvalidData,
-                            "fetch sideband channel invalid",
-                        ))
-                    }
-                }
-            }
-            _ => {
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "fetch response terminator invalid",
-                ))
-            }
-        }
-    }
-    debug_assert_eq!(
-        reader.stopped_at(),
-        Some(gix_transport::client::MessageKind::Flush)
-    );
-    drop(reader);
-    let finalization = transport.finalize_http_framing()?;
-    if !finalization.is_complete() || pack.is_empty() {
-        return Err(safe_error(
-            io::ErrorKind::UnexpectedEof,
-            "fetch HTTP framing incomplete",
-        ));
-    }
-    Ok((pack, finalization))
-}
-
 fn create_receiver(root: &PrivateRoot, name: &str) -> io::Result<PathBuf> {
     let path = root.path.join(name);
     let path_arg = path
@@ -581,129 +439,82 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let server_tls = tls.server.clone();
     let expected_commit = commit.clone();
     let expected_tag = tag_object.clone();
-    let server = thread::spawn(
-        move || -> io::Result<(PrivateRoot, (bool, bool, bool, bool))> {
-            let socket = accept_until(&listener)?;
-            let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
-            stream.sock.deadline = Instant::now() + Duration::from_secs(10);
-            let (method, target, _) = read_v2_request(&mut stream)?;
-            if method != "GET" || target != "/example/repo.git/info/refs?service=git-upload-pack" {
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "unexpected Git advertisement request",
-                ));
-            }
-            let advertisement = git_upload_pack(
-                &root,
-                &["upload-pack", "--stateless-rpc", "--advertise-refs", &repo],
-                b"",
-            )?;
-            write_response(
-                &mut stream,
-                "application/x-git-upload-pack-advertisement",
-                &advertisement,
-            )?;
-            drop(stream);
-
+    let server = thread::spawn(move || -> io::Result<PrivateRoot> {
+        for index in 0..5 {
             let socket = accept_until(&listener)?;
             let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
             stream.sock.deadline = Instant::now() + Duration::from_secs(10);
             let (method, target, body) = read_v2_request(&mut stream)?;
-            if method != "POST" || target != "/example/repo.git/git-upload-pack" {
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "unexpected Git upload-pack request",
-                ));
-            }
-            if body != b"0014command=ls-refs\n00010009peel\n000csymrefs\n0000" {
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "unexpected fixture Git command",
-                ));
-            }
-            let response =
-                git_upload_pack(&root, &["upload-pack", "--stateless-rpc", &repo], &body)?;
-            write_response(
-                &mut stream,
-                "application/x-git-upload-pack-result",
-                &response,
-            )?;
-            drop(stream);
-
-            let socket = accept_until(&listener)?;
-            let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
-            stream.sock.deadline = Instant::now() + Duration::from_secs(10);
-            let (method, target, _) = read_v2_request(&mut stream)?;
-            if method != "GET" || target != "/example/repo.git/info/refs?service=git-upload-pack" {
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "unexpected Git fetch advertisement request",
-                ));
-            }
-            let advertisement = git_upload_pack(
-                &root,
-                &["upload-pack", "--stateless-rpc", "--advertise-refs", &repo],
-                b"",
-            )?;
-            write_response(
-                &mut stream,
-                "application/x-git-upload-pack-advertisement",
-                &advertisement,
-            )?;
-            drop(stream);
-
-            let socket = accept_until(&listener)?;
-            let mut stream = tls_stream(socket, Arc::clone(&server_tls))?;
-            stream.sock.deadline = Instant::now() + Duration::from_secs(10);
-            let (method, target, body) = read_v2_request(&mut stream)?;
-            if method != "POST" || target != "/example/repo.git/git-upload-pack" {
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "unexpected Git fetch request",
-                ));
-            }
-            let want = format!("want {expected_commit}\n");
-            let tag_want = format!("want {expected_tag}\n");
-            let expected_fetch = [
-                packet_line("command=fetch"),
-                "0001".to_owned(),
-                packet_line(want.trim_end()),
-                packet_line(tag_want.trim_end()),
-                packet_line("ofs-delta"),
-                packet_line("no-progress"),
-                packet_line("done"),
-                "0000".to_owned(),
-            ]
-            .concat();
-            if body != expected_fetch.as_bytes() {
-                return Err(safe_error(
-                    io::ErrorKind::InvalidData,
-                    "unexpected fetch request body",
-                ));
-            }
-            let response =
-                git_upload_pack(&root, &["upload-pack", "--stateless-rpc", &repo], &body)?;
-            write_response(
-                &mut stream,
-                "application/x-git-upload-pack-result",
-                &response,
-            )?;
-            Ok((root, (true, true, true, true)))
-        },
-    );
+            let (ct, response) = if index == 0 || index == 2 {
+                if method != "GET"
+                    || target != "/example/repo.git/info/refs?service=git-upload-pack"
+                {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "unexpected fixture GET",
+                    ));
+                }
+                (
+                    "application/x-git-upload-pack-advertisement",
+                    git_upload_pack(
+                        &root,
+                        &["upload-pack", "--stateless-rpc", "--advertise-refs", &repo],
+                        b"",
+                    )?,
+                )
+            } else {
+                if method != "POST" || target != "/example/repo.git/git-upload-pack" {
+                    return Err(safe_error(
+                        io::ErrorKind::InvalidData,
+                        "unexpected fixture POST",
+                    ));
+                }
+                if index < 4 {
+                    if body != b"0014command=ls-refs\n00010009peel\n000csymrefs\n0000" {
+                        return Err(safe_error(
+                            io::ErrorKind::InvalidData,
+                            "unexpected fixture ls-refs",
+                        ));
+                    }
+                } else {
+                    let mut wants = vec![expected_commit.clone(), expected_tag.clone()];
+                    wants.sort();
+                    let mut expected = packet_line("command=fetch");
+                    expected.push_str("0001");
+                    for oid in wants {
+                        expected.push_str(&packet_line(&format!("want {oid}")));
+                    }
+                    for arg in ["ofs-delta", "no-progress", "done"] {
+                        expected.push_str(&packet_line(arg));
+                    }
+                    expected.push_str("0000");
+                    if body != expected.as_bytes() {
+                        return Err(safe_error(
+                            io::ErrorKind::InvalidData,
+                            "unexpected fixture fetch",
+                        ));
+                    }
+                }
+                (
+                    "application/x-git-upload-pack-result",
+                    git_upload_pack(&root, &["upload-pack", "--stateless-rpc", &repo], &body)?,
+                )
+            };
+            write_response(&mut stream, ct, &response)?;
+        }
+        Ok(root)
+    });
     let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let report_result = candidate_transport(repository.clone(), &tls, address).observe_refs();
     let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
-    let fetch_result = fetch_pack(
-        candidate_transport(fetch_repository, &tls, address),
-        &commit,
-        &tag_object,
-    );
-    let server_result = server.join();
-    let (root, server_observations) = server_result.expect("fixture server panicked").unwrap();
-    assert_eq!(server_observations, (true, true, true, true));
+    let mut pack = Vec::new();
+    let fetch_result =
+        candidate_transport(fetch_repository, &tls, address).download_advertised_pack(&mut pack);
+    let root = server.join().expect("fixture server panicked").unwrap();
     let report = report_result.unwrap();
-    let (pack, fetch_finalization) = fetch_result.unwrap();
+    let fetch_report = fetch_result.unwrap();
+    assert!(fetch_report.is_complete_transfer(), "{fetch_report:?}");
+    assert_eq!(fetch_report.bytes_written(), pack.len() as u64);
     assert!(
         report.is_complete(),
         "real Git v2 refs exchange did not complete: {report:?}"
@@ -729,8 +540,8 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
         pack.len() <= MAX_PACK && pack.len() <= MAX_GIT_IN,
         "fixture pack exceeds bounded Git input"
     );
-    assert!(fetch_finalization.is_complete());
-    assert_eq!(fetch_finalization.framing().completed(), 2);
+    assert!(fetch_report.finalization().is_complete());
+    assert_eq!(fetch_report.finalization().framing().completed(), 3);
 
     let receiver = create_receiver(&root, "receiver.git").unwrap();
     let receiver_arg = receiver_path_arg(&receiver).unwrap();

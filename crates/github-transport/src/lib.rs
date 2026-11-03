@@ -4,7 +4,9 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod pack;
 mod refs;
+pub use pack::PackTransferReport;
 pub use refs::{AdvertisedRef, RefObservationReport};
 
 #[cfg(not(test))]
@@ -472,6 +474,17 @@ impl GitHubTransport {
     /// retention. Prefer this API over the separate low-level stages.
     pub fn observe_refs(self) -> io::Result<RefObservationReport> {
         refs::observe_refs(self)
+    }
+
+    /// Download the bounded pack for all freshly advertised tips to a backend
+    /// caller's sink. Completion proves transfer framing only, not object
+    /// integrity or recoverability. The caller must enforce owned-store space
+    /// admission and supervise blocking sink I/O in an outer worker.
+    pub fn download_advertised_pack(
+        self,
+        sink: &mut impl io::Write,
+    ) -> io::Result<PackTransferReport> {
+        pack::download_advertised_pack(self, sink)
     }
 
     /// Low-level Git v2 `ls-refs` stage. Call `finalize_http_framing` afterward
@@ -2092,6 +2105,7 @@ mod tests {
     mod failure_tests;
     #[cfg(unix)]
     mod git_interop;
+    mod pack_tests;
 
     use super::*;
     use gix_transport::bstr::ByteSlice as _;
