@@ -633,9 +633,7 @@ impl DemoExecutionService {
                     .map(|_| ())
             });
         if ledger_result.is_err() {
-            self.purge
-                .mark_execution_uncertain(execution_id, &attempts, after)
-                .map_err(map_purge)?;
+            self.record_purge_uncertainty(execution_id, &attempts, after)?;
             return Err(DemoError::LedgerUnavailable);
         }
         let execution_time = self.checked_now();
@@ -652,25 +650,66 @@ impl DemoExecutionService {
         let execution_time = match execution_check {
             Ok(time) => time,
             Err(error) => {
-                self.purge
-                    .mark_execution_uncertain(execution_id, &attempts, after)
-                    .map_err(map_purge)?;
+                self.record_purge_uncertainty(execution_id, &attempts, after)?;
                 return Err(error);
             }
         };
         let _ = execution_time;
         let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
         let volume_before = sample_volume(lifecycle);
-        let mut result = self
-            .purge
-            .execute_claimed_batch(lifecycle, execution_id, &prepared, attempts)
-            .map_err(map_purge)?;
+        let batch =
+            self.purge
+                .execute_claimed_batch(lifecycle, execution_id, &prepared, attempts.clone());
         let volume_after = sample_volume(lifecycle);
+        let mut result = match batch {
+            Ok(result) => result,
+            Err(error) => {
+                self.record_purge_uncertainty(execution_id, &attempts, after)?;
+                return Err(map_purge(error));
+            }
+        };
+        let finished = match self.checked_now() {
+            Ok(time) => time,
+            Err(error) => {
+                self.record_purge_uncertainty(execution_id, &attempts, after)?;
+                return Err(error);
+            }
+        };
+        let terminal = if result.state == "finished" {
+            self.ledger
+                .record_intent_finished(&execution_wire, finished)
+        } else {
+            self.ledger
+                .record_intent_uncertain(&execution_wire, finished)
+        };
+        if terminal.is_err() {
+            self.record_purge_uncertainty(execution_id, &attempts, finished)?;
+            return Err(DemoError::LedgerUnavailable);
+        }
         if result.state == "finished" {
             result.volume_observation =
                 volume_observation(execution_id, volume_before, volume_after);
         }
         Ok(result)
+    }
+
+    fn record_purge_uncertainty(
+        &mut self,
+        execution: ExecutionId,
+        attempts: &[AttemptId],
+        at: i64,
+    ) -> DemoResult<()> {
+        let _ = self.ledger.record_intent_uncertain(&wire(&execution)?, at);
+        if self
+            .purge
+            .mark_execution_uncertain(execution, attempts, at)
+            .is_err()
+        {
+            self.poisoned = true;
+            self.lease.take();
+            return Err(DemoError::Storage);
+        }
+        Ok(())
     }
 
     fn prepare(
@@ -2779,6 +2818,32 @@ mod tests {
                 .expect("exact non-prefix subset must pass the approval/claim path");
             assert_eq!(result.state, "finished");
             assert_eq!(result.items.len(), targets.len());
+            // A completed approved execution cannot be redirected to a retained
+            // receipt through the lower-level trusted batch API.
+            let retained = before
+                .fixtures
+                .iter()
+                .find(|fixture| {
+                    !targets
+                        .iter()
+                        .any(|target| target.action_id == fixture.action_id)
+                })
+                .unwrap();
+            let mut redirected = review.clone();
+            redirected.targets[0].action_id = retained.action_id;
+            redirected.targets[0].receipt_id = retained.receipt_id.unwrap();
+            redirected.targets[0].logical_bytes = retained.bytes;
+            let attempts = result.items.iter().map(|item| item.attempt_id).collect();
+            assert!(service
+                .purge
+                .execute_claimed_batch(
+                    service.lifecycle.as_mut().unwrap(),
+                    result.execution_id,
+                    &redirected,
+                    attempts
+                )
+                .is_err());
+            assert!(!service.purge.has_uncertainty().unwrap());
             let after = service.status().unwrap();
             let session_component = wire(&before.session_id.unwrap())
                 .unwrap()
@@ -2948,6 +3013,14 @@ mod tests {
             intents, 2,
             "the stage and purge execution intents are durably recorded"
         );
+        assert_eq!(
+            service
+                .ledger
+                .execution_intent(&wire(&result.execution_id).unwrap())
+                .unwrap()
+                .state,
+            disk_steward_approval_ledger::IntentState::Finished
+        );
     }
 
     #[test]
@@ -3009,6 +3082,133 @@ mod tests {
                 result.selected_logical_bytes
             );
         }
+    }
+
+    #[test]
+    fn purge_batch_terminal_write_error_records_cross_store_uncertainty() {
+        for (fault, expected_error) in [
+            ("CREATE TRIGGER fail_batch_terminal BEFORE UPDATE ON purge_executions WHEN NEW.state='finished' BEGIN SELECT RAISE(ABORT, 'injected terminal batch write failure'); END;", DemoError::Storage),
+            ("CREATE TRIGGER fail_batch_terminal BEFORE UPDATE ON purge_child_attempts WHEN NEW.state='permanently_removed' BEGIN SELECT RAISE(IGNORE); END;", DemoError::ExecutionUncertain),
+        ] {
+        let (dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let stage = service.prepare_stage(plan.revision_id).unwrap();
+        service
+            .confirm_and_execute(stage.review_id, |_| true)
+            .unwrap();
+        let fixture = service.status().unwrap().fixtures[0].clone();
+        let review = service
+            .prepare_purge_review(
+                plan.revision_id,
+                vec![disk_steward_fixture_purge::PurgeTarget {
+                    action_id: fixture.action_id,
+                    receipt_id: fixture.receipt_id.unwrap(),
+                }],
+            )
+            .unwrap();
+        let control =
+            Connection::open(dir.path().join("fixture-purge-control-v1.sqlite3")).unwrap();
+        control.execute_batch(fault).unwrap();
+        assert_eq!(
+            service
+                .confirm_purge_execution(review.review_id, |_| true)
+                .unwrap_err(),
+            expected_error
+        );
+        assert!(service.purge.has_uncertainty().unwrap());
+        let current = service.status().unwrap();
+        assert_eq!(
+            current
+                .fixtures
+                .iter()
+                .find(|item| item.action_id == fixture.action_id)
+                .unwrap()
+                .status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        let ledger = Connection::open(dir.path().join(LEDGER_DB)).unwrap();
+        let uncertain: i64 = ledger
+            .query_row(
+                "SELECT COUNT(*) FROM execution_intents WHERE state='uncertain'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uncertain, 1);
+        let batch_state: String = control
+            .query_row("SELECT state FROM purge_executions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(batch_state, "uncertain");
+        control
+            .execute_batch("DROP TRIGGER fail_batch_terminal;")
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn purge_terminal_ledger_failure_preserves_removed_receipt_and_blocks_after_reopen() {
+        let (dir, mut service, plan) = fixture_service();
+        let plan = include_one(&mut service, &plan);
+        let stage = service.prepare_stage(plan.revision_id).unwrap();
+        service
+            .confirm_and_execute(stage.review_id, |_| true)
+            .unwrap();
+        let fixture = service.status().unwrap().fixtures[0].clone();
+        let target = disk_steward_fixture_purge::PurgeTarget {
+            action_id: fixture.action_id,
+            receipt_id: fixture.receipt_id.unwrap(),
+        };
+        let review = service
+            .prepare_purge_review(plan.revision_id, vec![target])
+            .unwrap();
+        let ledger_path = dir.path().join(LEDGER_DB);
+        let external = Connection::open(&ledger_path).unwrap();
+        external.execute_batch("CREATE TRIGGER fail_terminal_fixture_intent BEFORE UPDATE ON execution_intents WHEN NEW.state='finished' BEGIN SELECT RAISE(ABORT, 'injected terminal ledger failure'); END;").unwrap();
+        assert_eq!(
+            service
+                .confirm_purge_execution(review.review_id, |_| true)
+                .unwrap_err(),
+            DemoError::LedgerUnavailable
+        );
+        assert!(service.purge.has_uncertainty().unwrap());
+        let current = service.status().unwrap();
+        let removed = current
+            .fixtures
+            .iter()
+            .find(|item| item.action_id == fixture.action_id)
+            .unwrap();
+        assert_eq!(removed.status, FixtureStatus::PermanentlyRemoved);
+        assert_eq!(removed.receipt_id, fixture.receipt_id);
+        assert!(current
+            .fixtures
+            .iter()
+            .filter(|item| item.action_id != fixture.action_id)
+            .all(|item| item.status == FixtureStatus::Available));
+        let uncertain: i64 = external
+            .query_row(
+                "SELECT COUNT(*) FROM execution_intents WHERE state='uncertain'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uncertain, 1);
+        external
+            .execute_batch("DROP TRIGGER fail_terminal_fixture_intent;")
+            .unwrap();
+        drop(external);
+        drop(service);
+        let mut reopened = DemoExecutionService::open(dir.path()).unwrap();
+        assert!(reopened.purge.has_uncertainty().unwrap());
+        assert_eq!(
+            reopened.prepare_stage(plan.revision_id).unwrap_err(),
+            DemoError::NeedsInspection
+        );
+        assert_eq!(
+            reopened
+                .prepare_purge_review(plan.revision_id, vec![])
+                .unwrap_err(),
+            DemoError::NeedsInspection
+        );
     }
 
     #[test]
