@@ -489,9 +489,18 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     registry
         .transition(FIXTURE_ID, RState::Active, RState::Stopped)
         .map_err(|e| format!("record registry stop: {e}"))?;
-    let live_state = store
-        .inspect_state()
-        .map_err(|e| format!("inspect store: {e}"))?;
+    let (_, live_state) = latch_stopped_registry_attempt(
+        &mut registry,
+        FIXTURE_ID,
+        store::WORKER_PAYLOAD_RESERVATION,
+        parent,
+        root,
+        || {
+            store
+                .inspect_state()
+                .map_err(|_| "inspect stopped store refused".to_owned())
+        },
+    )?;
     let payload_observation = if mode == IndexedWorkerMode::Payload {
         let observation = store
             .inspect_stopped_worker_payload(&receipt)
@@ -601,11 +610,11 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             fixture_footprint.ok_or("complete payload footprint observation missing")?;
         let accounted =
             parent_observed_accounted_bytes.ok_or("parent fixture accounting missing")?;
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
     } else if descriptor_handoff {
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     } else {
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     }
     Ok(())
 }
@@ -663,6 +672,58 @@ fn settle_parent_store_budget(
 
 fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+// The caller must already hold exact child shutdown evidence. Keep this private:
+// a registry row alone cannot prove that an operating-system process stopped.
+fn latch_stopped_registry_attempt<T>(
+    registry: &mut verification_store_registry::VerificationStoreRegistry,
+    id: &str,
+    reservation: u64,
+    parent: (u64, u64),
+    root: (u64, u64),
+    observe: impl FnOnce() -> Result<T, String>,
+) -> Result<(verification_store_registry::StoreRecord, T), String> {
+    use verification_store_registry::{RegistryError, StoreState};
+
+    let record = registry
+        .require_reconciliation(id, StoreState::Stopped)
+        .map_err(|error| format!("latch stopped registry attempt: {error}"))?;
+    if record.state != StoreState::NeedsReconciliation
+        || record.prior_state != Some(StoreState::Stopped)
+        || record.reserved_bytes != reservation
+        || (
+            record.parent_dev,
+            record.parent_ino,
+            record.root_dev,
+            record.root_ino,
+        ) != (parent.0, parent.1, root.0, root.1)
+    {
+        return Err("stopped registry reconciliation latch mismatch".into());
+    }
+    let proposed = reservation
+        .checked_add(1)
+        .ok_or("stopped reservation growth probe overflow")?;
+    match registry.reserve(id, reservation, proposed) {
+        Err(RegistryError::ReconciliationRequired) => {}
+        Err(error) => {
+            return Err(format!(
+                "latched reservation retry refused unexpectedly: {error}"
+            ))
+        }
+        Ok(_) => return Err("latched registry unexpectedly admitted storage growth".into()),
+    }
+    match registry.transition(id, StoreState::NeedsReconciliation, StoreState::Active) {
+        Err(RegistryError::InvalidTransition) => {}
+        Err(error) => {
+            return Err(format!(
+                "latched lifecycle retry refused unexpectedly: {error}"
+            ))
+        }
+        Ok(_) => return Err("latched registry unexpectedly became active".into()),
+    }
+    let observed = observe()?;
+    Ok((record, observed))
 }
 
 fn run_store_worker() -> Result<(), String> {
@@ -1392,7 +1453,7 @@ mod bounded_reader_tests {
 
 #[cfg(test)]
 mod store_worker_tests {
-    use super::{store::OwnedStore, StopReceipt};
+    use super::{latch_stopped_registry_attempt, store::OwnedStore, StopReceipt};
 
     #[test]
     fn store_binding_is_single_store_and_exact_pid() {
@@ -1420,6 +1481,118 @@ mod store_worker_tests {
         second
             .record_stopped(&StopReceipt::confirmed(second.token(), 41))
             .unwrap();
+    }
+
+    #[test]
+    fn mismatched_identity_and_replayed_latch_never_invoke_observation() {
+        use verification_store_registry::{StoreState, VerificationStoreRegistry};
+        const ID: &str = "fedcba9876543210fedcba9876543210";
+        const RESERVED: u64 = 128 * 1024;
+        let store = OwnedStore::create().unwrap();
+        let (parent, root) = store.control_identity().unwrap();
+        let mut registry =
+            VerificationStoreRegistry::open(store.control_registry_path().unwrap()).unwrap();
+        registry
+            .register(ID, parent.0, parent.1, root.0, root.1)
+            .unwrap();
+        registry.reserve(ID, 0, RESERVED).unwrap();
+        registry
+            .transition(ID, StoreState::Registered, StoreState::Active)
+            .unwrap();
+        registry
+            .transition(ID, StoreState::Active, StoreState::Stopped)
+            .unwrap();
+        let mut called = false;
+        let wrong_root = (root.0, root.1 ^ 1);
+        let error =
+            latch_stopped_registry_attempt(&mut registry, ID, RESERVED, parent, wrong_root, || {
+                called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error, "stopped registry reconciliation latch mismatch");
+        assert!(!called);
+        let retained = registry.get(ID).unwrap().unwrap();
+        assert_eq!(retained.state, StoreState::NeedsReconciliation);
+        assert_eq!(retained.prior_state, Some(StoreState::Stopped));
+        assert_eq!(retained.reserved_bytes, RESERVED);
+        assert!(
+            latch_stopped_registry_attempt(&mut registry, ID, RESERVED, parent, root, || {
+                called = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!called);
+        assert_eq!(registry.get(ID).unwrap().unwrap(), retained);
+    }
+
+    #[test]
+    fn failed_post_stop_observation_leaves_live_registry_latched() {
+        use verification_store_registry::{RegistryError, StoreState, VerificationStoreRegistry};
+
+        const ID: &str = "fedcba9876543210fedcba9876543210";
+        const RESERVATION: u64 = 128 * 1024;
+        let store = OwnedStore::create().unwrap();
+        let registry_path = store.control_registry_path().unwrap();
+        let (parent, root) = store.control_identity().unwrap();
+        let mut registry = VerificationStoreRegistry::open(&registry_path).unwrap();
+        registry
+            .register(ID, parent.0, parent.1, root.0, root.1)
+            .unwrap();
+
+        let mut called = false;
+        assert!(latch_stopped_registry_attempt(
+            &mut registry,
+            ID,
+            RESERVATION,
+            parent,
+            root,
+            || {
+                called = true;
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!called, "post-stop observation ran before the latch");
+
+        registry.reserve(ID, 0, RESERVATION).unwrap();
+        registry
+            .transition(ID, StoreState::Registered, StoreState::Active)
+            .unwrap();
+        registry
+            .transition(ID, StoreState::Active, StoreState::Stopped)
+            .unwrap();
+        let error =
+            latch_stopped_registry_attempt(&mut registry, ID, RESERVATION, parent, root, || {
+                called = true;
+                Err::<(), _>("injected stopped observation refusal".into())
+            })
+            .unwrap_err();
+        assert_eq!(error, "injected stopped observation refusal");
+        assert!(called, "post-stop observation seam was not reached");
+
+        let record = registry.get(ID).unwrap().unwrap();
+        assert_eq!(record.state, StoreState::NeedsReconciliation);
+        assert_eq!(record.prior_state, Some(StoreState::Stopped));
+        assert_eq!(record.reserved_bytes, RESERVATION);
+        assert_eq!(
+            (
+                record.parent_dev,
+                record.parent_ino,
+                record.root_dev,
+                record.root_ino
+            ),
+            (parent.0, parent.1, root.0, root.1)
+        );
+        assert!(matches!(
+            registry.reserve(ID, RESERVATION, RESERVATION + 1),
+            Err(RegistryError::ReconciliationRequired)
+        ));
+        assert!(matches!(
+            registry.transition(ID, StoreState::NeedsReconciliation, StoreState::Active),
+            Err(RegistryError::InvalidTransition)
+        ));
     }
 }
 
