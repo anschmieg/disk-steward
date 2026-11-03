@@ -655,3 +655,10 @@ admission or cleanup approval. Counter snapshots may wait on the in-flight read
 mutex; they are not nonblocking and provide no OS latency guarantee. Poisoned
 locks return a sanitized error. This backend API adds no renderer command,
 network execution, filesystem access, worker handoff or persisted receipt.
+
+For supervisor sampling, `try_observed_bytes()` uses a single nonblocking mutex
+attempt: `Some(total)` is an observation, `None` means busy, and a poisoned lock
+is an error. Busy is neither zero usage nor completion. The method does not
+retry, change counters, or suppress observations after cancellation. It provides
+no operating-system scheduling guarantee; callers still own attempt deadlines
+and final accounting.

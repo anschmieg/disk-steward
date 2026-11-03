@@ -33,6 +33,21 @@ impl TransportIngressObserver {
             .map_err(|_| safe_error(io::ErrorKind::Other, "ingress observation unavailable"))
     }
 
+    /// Try to return the cumulative ingress total without waiting for the
+    /// counter mutex. `None` means the counter is busy; it says nothing about
+    /// whether bytes are zero or whether the attempt is complete. This method
+    /// does not retry and makes no guarantee about operating-system latency.
+    pub fn try_observed_bytes(&self) -> io::Result<Option<u64>> {
+        match self.used.try_lock() {
+            Ok(used) => Ok(Some(*used)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(safe_error(
+                io::ErrorKind::Other,
+                "ingress observation unavailable",
+            )),
+        }
+    }
+
     /// Whether `report` belongs to this exact historical attempt identity.
     /// This does not establish freshness, transfer completion, or approval.
     pub fn matches_transfer(&self, report: &PackTransferReport) -> bool {
