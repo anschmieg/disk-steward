@@ -310,9 +310,9 @@ objects refuse the result. Observation uses checked sums of the larger of each
 object's logical length and native allocated blocks, with cooperative deadlines.
 
 The report includes the six-object byte total and count and checks the snapshot
-against 128 KiB. That is a separate fixture observation: the existing reservation
-still admits the payload, and this does not establish a whole-store quota or
-lifetime allocation peak. Partial and descriptor-only modes do not claim this
+against 128 KiB. The complete mode charges this observation once into the parent
+budget; the existing reservation still admits the payload. This does not establish
+a whole-store quota or lifetime allocation peak. Partial and descriptor-only modes do not claim this
 observation. Files and reservations remain retained; no cleanup eligibility,
 recovered-space claim, production aggregate accounting, OS containment or
 milestone acceptance is added.
@@ -320,32 +320,38 @@ The report labels this as `fixture_snapshot=before_registry_reopen`. Reopening
 and later SQLite writes can change control-file allocation after the snapshot;
 the value is not a final or maximum footprint for the probe lifecycle.
 
-## Parent payload accounting after worker shutdown
+## Parent observed-store accounting after worker shutdown
 
-The complete and partial indexed payload fixtures charge the validated payload
-allocation observation into the same parent budget job that admitted the worker.
-The supervisor samples free space through the owned directory handle, records the
-payload bytes, then marks verification incomplete and acknowledges the already
-confirmed worker stop. Reports expose `parent_payload_accounted_bytes`,
-`parent_budget_incomplete=true` and `parent_worker_stopped=true`. A numeric budget
-refusal retains the charged bytes and its original failure reason. Repeating the
-settlement refuses before a second charge.
+The complete indexed payload fixture charges its validated six-object snapshot
+once into the same parent budget job that admitted the worker. It reports
+`parent_accounting_scope=fixed_six_objects`; the payload observation remains
+separately visible and is not added again. The partial fixture has no validated
+six-object snapshot and charges only payload allocation, reporting
+`parent_accounting_scope=payload_only`.
 
-This is a payload-only stopped checkpoint. Directory, journal and registry bytes
-and earlier allocation peaks are outside this parent charge; the separate
-six-object snapshot keeps its existing limits. Descriptor-only and stall modes
-have no payload observation and do not claim this settlement. Neither a complete
-synthetic payload nor a stopped child proves remote verification success. The
-budget retains usage, the registry retains its reservation and reconciliation
-blocker, and no cleanup is confirmed or authorized. Continuous parent monitoring,
-app-wide ownership and production Git verification remain separate work.
+The supervisor samples free space through the owned directory handle after the
+observation, records the observed bytes, then marks verification incomplete and
+acknowledges the already confirmed worker stop. Reports expose
+`parent_observed_accounted_bytes`, `parent_budget_incomplete=true` and
+`parent_worker_stopped=true`. A numeric budget refusal retains the charged bytes
+and its original failure reason. Repeating settlement refuses before a second
+charge. The fixed observation-bound check also follows charging.
 
-The parent payload settlement also checks elapsed milliseconds against the
-existing five-minute budget using one monotonic start captured immediately
-before coordinated admission. The start is retained through worker shutdown and
-readback; it is not renewed for settlement. Observed payload bytes are charged
-before the elapsed check. A timeout retains those bytes and is acknowledged as
-worker-stopped; an earlier storage or free-space refusal keeps its first reason.
+The complete snapshot remains a before-registry-reopen checkpoint. Later SQLite
+writes can change allocation, and earlier peaks remain unknown. Partial mode
+excludes directories, journal and registry bytes. Descriptor-only and stall modes
+do not claim this settlement. Neither a complete synthetic payload nor a stopped
+child proves remote verification success. The budget retains usage, the registry
+retains its reservation and reconciliation blocker, and no cleanup is confirmed
+or authorized. Continuous parent monitoring, app-wide ownership and production
+Git verification remain separate work.
+
+Parent settlement checks elapsed milliseconds against the existing five-minute
+budget using one monotonic start captured immediately before coordinated
+admission. The start is retained through worker shutdown and readback; it is not
+renewed for settlement. Observed bytes are charged before the elapsed check. A
+timeout retains those bytes and is acknowledged as worker-stopped; an earlier
+storage or free-space refusal keeps its first reason.
 `parent_elapsed_checked=true` identifies the successful elapsed checkpoint in
 complete and partial reports. This is a stopped checkpoint, not continuous parent
 monitoring, a bound on noninterruptible system calls, or proof of production
