@@ -486,3 +486,23 @@ full-fsck, authentication, worker/RSS and cleanup limits remain. Traversal reuse
 existing fallible allocation and cooperative controls without cloning payloads.
 Tests distinguish an unreachable packed object from a reachable ancestor and
 check all four fixture object kinds through the real-Git private TLS flow.
+
+### Outer supervision of the composed fixture
+
+On Linux/macOS the real-Git private TLS verification flow runs in an exactly
+selected ignored child test of the current test executable. The parent clears
+the child environment and requires a successful exit, a unique completion marker,
+no more than 1,024 stdout bytes and a joined collector within a 30-second fixture
+deadline. The marker follows the entire existing reserved-file fetch, decode,
+advertised closure, required-object coverage and independent strict receiver
+assertions. Four negative child fixtures exercise deadline, output overflow,
+missing-marker and unsuccessful-exit handling. Collection uses a fixed buffer
+and bounded interruption handling; cleanup precedes evidence assertions.
+
+This is test supervision of that disposable flow, not the production worker or
+an OS-level wait/kill latency, descendant-process, memory or crash-cleanup proof.
+A forcibly interrupted child may retain its private fixture for reconciliation;
+the parent does not infer deletion authority or remove paths from child output.
+Private GitHub credentials, stable local inventory, preservation, receipt expiry
+and integrated store lifecycle gates remain open. Production app/renderer and
+worker-probe interfaces are unchanged.

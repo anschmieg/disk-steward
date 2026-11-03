@@ -2128,6 +2128,8 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 mod tests {
     mod checksum_tests;
     mod commit_tests;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod completion_supervision;
     mod decode_tests;
     mod delta_tests;
     mod entry_header_tests;

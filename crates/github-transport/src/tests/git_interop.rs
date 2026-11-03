@@ -431,8 +431,30 @@ fn git_upload_pack(root: &PrivateRoot, args: &[&str], input: &[u8]) -> io::Resul
     Ok(result.stdout)
 }
 
+const VERIFICATION_COMPLETE: &[u8] = b"DISK_STEWARD_GIT_VERIFICATION_COMPLETE\n";
+
 #[test]
 fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
+    let receipt = super::completion_supervision::supervise(
+        "tests::git_interop::real_git_verification_child",
+        VERIFICATION_COMPLETE,
+        Duration::from_secs(30),
+    )
+    .expect("bounded real-Git verification child must complete");
+    assert!(receipt.reader_joined);
+    assert!(receipt.bytes > VERIFICATION_COMPLETE.len() && receipt.bytes <= 1024);
+}
+
+#[test]
+#[ignore = "selected only by the exact real-Git verification supervisor"]
+fn real_git_verification_child() {
+    run_real_git_verification();
+    let mut stdout = io::stdout();
+    stdout.write_all(VERIFICATION_COMPLETE).unwrap();
+    stdout.flush().unwrap();
+}
+
+fn run_real_git_verification() {
     let root = PrivateRoot::create().unwrap();
     let (repo, blob, tree, commit, tag_object) = make_repository(&root).unwrap();
     let peeled = object_id(
