@@ -456,7 +456,9 @@ cooperative controls still require an outer supervised worker.
 and graph closure of caller-supplied bytes. It requires an exact accepted-byte
 count and SHA-256 digest match, resolves every advertised tip, requires commit objects for HEAD and branch
 refs, and uses decoded kinds for other namespaces. Symref targets must appear in
-the same advertisement with the same ID. Peeled tag claims must match the terminal
+the same advertisement with the same ID, and symbolic-reference chains must be
+acyclic. A bounded iterative traversal rejects self-loops and longer cycles before
+decoding, while accepting shared chain tails. Peeled tag claims must match the terminal
 non-tag object reached through typed tag links. Repeated peel claims share a
 16,384-step budget. Existing decoder, graph and parser caps remain in force;
 there are at most 1,024 advertised refs and 64 distinct roots.
