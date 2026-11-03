@@ -23,6 +23,7 @@ const MAX_PEEL_STEPS: usize = 16_384;
 /// A decoded pack and graph closure report for advertised roots.
 #[derive(Debug)]
 pub struct AdvertisedPackReport {
+    context: crate::attempt_context::AttemptContext,
     decoded: DecodedPack,
     graph: PackGraphReport,
     advertised_ref_count: usize,
@@ -47,6 +48,15 @@ impl RequiredObjectCoverageReport {
 }
 
 impl AdvertisedPackReport {
+    pub fn repository(&self) -> &crate::RepositoryUrl {
+        self.context.repository()
+    }
+
+    /// Recheck exact repository binding and in-process dual-clock expiry.
+    pub fn check_context(&self, expected: &crate::RepositoryUrl) -> io::Result<()> {
+        self.context.check(expected)
+    }
+
     /// Require each supplied typed object to be reachable from this report's
     /// advertised roots. Mere presence elsewhere in the pack is insufficient.
     ///
@@ -56,10 +66,14 @@ impl AdvertisedPackReport {
     /// preserve ref names, prove receipt freshness or authorize cleanup.
     pub fn check_required_objects(
         &self,
+        expected_repository: &crate::RepositoryUrl,
         required: &[([u8; 20], GitObjectKind)],
         cancellation: &CancellationHandle,
         deadline: Instant,
     ) -> io::Result<RequiredObjectCoverageReport> {
+        cancellation.check()?;
+        check_deadline(deadline)?;
+        self.check_context(expected_repository)?;
         let graph = crate::graph::check_pack_graph_coverage(
             &self.decoded,
             &self.roots,
@@ -67,6 +81,7 @@ impl AdvertisedPackReport {
             cancellation,
             deadline,
         )?;
+        self.check_context(expected_repository)?;
         Ok(RequiredObjectCoverageReport {
             required_object_count: required.len(),
             graph,
@@ -89,6 +104,7 @@ impl AdvertisedPackReport {
 /// Decode a completed transfer and check closure from its advertised references.
 pub fn decode_advertised_pack(
     report: &PackTransferReport,
+    expected_repository: &crate::RepositoryUrl,
     input: &[u8],
     max_decoded_bytes: usize,
     cancellation: &CancellationHandle,
@@ -100,6 +116,7 @@ pub fn decode_advertised_pack(
     if !report.is_complete_transfer() || report.bytes_written() != input_len {
         return Err(invalid("pack transfer evidence does not match input"));
     }
+    report.check_context(expected_repository)?;
     let refs = report
         .advertised_refs()
         .filter(|refs| !refs.is_empty() && refs.len() <= MAX_REFS)
@@ -189,7 +206,9 @@ pub fn decode_advertised_pack(
 
     let graph = check_pack_graph_closure(&decoded, &roots, cancellation, deadline)?;
     check_attempt(cancellation, deadline)?;
+    report.check_context(expected_repository)?;
     Ok(AdvertisedPackReport {
+        context: report.context().clone(),
         decoded,
         graph,
         advertised_ref_count: refs.len(),

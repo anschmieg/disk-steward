@@ -237,6 +237,7 @@ impl BudgetFileSink {
             crate::check_deadline(deadline)?;
             let checked = crate::decode_advertised_pack(
                 report,
+                &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
                 &bytes,
                 max_decoded_bytes,
                 &self.signal,
