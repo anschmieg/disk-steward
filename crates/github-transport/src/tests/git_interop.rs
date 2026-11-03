@@ -623,6 +623,19 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
             .unwrap();
         assert_eq!(decoded.kind(), kind);
         assert_eq!(decoded.content(), raw);
+        if kind == GitObjectKind::Tree {
+            let links = parse_sha1_tree(
+                decoded.content(),
+                4096,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].mode(), GitTreeMode::Regular);
+            assert_eq!(links[0].name(), b"fixture.txt");
+            assert_eq!(links[0].oid(), &hex_oid(&blob));
+        }
     }
 
     let mut damaged_pack = pack.clone();
@@ -963,4 +976,48 @@ fn delta_reconstruction_matches_independent_strict_git_import() {
         delta_header.kind(),
         PackEntryKind::ReferenceDelta { base_oid }
     );
+}
+
+#[test]
+fn real_git_tree_modes_and_directory_order_match_parser() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, blob, tree, commit, _) = make_repository(&root).unwrap();
+    // Git sorts this deliberately unordered input and canonicalizes 040000.
+    let input = format!("040000 tree {tree}\tfoo\n100755 blob {blob}\tfoo0\n100644 blob {blob}\tfoo.bar\n160000 commit {commit}\tb-module\n120000 blob {blob}\ta-link\n");
+    let tree_oid =
+        object_id(&checked_git(&root, &["-C", &repo, "mktree"], input.as_bytes()).unwrap())
+            .unwrap();
+    let raw = checked_git(&root, &["-C", &repo, "cat-file", "tree", &tree_oid], b"").unwrap();
+    let links = parse_sha1_tree(
+        &raw,
+        5,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        links.iter().map(|link| link.name()).collect::<Vec<_>>(),
+        [
+            b"a-link".as_slice(),
+            b"b-module",
+            b"foo.bar",
+            b"foo",
+            b"foo0"
+        ]
+    );
+    assert_eq!(
+        links.iter().map(|link| link.mode()).collect::<Vec<_>>(),
+        [
+            GitTreeMode::Symlink,
+            GitTreeMode::Gitlink,
+            GitTreeMode::Regular,
+            GitTreeMode::Directory,
+            GitTreeMode::Executable
+        ]
+    );
+    assert_eq!(links[1].oid(), &hex_oid(&commit));
+    assert_eq!(links[3].oid(), &hex_oid(&tree));
+    for index in [0, 2, 4] {
+        assert_eq!(links[index].oid(), &hex_oid(&blob));
+    }
 }
