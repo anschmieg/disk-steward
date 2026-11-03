@@ -1,4 +1,6 @@
+mod budget_file;
 use super::*;
+use budget_file::BudgetFileSink;
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, MetadataExt},
@@ -437,6 +439,9 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let tls = fixture_tls();
     let (listener, address) = listener();
     let server_tls = tls.server.clone();
+    let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let fetch_transport = candidate_transport(fetch_repository, &tls, address);
+    let mut pack_sink = BudgetFileSink::new(&root, fetch_transport.cancellation_handle()).unwrap();
     let expected_commit = commit.clone();
     let expected_tag = tag_object.clone();
     let server = thread::spawn(move || -> io::Result<PrivateRoot> {
@@ -506,13 +511,19 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     });
     let repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let report_result = candidate_transport(repository.clone(), &tls, address).observe_refs();
-    let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
-    let mut pack = Vec::new();
-    let fetch_result =
-        candidate_transport(fetch_repository, &tls, address).download_advertised_pack(&mut pack);
+    let fetch_result = fetch_transport.download_advertised_pack(&mut pack_sink);
     let root = server.join().expect("fixture server panicked").unwrap();
     let report = report_result.unwrap();
     let fetch_report = fetch_result.unwrap();
+    pack_sink.sync_and_observe().unwrap();
+    let pack = pack_sink.contents().unwrap();
+    let pack_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
+    assert!(
+        pack_sink.bytes_charged()
+            >= pack_metadata
+                .len()
+                .max(pack_metadata.blocks().checked_mul(512).unwrap())
+    );
     assert!(fetch_report.is_complete_transfer(), "{fetch_report:?}");
     assert_eq!(fetch_report.bytes_written(), pack.len() as u64);
     assert!(
@@ -629,4 +640,28 @@ fn hex_oid(value: &str) -> [u8; 20] {
         out[index] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
     }
     out
+}
+
+#[test]
+fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
+    let root = PrivateRoot::create().unwrap();
+    let mut body = super::ref_packet(b"packfile\n");
+    body.extend(super::ref_packet(b"\x01PACKfixture"));
+    body.extend_from_slice(b"0000");
+    let (transport, server) = super::pack_tests::pack_fixture(body);
+    let mut sink =
+        BudgetFileSink::new_with_limit(&root, transport.cancellation_handle(), 5).unwrap();
+    let report = transport.download_advertised_pack(&mut sink).unwrap();
+    server.join().unwrap();
+    assert!(!report.is_complete_transfer());
+    assert_eq!(sink.contents().unwrap(), b"PACKf");
+    assert_eq!(report.bytes_written(), 5);
+    let partial_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
+    assert!(
+        sink.bytes_charged()
+            >= partial_metadata
+                .len()
+                .max(partial_metadata.blocks().checked_mul(512).unwrap())
+    );
+    assert!(report.operation_error_kind().is_some());
 }

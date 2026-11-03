@@ -1,0 +1,7 @@
+# M0 budgeted pack-to-file integration
+
+Connect actual download_advertised_pack to a private task-owned file sink in the existing Unix realGit/privateTLS fixture. Bounded sink checks identity and actual volume reserve before writes, shared BudgetController advisory admission, charges monotonic max(logical,allocatedblocks*512) afterward even partial failures. No more than512logicalbytes for this closed fixture. Cancel on failures; retain observedcharges/partialdata. Actual expectedobject receiverimport checks stilluse bounded<=512packcontents. No app/renderer/newCLI/userpath/liveGitHub integration.
+
+Also test sink refusal through actual candidate transfer, with incomplete report and partialfilebytes/chargesretained. Simulated low reserve/cap evidence explicitly distinct from nativeactualvolume sample. One attempt in-memory accounting only, not durable/globalaggregate enforcement, whole-storeoverhead, objectverificationreceipt, cleanupauthority or milestonepass. Registryinvestigation found per-storeprivateparent layout cannotmodelglobalaggregate; addingstoredbytesalonewouldnotfixcrashwindow/unknownstores.
+
+Luna owns new nested test-only file-sink module, root wireexistingrealGitfixture and negativeTLSfileproof/dependency/docs/progress/concretereviewbeforeexecution. Existing44–54watchesnotpolled, no duplicateagent/overlappingbuild, preserve2GiBreserve/CARGO_INCREMENTAL=0. Branch atop5418bc4ae/main02095ae baseline. Version0.0.17/no releases.

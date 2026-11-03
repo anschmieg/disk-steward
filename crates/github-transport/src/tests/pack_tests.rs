@@ -1,6 +1,6 @@
 use super::*;
 
-fn pack_fixture(body: Vec<u8>) -> (GitHubTransport, thread::JoinHandle<()>) {
+pub(super) fn pack_fixture(body: Vec<u8>) -> (GitHubTransport, thread::JoinHandle<()>) {
     pack_fixture_with_framing(body, false)
 }
 
