@@ -353,3 +353,27 @@ counts or graph completeness, or authorize cleanup. Callers must compare it with
 required identities and perform the remaining checks. Tests cover independent
 hash vectors and size/chunk boundaries, plus Git's own IDs for all four kinds
 and the reconstructed REF_DELTA result and its base reference.
+
+### Bounded pack decoder
+
+`decode_sha1_pack` composes the checksum, header, inflation, reconstruction and
+identity stages for a complete in-memory SHA-1 pack. It returns decoded objects
+only after the declared count, stream boundaries and checksum trailer agree.
+Each object includes its canonical ID, kind, content, entry offset and selected
+delta depth. Offset bases must be exact earlier entry boundaries; reference
+bases must match an earlier decoded object's computed ID. Missing, forward and
+external bases are explicitly unsupported in this experimental implementation.
+
+Limits are 16 MiB input, 1,024 entries, depth 32, and at most 16 MiB cumulative
+decoded work, with a caller-lowered work ceiling. Work includes each inflated
+representation and each reconstructed delta result, so discarded instruction
+streams still count. This is logical byte accounting, not total process RSS;
+input storage, decoder state, object metadata and allocation overhead remain
+separate. Controls are cooperative and require an outer worker for hard limits.
+
+Successful decoding still does not validate commit/tree/tag syntax, bind all
+required remote tips, prove graph completeness or authenticity, persist evidence,
+or authorize cleanup. These limits and backward-only resolution do not establish
+product Git support. Tests cover real Git object correspondence, independent
+REF/OFS vectors, depth and cumulative limits, unsupported bases, exact object
+counts, corruption, truncation and extra data.
