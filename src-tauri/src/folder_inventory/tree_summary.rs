@@ -7,6 +7,7 @@ use rustix::fs::{fstat, openat, statat, AtFlags, Dir, FileType, Mode, OFlags, St
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const MAX_ENTRIES: usize = 4096;
@@ -45,6 +46,8 @@ struct WalkState<'a> {
     stop_reason: Option<&'static str>,
     halted: bool,
     exclusion_policy: &'a SummaryExclusionPolicy,
+    cancellation: &'a AtomicBool,
+    cancelled: bool,
 }
 
 impl WalkState<'_> {
@@ -60,6 +63,11 @@ impl WalkState<'_> {
     }
 
     fn time_check(&mut self) -> bool {
+        if self.cancellation.load(Ordering::Acquire) {
+            self.cancelled = true;
+            self.halted = true;
+            return true;
+        }
         if self.expired() {
             self.set_reason("time_limit");
             self.halted = true;
@@ -105,9 +113,12 @@ impl WalkState<'_> {
     }
 }
 
+// Keep scope identity, preservation policy, cancellation and independently testable limits explicit.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn summarize(
     session: &Session,
     exclusion_policy: &SummaryExclusionPolicy,
+    cancellation: &AtomicBool,
     expected_observation_id: InventoryItemId,
     started: Instant,
     duration: Duration,
@@ -145,8 +156,13 @@ pub(super) fn summarize(
         stop_reason: None,
         halted: false,
         exclusion_policy,
+        cancellation,
+        cancelled: false,
     };
     if state.time_check() {
+        if state.cancelled {
+            return Err("Subtree summary was canceled.");
+        }
         return Ok(state.summary());
     }
     let root_stat = match fstat(&frame.fd) {
@@ -157,6 +173,9 @@ pub(super) fn summarize(
         }
     };
     if state.time_check() {
+        if state.cancelled {
+            return Err("Subtree summary was canceled.");
+        }
         return Ok(state.summary());
     }
     if identity(&root_stat) != frame.identity
@@ -167,9 +186,41 @@ pub(super) fn summarize(
         state.changed_directory();
         return Ok(state.summary());
     }
-    exclusion_policy.ensure_ancestor_scope_allowed(&frame.fd, started, state.duration)?;
+    if state.time_check() {
+        return if state.cancelled {
+            Err("Subtree summary was canceled.")
+        } else {
+            Ok(state.summary())
+        };
+    }
+    let ancestry =
+        exclusion_policy.ensure_ancestor_scope_allowed(&frame.fd, started, state.duration);
+    if state.time_check() {
+        return if state.cancelled {
+            Err("Subtree summary was canceled.")
+        } else {
+            Ok(state.summary())
+        };
+    }
+    ancestry?;
     walk_directory(&frame.fd, root_stat, 1, &mut state);
-    exclusion_policy.ensure_ancestor_scope_allowed(&frame.fd, started, state.duration)?;
+    if state.time_check() {
+        return if state.cancelled {
+            Err("Subtree summary was canceled.")
+        } else {
+            Ok(state.summary())
+        };
+    }
+    let ancestry =
+        exclusion_policy.ensure_ancestor_scope_allowed(&frame.fd, started, state.duration);
+    if state.time_check() {
+        return if state.cancelled {
+            Err("Subtree summary was canceled.")
+        } else {
+            Ok(state.summary())
+        };
+    }
+    ancestry?;
     Ok(state.summary())
 }
 
@@ -466,9 +517,11 @@ mod tests {
     ) -> (FolderTreeSummary, Session) {
         let (session, _) = selected_root_session(path, 1, Duration::from_secs(2)).unwrap();
         let policy = SummaryExclusionPolicy::empty_for_tests();
+        let cancellation = AtomicBool::new(false);
         let summary = summarize(
             &session,
             &policy,
+            &cancellation,
             session.observation_id,
             Instant::now(),
             duration,
@@ -508,9 +561,11 @@ mod tests {
         assert!(paged_session.cursor.is_some());
         let cursor_address = paged_session.cursor.as_ref().unwrap() as *const _;
         let policy = SummaryExclusionPolicy::empty_for_tests();
+        let cancellation = AtomicBool::new(false);
         let _ = summarize(
             &paged_session,
             &policy,
+            &cancellation,
             paged_session.observation_id,
             Instant::now(),
             Duration::from_secs(2),
@@ -525,6 +580,7 @@ mod tests {
         assert!(summarize(
             &paged_session,
             &policy,
+            &cancellation,
             InventoryItemId::new(),
             Instant::now(),
             Duration::from_secs(2),
@@ -568,9 +624,11 @@ mod tests {
         fs::write(root.path().join("file"), b"x").unwrap();
         let (session, _) = selected_root_session(root.path(), 1, Duration::from_secs(2)).unwrap();
         let policy = SummaryExclusionPolicy::empty_for_tests();
+        let cancellation = AtomicBool::new(false);
         assert!(summarize(
             &session,
             &policy,
+            &cancellation,
             InventoryItemId::new(),
             Instant::now(),
             Duration::from_secs(2),
@@ -581,6 +639,7 @@ mod tests {
         let expired = summarize(
             &session,
             &policy,
+            &cancellation,
             session.observation_id,
             Instant::now(),
             Duration::ZERO,
@@ -593,16 +652,60 @@ mod tests {
     }
 
     #[test]
-    fn summary_request_accepts_only_the_typed_observation_id() {
+    fn pre_canceled_summary_returns_no_partial_evidence_or_cursor_mutation() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+        let (session, _) = selected_root_session(root.path(), 1, Duration::from_secs(2)).unwrap();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
+        let cancellation = AtomicBool::new(true);
+
+        assert_eq!(
+            summarize(
+                &session,
+                &policy,
+                &cancellation,
+                session.observation_id,
+                Instant::now(),
+                Duration::from_secs(2),
+                MAX_ENTRIES,
+                MAX_DEPTH,
+            )
+            .unwrap_err(),
+            "Subtree summary was canceled."
+        );
+        assert!(session.cursor.is_some());
+        assert_eq!(session.snapshot.entries.len(), 1);
+    }
+
+    #[test]
+    fn summary_requests_require_typed_observation_and_attempt_ids() {
         let valid = serde_json::json!({
-            "expectedObservationId": serde_json::to_value(InventoryItemId::new()).unwrap()
+            "expectedObservationId": serde_json::to_value(InventoryItemId::new()).unwrap(),
+            "attemptId": serde_json::to_value(disk_steward_core::SummaryAttemptId::new()).unwrap()
         });
         assert!(serde_json::from_value::<super::super::TreeSummaryRequest>(valid).is_ok());
+        let valid_cancel = serde_json::json!({
+            "expectedObservationId": serde_json::to_value(InventoryItemId::new()).unwrap(),
+            "attemptId": serde_json::to_value(disk_steward_core::SummaryAttemptId::new()).unwrap()
+        });
+        assert!(
+            serde_json::from_value::<super::super::CancelTreeSummaryRequest>(valid_cancel).is_ok()
+        );
         let with_path = serde_json::json!({
             "expectedObservationId": serde_json::to_value(InventoryItemId::new()).unwrap(),
+            "attemptId": serde_json::to_value(disk_steward_core::SummaryAttemptId::new()).unwrap(),
             "path": "/tmp"
         });
         assert!(serde_json::from_value::<super::super::TreeSummaryRequest>(with_path).is_err());
+        let cancel_with_path = serde_json::json!({
+            "expectedObservationId": serde_json::to_value(InventoryItemId::new()).unwrap(),
+            "attemptId": serde_json::to_value(disk_steward_core::SummaryAttemptId::new()).unwrap(),
+            "path": "/tmp"
+        });
+        assert!(
+            serde_json::from_value::<super::super::CancelTreeSummaryRequest>(cancel_with_path)
+                .is_err()
+        );
     }
 
     #[test]
@@ -654,9 +757,11 @@ mod tests {
         let policy =
             SummaryExclusionPolicy::for_tests(vec![(stat.st_dev as u64, stat.st_ino as u64)]);
         let (session, _) = selected_root_session(root.path(), 1, Duration::from_secs(2)).unwrap();
+        let cancellation = AtomicBool::new(false);
         let summary = summarize(
             &session,
             &policy,
+            &cancellation,
             session.observation_id,
             Instant::now(),
             Duration::from_secs(2),
@@ -683,12 +788,14 @@ mod tests {
         let stat = statat(CWD, &excluded, AtFlags::SYMLINK_NOFOLLOW).unwrap();
         let policy =
             SummaryExclusionPolicy::for_tests(vec![(stat.st_dev as u64, stat.st_ino as u64)]);
+        let cancellation = AtomicBool::new(false);
 
         let (root_session, _) =
             selected_root_session(&excluded, 1, Duration::from_secs(2)).unwrap();
         assert!(summarize(
             &root_session,
             &policy,
+            &cancellation,
             root_session.observation_id,
             Instant::now(),
             Duration::from_secs(2),
@@ -705,6 +812,7 @@ mod tests {
         assert!(summarize(
             &descendant_session,
             &policy,
+            &cancellation,
             descendant_session.observation_id,
             Instant::now(),
             Duration::from_secs(2),
@@ -726,6 +834,7 @@ mod tests {
         let baseline = fstat(&fd).unwrap();
         fs::write(root.path().join("created-after-baseline"), b"x").unwrap();
         let policy = SummaryExclusionPolicy::empty_for_tests();
+        let cancellation = AtomicBool::new(false);
         let mut state = WalkState {
             observation_id: InventoryItemId::new(),
             root_label: "fixture".to_owned(),
@@ -748,6 +857,8 @@ mod tests {
             stop_reason: None,
             halted: false,
             exclusion_policy: &policy,
+            cancellation: &cancellation,
+            cancelled: false,
         };
         walk_directory(&fd, baseline, 1, &mut state);
         let summary = state.summary();

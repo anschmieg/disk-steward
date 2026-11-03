@@ -14,6 +14,7 @@
     "allow-continue-folder-inventory",
     "allow-clear-folder-inventory",
     "allow-inspect-folder-tree-summary",
+    "allow-cancel-folder-tree-summary",
     "allow-preview-native-review",
     "allow-get-example-plan",
     "allow-edit-example-plan",
