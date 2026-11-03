@@ -370,9 +370,11 @@ export default function AdvancedPlanPanel({
     1,
     Math.ceil(filteredDescendants.length / 50),
   );
+  const lastDescendantsPage = descendantsPageCount - 1;
+  const boundedDescendantPage = Math.min(descendantPage, lastDescendantsPage);
   const pagedDescendants = filteredDescendants.slice(
-    descendantPage * 50,
-    descendantPage * 50 + 50,
+    boundedDescendantPage * 50,
+    boundedDescendantPage * 50 + 50,
   );
   // Only the visible page needs display context. Keep the existing traversal
   // depth bound and avoid materializing paths for the whole 10,000-item plan.
@@ -397,6 +399,10 @@ export default function AdvancedPlanPanel({
       ancestors.unshift("Incomplete location");
     descendantContexts.set(child.itemId, ancestors.join(" › "));
   }
+  useEffect(() => {
+    if (descendantPage > lastDescendantsPage)
+      setDescendantPage(lastDescendantsPage);
+  }, [descendantPage, lastDescendantsPage]);
   useEffect(() => setDescendantPage(0), [inspectedId, descendantSearch]);
   const captureFocus = (event: React.FocusEvent<HTMLElement>) => {
     const target = event.target;
@@ -1036,7 +1042,7 @@ export default function AdvancedPlanPanel({
                   <div className="ap-descendant-count" aria-live="polite">
                     {filteredDescendants.length === 0
                       ? "No matching descendants"
-                      : `Showing ${descendantPage * 50 + 1}–${Math.min((descendantPage + 1) * 50, filteredDescendants.length)} of ${filteredDescendants.length}`}
+                      : `Showing ${boundedDescendantPage * 50 + 1}–${Math.min((boundedDescendantPage + 1) * 50, filteredDescendants.length)} of ${filteredDescendants.length}`}
                   </div>
                   <div className="ap-descendants">
                     {pagedDescendants.map((child) => {
@@ -1084,23 +1090,29 @@ export default function AdvancedPlanPanel({
                       <button
                         data-editor-focus={`descendant-previous:${inspected.itemId}`}
                         type="button"
-                        disabled={descendantPage === 0}
+                        disabled={boundedDescendantPage === 0}
                         onClick={() =>
-                          setDescendantPage((page) => Math.max(0, page - 1))
+                          setDescendantPage(
+                            Math.max(0, boundedDescendantPage - 1),
+                          )
                         }
                       >
                         Previous
                       </button>
                       <span>
-                        Page {descendantPage + 1} of {descendantsPageCount}
+                        Page {boundedDescendantPage + 1} of{" "}
+                        {descendantsPageCount}
                       </span>
                       <button
                         data-editor-focus={`descendant-next:${inspected.itemId}`}
                         type="button"
-                        disabled={descendantPage + 1 >= descendantsPageCount}
+                        disabled={boundedDescendantPage >= lastDescendantsPage}
                         onClick={() =>
-                          setDescendantPage((page) =>
-                            Math.min(descendantsPageCount - 1, page + 1),
+                          setDescendantPage(
+                            Math.min(
+                              lastDescendantsPage,
+                              boundedDescendantPage + 1,
+                            ),
                           )
                         }
                       >
