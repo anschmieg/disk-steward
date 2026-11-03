@@ -305,6 +305,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-steward-generated-evidence"
+version = "0.0.17"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "disk-steward-gix-byte-probe"
 version = "0.0.17"
 dependencies = [
