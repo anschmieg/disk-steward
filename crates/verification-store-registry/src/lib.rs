@@ -149,12 +149,35 @@ impl std::fmt::Display for RegistryError {
     }
 }
 impl std::error::Error for RegistryError {}
+// Field drop order keeps the database connection closed before this guard
+// releases its lock. Explicit unlock also releases the shared file-description
+// lock when a concurrently spawning child briefly retains a duplicate FD.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct RegistryLease(File);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::ops::Deref for RegistryLease {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for RegistryLease {
+    fn drop(&mut self) {
+        // Drop cannot report failure. A failed unlock leaves the normal close
+        // fallback in place; callers still fail closed on LeaseHeld.
+        let _ = flock(&self.0, FlockOperation::Unlock);
+    }
+}
+
 /// Exclusive owner of the registry index. The sibling lease is held for its lifetime.
 pub struct VerificationStoreRegistry {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     connection: Connection,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    _lease: File,
+    _lease: RegistryLease,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     lease_path: PathBuf,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -207,6 +230,7 @@ impl VerificationStoreRegistry {
             validate_private_file(&lease)?;
             flock(&lease, FlockOperation::NonBlockingLockExclusive)
                 .map_err(|_| RegistryError::LeaseHeld)?;
+            let lease = RegistryLease(lease);
             validate_database(path)?;
             let database_before =
                 fs::symlink_metadata(path).map_err(|_| RegistryError::UnsafePath)?;
@@ -1163,6 +1187,33 @@ mod tests {
             .unwrap(),
             "bad"
         );
+    }
+
+    #[test]
+    fn owner_drop_unlocks_even_with_a_duplicate_descriptor() {
+        let (_dir, path) = setup();
+        let first = VerificationStoreRegistry::open(&path).unwrap();
+        // A duplicate shares the same open file description as a descriptor
+        // inherited by a concurrently spawning child before exec closes it.
+        let duplicate = first._lease.try_clone().unwrap();
+        assert!(matches!(
+            VerificationStoreRegistry::open(&path),
+            Err(RegistryError::LeaseHeld)
+        ));
+        drop(first);
+        let second = VerificationStoreRegistry::open(&path).unwrap();
+        assert!(matches!(
+            VerificationStoreRegistry::open(&path),
+            Err(RegistryError::LeaseHeld)
+        ));
+        drop(duplicate);
+        // Closing an old duplicate must not release the new owner's lease.
+        assert!(matches!(
+            VerificationStoreRegistry::open(&path),
+            Err(RegistryError::LeaseHeld)
+        ));
+        drop(second);
+        assert!(VerificationStoreRegistry::open(&path).is_ok());
     }
 
     #[test]
