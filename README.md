@@ -138,3 +138,9 @@ Native ownership/active-use checks and the separately reviewed staging,
 restoration and permanent-removal adapter remain required for executable D3.
 See the [format corpus](probes/generated_cache/README.md) and
 [current scope](.autonomous/disk-steward/m3-native-pytest-records-scope.md).
+
+A separate [generated-record lifecycle probe](probes/generated-lifecycle/README.md)
+tests review, stage, restore, and separately approved permanent removal using
+copies of the committed pytest corpus in its own private temporary fixture.
+It does not enable cleanup in selected projects or establish recovered-space
+acceptance.

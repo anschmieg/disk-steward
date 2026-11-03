@@ -455,6 +455,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "generated-lifecycle-probe"
+version = "0.0.17"
+dependencies = [
+ "approval-ledger",
+ "atomic-rename-probe",
+ "disk-steward-core",
+ "disk-steward-generated-evidence",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
