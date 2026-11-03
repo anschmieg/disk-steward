@@ -697,6 +697,7 @@ export default function AdvancedPlanPanel({
                       {group && (
                         <div
                           className="ap-group-choice"
+                          role="group"
                           aria-label={`Set all eligible ${label} items`}
                         >
                           <button

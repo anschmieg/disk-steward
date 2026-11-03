@@ -111,6 +111,70 @@ describe("AdvancedPlanPanel decisions", () => {
     });
   });
 
+  it("names each group's batch controls and targets commands to that exact group", () => {
+    const firstItem = editorItem("first-item", { label: "First finding" });
+    const secondItem = editorItem("second-item", { label: "Second finding" });
+    const { onEdit } = mount(
+      editorSnapshot(
+        [firstItem, secondItem],
+        [
+          editorGroup("first-group", [firstItem.itemId], {
+            label: "First finding group",
+          }),
+          editorGroup("second-group", [secondItem.itemId], {
+            label: "Second finding group",
+          }),
+        ],
+      ),
+    );
+
+    const firstActions = screen.getByRole("group", {
+      name: "Set all eligible First finding group items",
+    });
+    const secondActions = screen.getByRole("group", {
+      name: "Set all eligible Second finding group items",
+    });
+    for (const actions of [firstActions, secondActions]) {
+      expect(
+        within(actions).getByRole("button", { name: "Include group" }),
+      ).toBeEnabled();
+      expect(
+        within(actions).getByRole("button", { name: "Keep group" }),
+      ).toBeEnabled();
+      expect(
+        within(actions).getByRole("button", { name: "Investigate" }),
+      ).toBeEnabled();
+    }
+
+    fireEvent.click(
+      within(firstActions).getByRole("button", { name: "Include group" }),
+    );
+    fireEvent.click(
+      within(secondActions).getByRole("button", { name: "Keep group" }),
+    );
+    fireEvent.click(
+      within(firstActions).getByRole("button", { name: "Investigate" }),
+    );
+
+    expect(onEdit.mock.calls.map(([edit]) => edit)).toEqual([
+      {
+        kind: "setGroupChoice",
+        groupId: "first-group",
+        choice: "include",
+      },
+      {
+        kind: "setGroupChoice",
+        groupId: "second-group",
+        choice: "keep",
+      },
+      {
+        kind: "setGroupChoice",
+        groupId: "first-group",
+        choice: "investigate",
+      },
+    ]);
+  });
+
   it("shows preserved user Keep decisions in both the row and inspector", () => {
     const kept = editorItem("keep-me", {
       label: "Personal project",

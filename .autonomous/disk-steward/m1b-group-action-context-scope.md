@@ -1,0 +1,5 @@
+# M1B: expose named groups for batch decision controls
+
+Build on PR106 with main as eventual integration baseline. Repeated Include group/Keep group/Investigate buttons currently sit in a generic div carrying aria-label, which does not expose a named group role. Add the semantic group role to that existing labeled wrapper so assistive technology can associate each batch control set with its exact finding group. Preserve buttons, keyboard behavior, disabled-state safeguards and opaque group-target commands.
+
+Use two groups with distinct labels/IDs. Assert each named accessible group contains its own controls and activating them sends only the intended exact group ID. Cover search/read-only/hidden-members disabled behavior using existing regression checks, and prove the named-group assertion fails against old component. Run full frontend/type/build/format/version checks. This is component accessibility semantics, not a native VoiceOver pass, human pilot completion or any cleanup authority. Keep0.0.x/no release.
