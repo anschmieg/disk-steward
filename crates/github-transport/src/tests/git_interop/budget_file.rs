@@ -7,8 +7,12 @@ use std::{
 };
 
 use verification_budget::{BudgetController, JobId, Limits};
+use verification_store_registry::VerificationStoreRegistry;
 
 const NAME: &str = "pack.download";
+pub(super) const REGISTRY_NAME: &str = "pack-budget.sqlite";
+pub(super) const STORE_ID: &str = "0123456789abcdef0123456789abcdef";
+pub(super) const RESERVATION: u64 = 128 * 1024;
 const MAX_LIMIT: u64 = 512;
 const HEADROOM: u64 = 1024 * 1024;
 
@@ -23,6 +27,8 @@ pub(super) struct BudgetFileSink {
     high_water: u64,
     budget: BudgetController,
     job: JobId,
+    registry: VerificationStoreRegistry,
+    reservation_bytes: u64,
     signal: crate::CancellationHandle,
 }
 
@@ -98,6 +104,57 @@ impl BudgetFileSink {
             .check_store_admission(job, logical_limit, free)
             .map_err(|_| safe_error(io::ErrorKind::Other, "pack sink admission refused"))?;
 
+        // Commit durable admission before creating the payload file.
+        let registry_admission = (|| {
+            let mut registry = VerificationStoreRegistry::open(root.path.join(REGISTRY_NAME))
+                .map_err(|_| safe_error(io::ErrorKind::Other, "pack sink registry unavailable"))?;
+            let parent = root.path.parent().ok_or_else(|| {
+                safe_error(io::ErrorKind::PermissionDenied, "pack sink parent missing")
+            })?;
+            let parent_meta = fs::symlink_metadata(parent)?;
+            registry
+                .register(
+                    STORE_ID,
+                    parent_meta.dev(),
+                    parent_meta.ino(),
+                    opened_root.dev(),
+                    opened_root.ino(),
+                )
+                .map_err(|_| {
+                    safe_error(
+                        io::ErrorKind::Other,
+                        "pack sink registry registration refused",
+                    )
+                })?;
+            let reservation = registry
+                .reserve(STORE_ID, 0, RESERVATION)
+                .map_err(|_| safe_error(io::ErrorKind::Other, "pack sink reservation refused"))?;
+            if reservation.reserved_bytes != RESERVATION {
+                return Err(safe_error(
+                    io::ErrorKind::InvalidData,
+                    "pack sink reservation mismatch",
+                ));
+            }
+            Ok((registry, reservation.reserved_bytes))
+        })();
+        let (registry, reservation_bytes) = match registry_admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                signal.cancel();
+                return Err(error);
+            }
+        };
+
+        // Registry creation consumed control metadata space; sample again before payload creation.
+        let free_after_registry = free_bytes(&root_fd)?;
+        budget
+            .check_store_admission(job, logical_limit, free_after_registry)
+            .map_err(|_| {
+                safe_error(
+                    io::ErrorKind::Other,
+                    "pack sink post-registry reserve refused",
+                )
+            })?;
         let path = root.path.join(NAME);
         let file = File::from(
             rustix::fs::openat(
@@ -125,6 +182,8 @@ impl BudgetFileSink {
             high_water: 0,
             budget,
             job,
+            registry,
+            reservation_bytes,
             signal,
         };
         sink.validate_identity()?;
@@ -136,6 +195,15 @@ impl BudgetFileSink {
             .snapshot(self.job)
             .map(|snapshot| snapshot.usage.stored_bytes)
             .expect("created budget job remains registered")
+    }
+
+    pub(super) fn reservation_bytes(&self) -> io::Result<u64> {
+        let record = self
+            .registry
+            .get(STORE_ID)
+            .map_err(|_| safe_error(io::ErrorKind::Other, "pack sink reservation lookup failed"))?
+            .ok_or_else(|| safe_error(io::ErrorKind::NotFound, "pack sink reservation missing"))?;
+        Ok(record.reserved_bytes)
     }
 
     pub(super) fn contents(&self) -> io::Result<Vec<u8>> {
@@ -186,6 +254,24 @@ impl BudgetFileSink {
     }
 
     fn validate_identity(&self) -> io::Result<()> {
+        let record = self
+            .registry
+            .get(STORE_ID)
+            .map_err(|_| safe_error(io::ErrorKind::Other, "pack sink registry validation failed"))?
+            .ok_or_else(|| safe_error(io::ErrorKind::NotFound, "pack sink reservation missing"))?;
+        if record.reserved_bytes != self.reservation_bytes
+            || (record.root_dev, record.root_ino) != (self.root_identity.0, self.root_identity.1)
+            || !matches!(
+                record.state,
+                verification_store_registry::StoreState::Registered
+                    | verification_store_registry::StoreState::Active
+            )
+        {
+            return Err(safe_error(
+                io::ErrorKind::PermissionDenied,
+                "pack sink reservation binding changed",
+            ));
+        }
         let root = fs::symlink_metadata(&self.root_path)?;
         let held_root = self.root_fd.metadata()?;
         if !root.is_dir()
@@ -246,7 +332,15 @@ impl BudgetFileSink {
         self.high_water = high_water;
         self.budget
             .record_store(self.job, growth, free)
-            .map_err(|_| safe_error(io::ErrorKind::Other, "pack sink storage budget blocked"))
+            .map_err(|_| safe_error(io::ErrorKind::Other, "pack sink storage budget blocked"))?;
+        if high_water > self.reservation_bytes {
+            self.signal.cancel();
+            return Err(safe_error(
+                io::ErrorKind::Other,
+                "pack sink exceeded durable reservation",
+            ));
+        }
+        Ok(())
     }
 
     fn observe_after_operation(&mut self) -> io::Result<()> {
