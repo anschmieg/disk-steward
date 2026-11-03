@@ -1,0 +1,9 @@
+# M0 real Git fetch interoperability
+
+Extend only the closed Unix test fixture to request a real protocol v2 fetch through the inactive GitHub transport candidate, collect bounded sideband pack bytes and import them into a new task-owned bare store. Verify expected commit/tree/blob/tag identities and integrity there, with no source clone, remotes, credentials, renderer or eligibility changes. No production fetch API yet: this experiment establishes actual protocol requirements before a budgeted durable-store implementation.
+
+Use existing private TLS, fixed cleared-environment /usr/bin/git subprocess supervision and exclusive 0700 identity-validated roots. Keep all command input bounded and small; no arbitrary user input. Verify malformed/truncated pack fails in the isolated receiver. Review concrete code before execution. Preserve 2 GiB host reserve; use CARGO_INCREMENTAL=0 and no overlapping builds. Current free space5GiB after removing ignored task-owned incremental compiler artifacts; no user caches removed.
+
+Luna owns test fixture extension only; root reviews source, owns docs/progress/integration/validation. Stack atop PR51 f7568e8 with main9823535 baseline. Full fetch production safety, store allocation/budgets/reconciliation, reachability, real private GitHub/Keychain, human pilot and milestone gates remain open. Version0.0.17/no releases.
+
+Primary protocol reference reviewed: https://git-scm.com/docs/gitprotocol-v2 defines done→omitted acknowledgments, packfile section header, mandatory sideband1pack/2progress/3fatal and final flush. No shallow/filter/thin-pack/URI support requested in this closed experiment. https://git-scm.com/docs/git-index-pack documents --stdin import and --strict validation; receiver remains isolated from source/alternates. Full production input safety must not be inferred from a fixed small fixture.

@@ -164,3 +164,16 @@ commands and cleanup. The test checks real HEAD/main/tag and peeled metadata
 and both HTTP finalizations. This is local ref-protocol evidence on the Git
 version/platform where run, not fetching, object completeness, a broad version
 matrix, real GitHub/private authentication, or cleanup eligibility.
+
+The closed Unix interoperability fixture also requests a real v2 `fetch` for
+its advertised commit and annotated tag. It accepts only the expected packfile
+section and bounded sideband packets, retains at most 512 pack bytes, and
+requires both HTTP responses to finalize. In a separate fresh bare receiver,
+fixed Git commands run `index-pack --strict`, `fsck --strict --full`, and check
+that the expected blob, tree, commit and tag exist. Separate fresh receivers
+must reject a damaged checksum and a truncated pack. The subprocess input
+ceiling remains 512 bytes. This is a small local protocol experiment using
+system Git, not a production fetch API or durable budgeted verification store;
+it does not establish source-state reachability, real private GitHub access,
+large-pack behavior, or removal eligibility. The request and sideband layout
+follow the [Git v2 protocol](https://git-scm.com/docs/gitprotocol-v2).
