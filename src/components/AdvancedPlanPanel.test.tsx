@@ -361,6 +361,130 @@ describe("AdvancedPlanPanel decisions", () => {
     },
   );
 
+  it("restores a later group toggle after an earlier group expands beyond the window", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const earlyItems = Array.from({ length: 80 }, (_, index) =>
+      editorItem(`early-${index}`, {
+        inPlan: index === 0,
+        effectiveSelected: index === 0,
+        groupIds: ["early-group"],
+      }),
+    );
+    const laterItem = editorItem("later-item", {
+      groupIds: ["later-group"],
+    });
+    const initial = editorSnapshot(
+      [...earlyItems, laterItem],
+      [
+        editorGroup(
+          "early-group",
+          earlyItems.map((item) => item.itemId),
+          { label: "Early findings" },
+        ),
+        editorGroup("later-group", [laterItem.itemId], {
+          label: "Later findings",
+        }),
+      ],
+    );
+    const props = {
+      busy: false,
+      confirmed: false,
+      editsConfirmed: true,
+      readOnly: false,
+      onEdit: vi.fn<(edit: PlanEdit) => Promise<void>>().mockResolvedValue(),
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+      onReview: async () => {},
+    };
+    const { rerender } = render(
+      <AdvancedPlanPanel snapshot={initial} {...props} />,
+    );
+    Object.defineProperty(
+      screen.getByRole("list", { name: "Grouped plan findings" }),
+      "clientHeight",
+      { configurable: true, value: 464 },
+    );
+
+    const laterToggle = screen.getByRole("button", {
+      name: "Collapse Later findings",
+    });
+    act(() => laterToggle.focus());
+    expect(laterToggle).toHaveFocus();
+
+    const next = {
+      ...initial,
+      revisionId: "earlier-group-expanded",
+      revisionNumber: initial.revisionNumber + 1,
+      items: [
+        ...earlyItems.map((item) => ({ ...item, inPlan: true })),
+        laterItem,
+      ],
+    };
+    rerender(<AdvancedPlanPanel snapshot={next} {...props} />);
+    expect(
+      screen.queryByRole("button", { name: "Collapse Later findings" }),
+    ).not.toBeInTheDocument();
+    act(() => frames.splice(0).forEach((callback) => callback(0)));
+
+    const list = screen.getByRole("list", { name: "Grouped plan findings" });
+    const restoredToggle = screen.getByRole("button", {
+      name: "Collapse Later findings",
+    });
+    expect(restoredToggle).toBeInTheDocument();
+    expect(restoredToggle).toHaveFocus();
+    expect(within(list).getAllByRole("listitem").length).toBeLessThan(100);
+  });
+
+  it.each(["Include group", "Keep group", "Investigate"])(
+    "restores the exact %s control after busy clears",
+    (name) => {
+      const frames = stubAnimationFrames();
+      const item = editorItem("group-focus-item");
+      const snapshot = editorSnapshot(
+        [item],
+        [editorGroup("group-focus", [item.itemId])],
+      );
+      const props = {
+        busy: false,
+        confirmed: false,
+        onEdit: async () => {},
+        onUndo: async () => {},
+        onRedo: async () => {},
+        onRefresh: async () => {},
+      };
+      const view = render(<AdvancedPlanPanel snapshot={snapshot} {...props} />);
+      const control = screen.getByRole("button", { name });
+      act(() => control.focus());
+      const next = {
+        ...snapshot,
+        revisionId: "group-focus-next",
+        revisionNumber: 2,
+      };
+      view.rerender(<AdvancedPlanPanel snapshot={next} {...props} busy />);
+      // A disabled control may lose focus in the native WebView. Model that
+      // loss without introducing a newer user-selected focus target.
+      act(() => {
+        const previous = document.body.getAttribute("tabindex");
+        document.body.setAttribute("tabindex", "-1");
+        document.body.focus();
+        if (previous === null) document.body.removeAttribute("tabindex");
+        else document.body.setAttribute("tabindex", previous);
+      });
+      expect(document.body).toHaveFocus();
+      view.rerender(<AdvancedPlanPanel snapshot={next} {...props} />);
+      expect(frames.callbacks).toHaveLength(1);
+      act(() => frames.run(1));
+      expect(screen.getByRole("button", { name })).toHaveFocus();
+    },
+  );
+
   it("ignores a stale restore after a busy revision and newer Search focus", () => {
     const frames = stubAnimationFrames();
     const item = editorItem("focus-item", { label: "Focus item" });

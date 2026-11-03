@@ -635,6 +635,7 @@ export default function AdvancedPlanPanel({
                   return (
                     <div
                       key={row.key}
+                      data-editor-row={row.key}
                       role="listitem"
                       aria-posinset={index + 1}
                       aria-setsize={rows.length}
@@ -701,6 +702,7 @@ export default function AdvancedPlanPanel({
                           aria-label={`Set all eligible ${label} items`}
                         >
                           <button
+                            data-editor-focus={`group-choice:include:${row.groupId}`}
                             disabled={groupChoiceDisabled}
                             title={groupChoiceTitle}
                             onClick={() =>
@@ -714,6 +716,7 @@ export default function AdvancedPlanPanel({
                             Include group
                           </button>
                           <button
+                            data-editor-focus={`group-choice:keep:${row.groupId}`}
                             disabled={groupChoiceDisabled}
                             title={groupChoiceTitle}
                             onClick={() =>
@@ -727,6 +730,7 @@ export default function AdvancedPlanPanel({
                             Keep group
                           </button>
                           <button
+                            data-editor-focus={`group-choice:investigate:${row.groupId}`}
                             disabled={groupChoiceDisabled}
                             title={groupChoiceTitle}
                             onClick={() =>
