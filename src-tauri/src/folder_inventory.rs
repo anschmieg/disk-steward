@@ -124,6 +124,7 @@ pub struct FolderTreeSummary {
     pub duplicate_hardlink_names: u32,
     pub directories_visited: u32,
     pub skipped_entries: u32,
+    pub excluded_directories: u32,
     pub unreadable_entries: u32,
     pub changed_directories: u32,
     pub unique_file_logical_bytes: String,
@@ -1422,10 +1423,12 @@ pub async fn clear_folder_inventory(
 #[tauri::command]
 pub async fn inspect_folder_tree_summary(
     state: tauri::State<'_, FolderInventoryState>,
+    exclusions: tauri::State<'_, crate::global_exclusions::ExclusionState>,
     request: TreeSummaryRequest,
 ) -> Result<FolderTreeSummary, String> {
     let guard = crate::NativeCheckGuard::acquire()?;
     let sessions = Arc::clone(&state.0);
+    let exclusions = exclusions.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         let current = sessions
@@ -1445,8 +1448,10 @@ pub async fn inspect_folder_tree_summary(
         {
             let started = Instant::now();
             validate_session_bindings(session, started, MAX_DURATION).map_err(str::to_owned)?;
+            let (exclusion_revision, policy) = exclusions.summary_policy(started, MAX_DURATION).map_err(str::to_owned)?;
             let summary = tree_summary::summarize(
                 session,
+                &policy,
                 request.expected_observation_id,
                 started,
                 MAX_DURATION,
@@ -1455,6 +1460,10 @@ pub async fn inspect_folder_tree_summary(
             )
             .map_err(str::to_owned)?;
             validate_session_bindings(session, started, MAX_DURATION).map_err(str::to_owned)?;
+            let (after_revision, after_policy) = exclusions.summary_policy(started, MAX_DURATION).map_err(str::to_owned)?;
+            if exclusion_revision != after_revision || policy != after_policy {
+                return Err("Remembered exclusions changed during inspection. Refresh before summarizing again.".into());
+            }
             Ok(summary)
         }
         #[cfg(not(unix))]
