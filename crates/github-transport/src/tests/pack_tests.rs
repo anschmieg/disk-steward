@@ -100,6 +100,16 @@ fn pack_transfer_completion_is_not_an_object_integrity_claim() {
     );
     assert_eq!(sink, b"PACKopaque fixture bytes");
     assert_eq!(report.bytes_written(), sink.len() as u64);
+    let digest_hex: String = report
+        .accepted_pack_sha256()
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        digest_hex,
+        "ed2cf8c3289ae21bfcc63b511e4e7cb82b50e6b0cd67c43bf0f6903bb1a07433"
+    );
     assert_eq!(report.finalization().framing().completed(), 3);
 }
 
@@ -120,6 +130,7 @@ fn pack_transfer_rejects_protocol_failures_without_complete_report() {
         server.join().unwrap();
         assert!(!report.is_complete_transfer());
         assert!(report.advertised_refs().is_none());
+        assert!(report.accepted_pack_sha256().is_none());
         assert!(report.operation_error_kind().is_some());
         assert_eq!(report.bytes_written(), sink.len() as u64);
     }
@@ -150,6 +161,7 @@ fn pack_transfer_reports_actual_partial_sink_bytes_on_failure() {
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
     assert!(report.advertised_refs().is_none());
+    assert!(report.accepted_pack_sha256().is_none());
     assert_eq!(report.bytes_written(), 3);
     assert_eq!(sink.bytes, b"PAC");
     assert_eq!(report.operation_error_kind(), Some(io::ErrorKind::Other));
@@ -173,6 +185,7 @@ fn oversized_or_empty_tip_set_refuses_fetch_before_sink_io() {
         server.join().unwrap();
         assert!(!report.is_complete_transfer());
         assert!(report.advertised_refs().is_none());
+        assert!(report.accepted_pack_sha256().is_none());
         assert_eq!(
             report.operation_error_kind(),
             Some(io::ErrorKind::InvalidData)
@@ -214,6 +227,7 @@ fn sink_cancellation_keeps_accepted_bytes_and_prevents_further_writes() {
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
     assert!(report.advertised_refs().is_none());
+    assert!(report.accepted_pack_sha256().is_none());
     assert_eq!(
         report.operation_error_kind(),
         Some(io::ErrorKind::ConnectionAborted)
@@ -232,6 +246,7 @@ fn git_flush_cannot_complete_transfer_with_truncated_http_framing() {
     assert_eq!(report.bytes_written(), sink.len() as u64);
     assert!(!report.is_complete_transfer());
     assert!(report.advertised_refs().is_none());
+    assert!(report.accepted_pack_sha256().is_none());
     assert!(!report.finalization().is_complete());
     assert!(report.operation_error_kind().is_none());
 }
@@ -489,4 +504,79 @@ fn advertised_report_retains_roots_for_required_object_coverage() {
     assert!(checked
         .check_required_objects(&[(id, K::Tree)], &cancel, deadline)
         .is_err());
+}
+
+#[test]
+fn transfer_digest_follows_short_writes_and_interruptions() {
+    struct ShortSink {
+        bytes: Vec<u8>,
+        interrupted: bool,
+    }
+    impl io::Write for ShortSink {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let count = input.len().min(2);
+            self.bytes.extend_from_slice(&input[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("transport must not flush an arbitrary sink")
+        }
+    }
+    let (transport, server) = pack_fixture(pack_body(b"PACKopaque fixture bytes"));
+    let mut sink = ShortSink {
+        bytes: Vec::new(),
+        interrupted: false,
+    };
+    let report = transport.download_advertised_pack(&mut sink).unwrap();
+    server.join().unwrap();
+    assert!(report.is_complete_transfer());
+    assert_eq!(sink.bytes, b"PACKopaque fixture bytes");
+    let digest_hex: String = report
+        .accepted_pack_sha256()
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        digest_hex,
+        "ed2cf8c3289ae21bfcc63b511e4e7cb82b50e6b0cd67c43bf0f6903bb1a07433"
+    );
+}
+
+#[test]
+fn decoder_rejects_same_length_valid_pack_substitution_with_same_roots() {
+    use super::graph_tests::{hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let root = b"root".to_vec();
+    let id = oid(K::Blob, &root);
+    let original = pack_bytes(&[(K::Blob, root.clone()), (K::Blob, b"x".to_vec())]);
+    let substituted = pack_bytes(&[(K::Blob, root), (K::Blob, b"y".to_vec())]);
+    assert_eq!(original.len(), substituted.len());
+    assert_ne!(original, substituted);
+    let alternative = decode_sha1_pack(
+        &substituted,
+        4096,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(check_pack_graph_closure(
+        &alternative,
+        &[(id, K::Blob)],
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5)
+    )
+    .is_ok());
+    let report = advertised_decode_fixture(
+        format!("{} refs/tags/root\n", hex(&id)).into_bytes(),
+        &original,
+    );
+    assert!(decode_report(&report, &original).is_ok());
+    let error = decode_report(&report, &substituted).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "pack bytes do not match transfer digest");
 }

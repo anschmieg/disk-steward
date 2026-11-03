@@ -1,12 +1,13 @@
 //! Experimental closure checking for objects named by one completed pack transfer.
 //!
-//! This validates only the selected advertised roots and any advertised tag peel
-//! claims. It is not a full fsck, an atomic remote snapshot, or proof that the
-//! supplied bytes came from the report's sink. The caller must pass bytes actually
-//! captured from that sink; equal length and root presence do not prove stream
-//! provenance. This establishes no local preservation or cleanup eligibility and
-//! provides no RSS proof. These bounds are experimental, not product scope.
+//! This validates advertised roots and tag peel claims while binding the supplied
+//! bytes to the transfer's accepted-byte SHA-256 digest. This is not full fsck,
+//! an atomic remote snapshot, or proof of physical sink persistence. A sink's
+//! accepted byte count remains its own contract. This establishes no local
+//! preservation or cleanup eligibility and provides no RSS proof. These bounds
+//! are experimental, not product scope.
 
+use sha2::{Digest, Sha256};
 use std::{io, time::Instant};
 
 use crate::{
@@ -103,6 +104,24 @@ pub fn decode_advertised_pack(
         .advertised_refs()
         .filter(|refs| !refs.is_empty() && refs.len() <= MAX_REFS)
         .ok_or_else(|| invalid("advertised reference set invalid"))?;
+
+    if input.len() > crate::decode::MAX_PACK_BYTES {
+        return Err(safe_error(
+            io::ErrorKind::InvalidInput,
+            "pack exceeds decoder input limit",
+        ));
+    }
+    let mut digest = Sha256::new();
+    for chunk in input.chunks(8192) {
+        check_attempt(cancellation, deadline)?;
+        digest.update(chunk);
+    }
+    check_attempt(cancellation, deadline)?;
+    let observed: [u8; 32] = digest.finalize().into();
+    check_attempt(cancellation, deadline)?;
+    if report.accepted_pack_sha256() != Some(&observed) {
+        return Err(invalid("pack bytes do not match transfer digest"));
+    }
 
     let decoded = decode_sha1_pack(input, max_decoded_bytes, cancellation, deadline)?;
     let objects = decoded.objects();

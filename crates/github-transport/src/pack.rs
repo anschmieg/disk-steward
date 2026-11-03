@@ -7,6 +7,7 @@ use std::{
 use gix_transport::client::blocking_io::{
     ExtendedBufRead as _, ReadlineBufRead as _, TransportV2Ext as _,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     check_deadline, safe_error, AdvertisedRef, CancellationHandle, GitHubTransport,
@@ -31,6 +32,7 @@ pub struct PackTransferReport {
     operation_error_kind: Option<io::ErrorKind>,
     finalization: HttpFinalizationReport,
     advertised_refs: Option<Vec<AdvertisedRef>>,
+    accepted_pack_sha256: Option<[u8; 32]>,
 }
 
 impl PackTransferReport {
@@ -57,6 +59,15 @@ impl PackTransferReport {
         self.advertised_refs.as_deref()
     }
 
+    /// SHA-256 of pack bytes the caller's sink reported accepting. Available
+    /// only when the pack operation and tracked HTTP framing both completed.
+    /// This binds the reported accepted byte stream; it does not prove physical
+    /// persistence, authenticate the source, verify pack integrity, or establish
+    /// cleanup eligibility.
+    pub fn accepted_pack_sha256(&self) -> Option<&[u8; 32]> {
+        self.accepted_pack_sha256.as_ref()
+    }
+
     /// True only when the Git pack section completed and all tracked HTTP
     /// response bodies finalized successfully. This is not object verification.
     pub fn is_complete_transfer(&self) -> bool {
@@ -64,6 +75,7 @@ impl PackTransferReport {
             && self.bytes_written > 0
             && self.finalization.is_complete()
             && self.advertised_refs.is_some()
+            && self.accepted_pack_sha256.is_some()
     }
 }
 
@@ -83,13 +95,20 @@ pub(super) fn download_advertised_pack(
     let cancellation = transport.cancellation_handle();
     let deadline = transport.deadline;
     let mut bytes_written = 0;
-    let operation = transfer_pack(
-        &mut transport,
-        sink,
-        &cancellation,
-        deadline,
-        &mut bytes_written,
-    );
+    let (operation, digest) = {
+        let mut digesting_sink = DigestingSink {
+            inner: sink,
+            digest: Sha256::new(),
+        };
+        let operation = transfer_pack(
+            &mut transport,
+            &mut digesting_sink,
+            &cancellation,
+            deadline,
+            &mut bytes_written,
+        );
+        (operation, digesting_sink.digest)
+    };
 
     // A sink may refuse growth because its owned-store reserve is exhausted.
     // Do not download the remaining response merely to finalize that failure.
@@ -98,16 +117,40 @@ pub(super) fn download_advertised_pack(
     }
     let operation_error_kind = operation.as_ref().err().map(io::Error::kind);
     let finalization = transport.finalize_http_framing()?;
-    let advertised_refs = match operation {
-        Ok(refs) if finalization.is_complete() => Some(refs),
-        _ => None,
+    let (advertised_refs, accepted_pack_sha256) = match operation {
+        Ok(refs) if finalization.is_complete() => (Some(refs), Some(digest.finalize().into())),
+        _ => (None, None),
     };
     Ok(PackTransferReport {
         bytes_written,
         operation_error_kind,
         finalization,
         advertised_refs,
+        accepted_pack_sha256,
     })
+}
+
+struct DigestingSink<'a, W: Write> {
+    inner: &'a mut W,
+    digest: Sha256,
+}
+
+impl<W: Write> Write for DigestingSink<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self.inner.write(bytes) {
+            Ok(count) => {
+                if count <= bytes.len() {
+                    self.digest.update(&bytes[..count]);
+                }
+                Ok(count)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn transfer_pack(
