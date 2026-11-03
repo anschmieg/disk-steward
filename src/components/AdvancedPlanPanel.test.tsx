@@ -604,6 +604,112 @@ describe("AdvancedPlanPanel decisions", () => {
     });
   });
 
+  it("bounds descendant pages after snapshots shrink and does not restore an obsolete page", () => {
+    const folder = editorItem("paged-project", {
+      label: "Paged project",
+      kind: "folder",
+      excludedDescendantIds: ["child-005", "child-050"],
+    });
+    const children = Array.from({ length: 120 }, (_, index) =>
+      editorItem(`child-${String(index).padStart(3, "0")}`, {
+        label: `Child ${String(index).padStart(3, "0")}`,
+        parentId: folder.itemId,
+      }),
+    );
+    const snapshot = (count: number, revision: number) =>
+      editorSnapshot(
+        [
+          {
+            ...folder,
+            excludedDescendantIds: folder.excludedDescendantIds.filter((id) =>
+              children.slice(0, count).some((child) => child.itemId === id),
+            ),
+          },
+          ...children.slice(0, count),
+        ],
+        [],
+        {
+          revisionId: `descendants-${revision}`,
+          revisionNumber: revision,
+        },
+      );
+    const onEdit = vi
+      .fn<(edit: PlanEdit) => Promise<void>>()
+      .mockResolvedValue();
+    const props = {
+      busy: false,
+      confirmed: false,
+      onEdit,
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+    };
+    const view = render(
+      <AdvancedPlanPanel snapshot={snapshot(120, 1)} {...props} />,
+    );
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "Search findings and groups" }),
+      { target: { value: "Paged project" } },
+    );
+    fireEvent.click(screen.getByRole("listitem", { name: /Paged project/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 3 of 3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: /Child 100/ }),
+    ).toBeInTheDocument();
+
+    view.rerender(<AdvancedPlanPanel snapshot={snapshot(20, 2)} {...props} />);
+    expect(screen.getByText("Showing 1–20 of 20")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Next" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /Child 005/ })).toBeChecked();
+
+    view.rerender(<AdvancedPlanPanel snapshot={snapshot(120, 3)} {...props} />);
+    expect(screen.getByText("Page 1 of 3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: /Child 000/ }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 2 of 3")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 3 of 3")).toBeInTheDocument();
+    view.rerender(<AdvancedPlanPanel snapshot={snapshot(60, 4)} {...props} />);
+    expect(screen.getByText("Showing 51–60 of 60")).toBeInTheDocument();
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Previous" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: /Child 050/ })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Child 050/ }));
+    expect(onEdit).toHaveBeenLastCalledWith({
+      kind: "excludeDescendants",
+      parentId: "paged-project",
+      itemIds: ["child-005"],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Previous" }));
+    expect(screen.getByText("Page 1 of 2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Previous" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    const search = screen.getByRole("searchbox", {
+      name: "Search descendants",
+    });
+    fireEvent.change(search, { target: { value: "not a child" } });
+    expect(screen.getByText("No matching descendants")).toBeInTheDocument();
+    expect(screen.queryAllByRole("checkbox", { name: /^Child / })).toHaveLength(
+      0,
+    );
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.getByText("Showing 1–50 of 60")).toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 2")).toBeInTheDocument();
+    expect(screen.getAllByRole("checkbox", { name: /^Child / })).toHaveLength(
+      50,
+    );
+    expect(onEdit).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ["busy", { busy: true }],
     ["read only", { readOnly: true }],
