@@ -27,6 +27,8 @@ pub enum BlockReason {
     ArithmeticOverflow,
     AttemptTimedOut,
     JobNotRunning,
+    /// The cumulative ingress counter moved backwards during an attempt.
+    IngressCounterRegressed,
     /// A caller could not finish a store operation or observe its outcome.
     StoreIncomplete,
     CleanupNotPending,
@@ -169,6 +171,49 @@ impl BudgetController {
             return Err(BudgetError::Blocked(reason));
         }
         Ok(())
+    }
+
+    /// Account a cumulative transport ingress observation for the same job
+    /// attempt and counter domain. Only the newly observed delta is charged,
+    /// so repeating a total never charges it twice. The caller is responsible for
+    /// binding totals to the correct job, attempt, and counter domain; do not
+    /// mix incompatible totals or chunk deltas for one job.
+    ///
+    /// Totals may still be charged after failure or cancellation while the
+    /// worker may be receiving data. A regressed total leaves usage unchanged;
+    /// it fails a running job with `IngressCounterRegressed`, while preserving
+    /// any earlier failed or canceled state. This method does not acknowledge
+    /// worker stop or authorize cleanup.
+    pub fn record_ingress_total(&mut self, id: JobId, total: u64) -> Result<(), BudgetError> {
+        let job = self.jobs.get_mut(&id).ok_or(BudgetError::UnknownJob(id))?;
+        let may_still_receive = matches!(
+            job.state,
+            JobState::Running
+                | JobState::Failed {
+                    worker_stopped: false,
+                    ..
+                }
+                | JobState::Canceled {
+                    worker_stopped: false,
+                    ..
+                }
+        );
+        if !may_still_receive {
+            return Err(BudgetError::Blocked(BlockReason::JobNotRunning));
+        }
+
+        if total < job.usage.ingress_bytes {
+            if job.state == JobState::Running {
+                job.state = JobState::Failed {
+                    reason: BlockReason::IngressCounterRegressed,
+                    worker_stopped: false,
+                };
+            }
+            return Err(BudgetError::Blocked(BlockReason::IngressCounterRegressed));
+        }
+
+        let delta = total - job.usage.ingress_bytes;
+        self.record_ingress(id, delta)
     }
 
     /// Check whether a running job may attempt a proposed store growth delta.
@@ -823,5 +868,201 @@ mod tests {
         assert_eq!(b.snapshot(third).unwrap().usage.stored_bytes, 1);
         b.confirm_cleanup(id).unwrap();
         assert_eq!(b.aggregate_stored().unwrap(), PER_REPOSITORY_TEMP_LIMIT + 1);
+    }
+
+    #[test]
+    fn cumulative_ingress_repeats_increases_and_enforces_exact_cap() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        assert_eq!(b.record_ingress_total(id, 100), Ok(()));
+        assert_eq!(b.record_ingress_total(id, 100), Ok(()));
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, 100);
+
+        assert_eq!(
+            b.record_ingress_total(id, PER_REPOSITORY_INGRESS_LIMIT),
+            Ok(())
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().usage.ingress_bytes,
+            PER_REPOSITORY_INGRESS_LIMIT
+        );
+        assert_eq!(
+            b.record_ingress_total(id, PER_REPOSITORY_INGRESS_LIMIT + 1),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().usage.ingress_bytes,
+            PER_REPOSITORY_INGRESS_LIMIT + 1
+        );
+        assert_eq!(
+            b.record_ingress_total(id, PER_REPOSITORY_INGRESS_LIMIT + 1),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(
+            b.snapshot(id).unwrap().usage.ingress_bytes,
+            PER_REPOSITORY_INGRESS_LIMIT + 1
+        );
+    }
+
+    #[test]
+    fn cumulative_ingress_late_totals_are_charged_but_preserve_terminal_reason() {
+        let mut b = controller();
+        let canceled = b.start(free()).unwrap();
+        b.record_ingress_total(canceled, 20).unwrap();
+        b.cancel(canceled).unwrap();
+        assert_eq!(b.record_ingress_total(canceled, 45), Ok(()));
+        assert_eq!(b.snapshot(canceled).unwrap().usage.ingress_bytes, 45);
+        assert_eq!(
+            b.snapshot(canceled).unwrap().state,
+            JobState::Canceled {
+                cleanup_confirmed: false,
+                worker_stopped: false
+            }
+        );
+
+        let mut failed_controller = controller();
+        let failed = failed_controller.start(free()).unwrap();
+        failed_controller.record_ingress_total(failed, 20).unwrap();
+        failed_controller
+            .fail(failed, BlockReason::AttemptTimedOut)
+            .unwrap();
+        assert_eq!(failed_controller.record_ingress_total(failed, 45), Ok(()));
+        assert_eq!(
+            failed_controller
+                .snapshot(failed)
+                .unwrap()
+                .usage
+                .ingress_bytes,
+            45
+        );
+        assert_eq!(
+            failed_controller.snapshot(failed).unwrap().state,
+            JobState::Failed {
+                reason: BlockReason::AttemptTimedOut,
+                worker_stopped: false
+            }
+        );
+    }
+
+    #[test]
+    fn regressed_ingress_fails_running_without_changing_usage() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        b.record_ingress_total(id, 200).unwrap();
+        assert_eq!(
+            b.record_ingress_total(id, 199),
+            Err(BudgetError::Blocked(BlockReason::IngressCounterRegressed))
+        );
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, 200);
+        assert_eq!(
+            b.snapshot(id).unwrap().state,
+            JobState::Failed {
+                reason: BlockReason::IngressCounterRegressed,
+                worker_stopped: false
+            }
+        );
+    }
+
+    #[test]
+    fn regressed_ingress_preserves_canceled_and_prior_failed_states() {
+        let mut b = controller();
+        let canceled = b.start(free()).unwrap();
+        b.record_ingress_total(canceled, 200).unwrap();
+        b.cancel(canceled).unwrap();
+        assert_eq!(
+            b.record_ingress_total(canceled, 199),
+            Err(BudgetError::Blocked(BlockReason::IngressCounterRegressed))
+        );
+        assert_eq!(b.snapshot(canceled).unwrap().usage.ingress_bytes, 200);
+        assert_eq!(
+            b.snapshot(canceled).unwrap().state,
+            JobState::Canceled {
+                cleanup_confirmed: false,
+                worker_stopped: false
+            }
+        );
+
+        let mut b = controller();
+        let failed = b.start(free()).unwrap();
+        b.record_ingress_total(failed, 200).unwrap();
+        b.fail(failed, BlockReason::AttemptTimedOut).unwrap();
+        assert_eq!(
+            b.record_ingress_total(failed, 199),
+            Err(BudgetError::Blocked(BlockReason::IngressCounterRegressed))
+        );
+        assert_eq!(b.snapshot(failed).unwrap().usage.ingress_bytes, 200);
+        assert_eq!(
+            b.snapshot(failed).unwrap().state,
+            JobState::Failed {
+                reason: BlockReason::AttemptTimedOut,
+                worker_stopped: false
+            }
+        );
+    }
+
+    #[test]
+    fn cumulative_ingress_rejects_unknown_stopped_and_completed_jobs() {
+        let mut b = controller();
+        assert_eq!(
+            b.record_ingress_total(JobId(999), 1),
+            Err(BudgetError::UnknownJob(JobId(999)))
+        );
+
+        let stopped = b.start(free()).unwrap();
+        b.fail(stopped, BlockReason::AttemptTimedOut).unwrap();
+        b.acknowledge_worker_stopped(stopped).unwrap();
+        let stopped_snapshot = b.snapshot(stopped).unwrap().clone();
+        assert_eq!(
+            b.record_ingress_total(stopped, 0),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(b.snapshot(stopped).unwrap(), &stopped_snapshot);
+
+        let completed = b.start(free()).unwrap();
+        b.record_ingress_total(completed, 10).unwrap();
+        b.complete(completed).unwrap();
+        let completed_snapshot = b.snapshot(completed).unwrap().clone();
+        assert_eq!(
+            b.record_ingress_total(completed, 10),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(b.snapshot(completed).unwrap(), &completed_snapshot);
+    }
+
+    #[test]
+    fn cumulative_ingress_max_total_and_delta_overflow_saturate_without_wrapping() {
+        let mut b = controller();
+        let id = b.start(free()).unwrap();
+        assert_eq!(
+            b.record_ingress_total(id, u64::MAX),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, u64::MAX);
+        assert_eq!(
+            b.record_ingress_total(id, u64::MAX),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(b.snapshot(id).unwrap().usage.ingress_bytes, u64::MAX);
+        b.acknowledge_worker_stopped(id).unwrap();
+
+        let overflow = b.start(free()).unwrap();
+        b.jobs.get_mut(&overflow).unwrap().usage.ingress_bytes = u64::MAX - 4;
+        assert_eq!(
+            b.record_ingress(overflow, 10),
+            Err(BudgetError::Blocked(BlockReason::ArithmeticOverflow))
+        );
+        assert_eq!(b.snapshot(overflow).unwrap().usage.ingress_bytes, u64::MAX);
+        assert_eq!(
+            b.record_ingress_total(overflow, u64::MAX),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit))
+        );
+        assert_eq!(b.snapshot(overflow).unwrap().usage.ingress_bytes, u64::MAX);
+        assert_eq!(
+            b.snapshot(overflow).unwrap().state,
+            JobState::Failed {
+                reason: BlockReason::ArithmeticOverflow,
+                worker_stopped: false
+            }
+        );
     }
 }

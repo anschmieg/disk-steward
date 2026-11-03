@@ -3076,6 +3076,20 @@ mod tests {
             transport_at(address, Arc::clone(&tls.trusted), AttemptLimits::default());
         assert!(transport.handshake(Service::UploadPack, &[]).is_ok());
         let before = transport.observed_ingress_bytes().unwrap();
+        let mut accounting =
+            verification_budget::BudgetController::new(verification_budget::Limits {
+                headroom_bytes: 0,
+            });
+        let job = accounting.start(10 * verification_budget::GIB).unwrap();
+        accounting.record_ingress_total(job, before).unwrap();
+        accounting.record_ingress_total(job, before).unwrap();
+        assert_eq!(
+            accounting.snapshot(job).unwrap().usage.ingress_bytes,
+            before
+        );
+        // Model cancellation before the worker's final observation arrives.
+        // This is accounting evidence, not cancellation routing/worker-stop proof.
+        accounting.cancel(job).unwrap();
         release_tx.send(()).unwrap();
         let report = transport.finalize_http_framing().unwrap();
         assert!(server.join().is_ok());
@@ -3084,6 +3098,29 @@ mod tests {
         assert_eq!(report.framing().completed(), 1);
         assert_eq!(report.framing().pending(), 0);
         assert!(report.observed_ingress_bytes() > before);
+        accounting
+            .record_ingress_total(job, report.observed_ingress_bytes())
+            .unwrap();
+        accounting
+            .record_ingress_total(job, report.observed_ingress_bytes())
+            .unwrap();
+        assert_eq!(
+            accounting.snapshot(job).unwrap().usage.ingress_bytes,
+            report.observed_ingress_bytes()
+        );
+        assert!(matches!(
+            accounting.snapshot(job).unwrap().state,
+            verification_budget::JobState::Canceled {
+                worker_stopped: false,
+                cleanup_confirmed: false
+            }
+        ));
+        assert_eq!(
+            accounting.confirm_cleanup(job),
+            Err(verification_budget::BudgetError::Blocked(
+                verification_budget::BlockReason::CleanupNotPending
+            ))
+        );
     }
 
     #[test]
@@ -3785,6 +3822,21 @@ mod tests {
         assert_eq!(report.refs().unwrap().len(), 1);
         assert_eq!(report.refs().unwrap()[0].name(), b"refs/heads/main");
         assert!(report.finalization().is_complete());
+        let mut accounting =
+            verification_budget::BudgetController::new(verification_budget::Limits {
+                headroom_bytes: 0,
+            });
+        let job = accounting.start(10 * verification_budget::GIB).unwrap();
+        let total = report.finalization().observed_ingress_bytes();
+        assert!(total > 0);
+        accounting.record_ingress_total(job, total).unwrap();
+        accounting.record_ingress_total(job, total).unwrap();
+        assert_eq!(accounting.snapshot(job).unwrap().usage.ingress_bytes, total);
+        assert_eq!(
+            accounting.snapshot(job).unwrap().state,
+            verification_budget::JobState::Running
+        );
+        assert!(accounting.confirm_cleanup(job).is_err());
     }
 
     #[test]
