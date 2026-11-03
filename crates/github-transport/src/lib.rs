@@ -4,6 +4,8 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod object_identity;
+pub use object_identity::{git_sha1_object_id, GitObjectKind};
 mod inflate;
 pub use inflate::{inflate_pack_representation, InflatedRepresentation};
 mod delta;
@@ -2117,6 +2119,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod git_interop;
     mod inflate_tests;
+    mod object_identity_tests;
     mod pack_tests;
 
     use super::*;
