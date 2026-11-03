@@ -38,6 +38,7 @@ type Props = {
 type Row = { key: string; groupId: string; itemId?: string; item?: EditorItem };
 const ROW_HEIGHT = 58;
 const WINDOW_HEIGHT = 464;
+const VIRTUAL_ROW_COUNT = Math.ceil(WINDOW_HEIGHT / ROW_HEIGHT) + 6;
 const choiceLabel: Record<PlanChoice, string> = {
   include: "Include",
   keep: "Keep",
@@ -193,15 +194,26 @@ export default function AdvancedPlanPanel({
     collator,
   ]);
   const visibleRows = useMemo(() => {
-    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 3);
+    const lastValidStart = Math.max(0, rows.length - VIRTUAL_ROW_COUNT);
+    const start = Math.min(
+      lastValidStart,
+      Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 3),
+    );
     return {
       start,
-      rows: rows.slice(
-        start,
-        start + Math.ceil(WINDOW_HEIGHT / ROW_HEIGHT) + 6,
-      ),
+      rows: rows.slice(start, start + VIRTUAL_ROW_COUNT),
     };
   }, [rows, scrollTop]);
+  useLayoutEffect(() => {
+    const container = scroller.current;
+    if (!container) return;
+    const viewportHeight = container.clientHeight || WINDOW_HEIGHT;
+    const maximum = Math.max(0, rows.length * ROW_HEIGHT - viewportHeight);
+    if (scrollTop > maximum) {
+      setScrollTop(maximum);
+      if (container.scrollTop > maximum) container.scrollTop = maximum;
+    }
+  }, [rows.length, scrollTop]);
   const requestFocusRow = (index: number) => {
     const boundedIndex = Math.max(0, Math.min(rows.length - 1, index));
     const next = rows[boundedIndex];
