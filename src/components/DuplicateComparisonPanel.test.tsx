@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import type { EditorSnapshot } from "../general-plan-contract";
 import DuplicateComparisonPanel from "./DuplicateComparisonPanel";
 import type { FolderInventory } from "./FolderInventoryPanel";
 
@@ -52,6 +53,27 @@ const validResult = {
   groups: [
     { id: "group-1", entryIds: ["entry-1", "entry-2"], logicalBytes: "4096" },
   ],
+};
+
+const planSnapshot: EditorSnapshot = {
+  schemaVersion: 1,
+  kind: "non_executable_editor",
+  executionAvailable: false,
+  planId: "plan-local",
+  revisionId: "revision-7",
+  revisionNumber: 7,
+  items: [],
+  groups: [],
+  duplicates: [],
+  totals: {
+    selectedCount: 0,
+    logicalSelectedBytes: 0,
+    inPlanLogicalBytes: 0,
+    recoveryLowerBytes: 0,
+    recoveryUpperBytes: null,
+  },
+  canUndo: false,
+  canRedo: false,
 };
 
 function selectTwoAndConsent() {
@@ -270,6 +292,9 @@ test("reports no matching groups only for the explicitly selected files", async 
       /No matching groups among the selected files for that comparison/,
     ),
   ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Add matching groups to plan" }),
+  ).not.toBeInTheDocument();
   expect(screen.queryByText(/folder is clean/i)).not.toBeInTheDocument();
 });
 
@@ -325,4 +350,271 @@ test("enforces the aggregate 64 MiB logical-input limit before selection", () =>
   expect(screen.getByText(/^4 selected · 67,108,864 bytes/)).toBeVisible();
   expect(files.getByRole("checkbox", { name: /file-5\.bin/ })).toBeDisabled();
   expect(invoke).not.toHaveBeenCalled();
+});
+
+test("imports only the current comparison ID and live revision without renderer group metadata", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(validResult)
+    .mockResolvedValueOnce(planSnapshot)
+    .mockResolvedValueOnce({
+      ...planSnapshot,
+      revisionId: "revision-8",
+      revisionNumber: 8,
+    });
+  const openPlan = vi.fn();
+  render(
+    <DuplicateComparisonPanel
+      snapshot={makeSnapshot()}
+      native
+      busy={false}
+      onBusyChange={vi.fn()}
+      onOpenPlan={openPlan}
+    />,
+  );
+  selectTwoAndConsent();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Compare selected files" }),
+  );
+  await screen.findByRole("region", { name: "Exact comparison result" });
+  expect(
+    screen.getByRole("checkbox", {
+      name: "Allow local content reads for these selected files",
+    }),
+  ).not.toBeChecked();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add matching groups to plan" }),
+  );
+  await screen.findByText(/saved to your local review plan/);
+  expect(invoke).toHaveBeenNthCalledWith(2, "get_general_plan", {
+    request: { profile: "live" },
+  });
+  expect(invoke).toHaveBeenNthCalledWith(3, "import_duplicate_review_items", {
+    request: {
+      expectedObservationId: "observation-1",
+      comparisonId: "comparison-1",
+      expectedRevisionId: "revision-7",
+    },
+  });
+  const importRequest = vi.mocked(invoke).mock.calls[2][1] as {
+    request: Record<string, unknown>;
+  };
+  expect(Object.keys(importRequest.request).sort()).toEqual([
+    "comparisonId",
+    "expectedObservationId",
+    "expectedRevisionId",
+  ]);
+  expect(importRequest.request).not.toHaveProperty("entryIds");
+  expect(importRequest.request).not.toHaveProperty("groups");
+  expect(importRequest.request).not.toHaveProperty("path");
+  expect(
+    screen.getByRole("button", { name: "Matching groups added to plan" }),
+  ).toBeDisabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Review matching groups in plan" }),
+  );
+  expect(openPlan).toHaveBeenCalledOnce();
+  expect(invoke).toHaveBeenCalledTimes(3);
+});
+
+test("keeps parent busy through revision read and import, and prevents a duplicate import", async () => {
+  let finishPlan: (value: EditorSnapshot) => void = () => {};
+  let finishImport: (value: EditorSnapshot) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(validResult)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishPlan = resolve;
+        }),
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishImport = resolve;
+        }),
+    );
+  const busy = vi.fn();
+  render(
+    <DuplicateComparisonPanel
+      snapshot={makeSnapshot()}
+      native
+      busy={false}
+      onBusyChange={busy}
+    />,
+  );
+  selectTwoAndConsent();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Compare selected files" }),
+  );
+  await screen.findByRole("region", { name: "Exact comparison result" });
+  expect(busy.mock.calls).toEqual([[true], [false]]);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add matching groups to plan" }),
+  );
+  await waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+  expect(busy.mock.calls).toEqual([[true], [false], [true]]);
+  expect(
+    screen.getByRole("region", {
+      name: "Compare selected files for exact matches",
+    }),
+  ).toHaveAttribute("aria-busy", "true");
+  expect(
+    screen.getByRole("button", { name: "Adding matching groups…" }),
+  ).toBeDisabled();
+  finishPlan(planSnapshot);
+  await waitFor(() => expect(invoke).toHaveBeenCalledTimes(3));
+  expect(busy.mock.calls).toEqual([[true], [false], [true]]);
+  expect(
+    screen.getByRole("region", {
+      name: "Compare selected files for exact matches",
+    }),
+  ).toHaveAttribute("aria-busy", "true");
+  finishImport({
+    ...planSnapshot,
+    revisionId: "revision-8",
+    revisionNumber: 8,
+  });
+  await screen.findByText(/saved to your local review plan/);
+  expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
+  expect(
+    screen.getByRole("region", {
+      name: "Compare selected files for exact matches",
+    }),
+  ).toHaveAttribute("aria-busy", "false");
+  expect(invoke).toHaveBeenCalledTimes(3);
+});
+
+test("failed import retains comparison evidence, releases busy, and does not retry automatically", async () => {
+  const busy = vi.fn();
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(validResult)
+    .mockResolvedValueOnce(planSnapshot)
+    .mockRejectedValueOnce(new Error("stale private database path"));
+  render(
+    <DuplicateComparisonPanel
+      snapshot={makeSnapshot()}
+      native
+      busy={false}
+      onBusyChange={busy}
+    />,
+  );
+  selectTwoAndConsent();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Compare selected files" }),
+  );
+  await screen.findByRole("region", { name: "Exact comparison result" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add matching groups to plan" }),
+  );
+  await screen.findByText(
+    /open your plan to check its latest state before trying again/,
+  );
+  expect(
+    screen.getByRole("region", { name: "Exact comparison result" }),
+  ).toHaveTextContent("comparison-1");
+  expect(
+    screen.getByRole("button", { name: "Add matching groups to plan" }),
+  ).toBeEnabled();
+  expect(
+    screen.queryByText(/stale private database path/),
+  ).not.toBeInTheDocument();
+  expect(invoke).toHaveBeenCalledTimes(3);
+  expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
+});
+
+test("a selection change makes imported proof historical and removes its import action", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(validResult)
+    .mockResolvedValueOnce(planSnapshot)
+    .mockResolvedValueOnce(planSnapshot);
+  render(
+    <DuplicateComparisonPanel
+      snapshot={makeSnapshot()}
+      native
+      busy={false}
+      onBusyChange={vi.fn()}
+    />,
+  );
+  selectTwoAndConsent();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Compare selected files" }),
+  );
+  await screen.findByRole("region", { name: "Exact comparison result" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add matching groups to plan" }),
+  );
+  await screen.findByText(/saved to your local review plan/);
+  fireEvent.click(
+    within(
+      screen.getByRole("list", { name: "Regular files on the current page" }),
+    ).getByRole("checkbox", { name: /file-3\.bin/ }),
+  );
+  expect(
+    screen.getByRole("heading", {
+      name: /Exact comparison result · historical/,
+    }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: /Add matching groups to plan/ }),
+  ).not.toBeInTheDocument();
+});
+
+test("a new successful comparison resets the import marker and uses its new comparison ID", async () => {
+  const nextResult = {
+    ...validResult,
+    comparisonId: "comparison-2",
+    filesCompared: 3,
+    bytesRead: "12288",
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(validResult)
+    .mockResolvedValueOnce(planSnapshot)
+    .mockResolvedValueOnce(planSnapshot)
+    .mockResolvedValueOnce(nextResult)
+    .mockResolvedValueOnce({ ...planSnapshot, revisionId: "revision-9" })
+    .mockResolvedValueOnce(planSnapshot);
+  render(
+    <DuplicateComparisonPanel
+      snapshot={makeSnapshot()}
+      native
+      busy={false}
+      onBusyChange={vi.fn()}
+    />,
+  );
+  selectTwoAndConsent();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Compare selected files" }),
+  );
+  await screen.findByRole("region", { name: "Exact comparison result" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add matching groups to plan" }),
+  );
+  await screen.findByText(/saved to your local review plan/);
+  fireEvent.click(
+    within(
+      screen.getByRole("list", { name: "Regular files on the current page" }),
+    ).getByRole("checkbox", { name: /file-3\.bin/ }),
+  );
+  fireEvent.click(
+    screen.getByRole("checkbox", {
+      name: "Allow local content reads for these selected files",
+    }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Compare selected files" }),
+  );
+  await screen.findByText(
+    /Comparison completed for 3 explicitly selected files/,
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add matching groups to plan" }),
+  );
+  await waitFor(() => expect(invoke).toHaveBeenCalledTimes(6));
+  expect(invoke).toHaveBeenNthCalledWith(6, "import_duplicate_review_items", {
+    request: {
+      expectedObservationId: "observation-1",
+      comparisonId: "comparison-2",
+      expectedRevisionId: "revision-9",
+    },
+  });
 });

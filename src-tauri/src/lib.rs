@@ -130,6 +130,7 @@ pub fn run() {
             general_plan::add_selected_general_item,
             general_plan::add_selected_general_folder,
             general_plan::import_observed_review_items,
+            general_plan::import_duplicate_review_items,
             global_exclusions::get_exclusion_registry,
             global_exclusions::add_global_exclusion,
             global_exclusions::remove_global_exclusion

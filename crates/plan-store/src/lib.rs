@@ -9,8 +9,8 @@ use std::{
 
 use disk_steward_core::{PlanId, ReviewId, RevisionId};
 use disk_steward_plan_model::{
-    synthetic_fixture, EditError, EditOutcome, EditorSnapshot, FrozenReview, InventoryItem,
-    PlanEdit, PlanEditor, PlanInput, ValidationError, MAX_SERIALIZED_BYTES,
+    synthetic_fixture, DuplicateSet, EditError, EditOutcome, EditorSnapshot, FrozenReview,
+    InventoryItem, PlanEdit, PlanEditor, PlanInput, ValidationError, MAX_SERIALIZED_BYTES,
 };
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -238,6 +238,35 @@ impl GeneralPlanStore {
             .filter(|total| *total <= MAX_SAFE_JS_LOGICAL_BYTES)
             .ok_or(StoreError::DomainEdit(EditError::InvalidInventory))?;
         let snapshot = editor.add_items(expected_revision, items)?;
+        if snapshot.revision_id != expected_revision {
+            save_editor(&tx, &editor)?;
+        }
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Atomically merges a native read-only duplicate evidence bundle into the plan.
+    /// Existing IDs may receive additive evidence; this API carries no paths or execution data.
+    pub fn append_duplicate_evidence(
+        &mut self,
+        expected_revision: RevisionId,
+        incoming: Vec<InventoryItem>,
+        sets: Vec<DuplicateSet>,
+    ) -> StoreResult<EditorSnapshot> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut editor, _) = load_editor(&tx)?;
+        validate_all_reviews(&tx, &editor)?;
+        check_revision(editor.snapshot().revision_id, expected_revision)?;
+        let snapshot = editor.add_duplicate_evidence(expected_revision, incoming, sets)?;
+        snapshot
+            .items
+            .iter()
+            .filter_map(|item| item.logical_bytes)
+            .try_fold(0u64, u64::checked_add)
+            .filter(|total| *total <= MAX_SAFE_JS_LOGICAL_BYTES)
+            .ok_or(StoreError::DomainEdit(EditError::InvalidInventory))?;
         if snapshot.revision_id != expected_revision {
             save_editor(&tx, &editor)?;
         }
@@ -658,7 +687,7 @@ fn nofollow_database_path(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_steward_core::{EvidenceId, InventoryItemId};
+    use disk_steward_core::{DuplicateGroupId, EvidenceId, InventoryItemId};
     use disk_steward_plan_model::{Blocker, Choice, ItemKind, PlanEdit, Suggestion};
     use std::{
         fs,
@@ -699,6 +728,22 @@ mod tests {
                 rationale: "User-selected item; metadata only".to_owned(),
             },
         }
+    }
+
+    fn duplicate_evidence_item(mut item: InventoryItem) -> InventoryItem {
+        item.recovery_lower_bytes = None;
+        item.recovery_upper_bytes = None;
+        item.storage_identity = None;
+        item.blockers.push(Blocker {
+            code: "read_only_comparison".to_owned(),
+            reason: "Read-only duplicate comparison evidence".to_owned(),
+        });
+        item.evidence.push(disk_steward_plan_model::EvidenceRef {
+            id: EvidenceId::new(),
+            summary: "Native exact-content comparison; no cleanup authority".to_owned(),
+        });
+        item.suggestion.choice = Choice::Keep;
+        item
     }
 
     #[test]
@@ -804,6 +849,208 @@ mod tests {
         let redone = reopened.redo(undone.revision_id).unwrap();
         assert!(redone.items.iter().any(|row| row.item_id == item_id));
         assert_eq!(reopened.get_saved_review(review.review_id).unwrap(), review);
+    }
+
+    #[test]
+    fn duplicate_evidence_import_is_atomic_blocked_persistent_and_keeps_frozen_reviews() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::Pilot1000).unwrap();
+        let initial = store.get_plan().unwrap();
+        let first = metadata_only_item("same-a.bin");
+        let second = metadata_only_item("same-b.bin");
+        let first_id = first.id;
+        let second_id = second.id;
+        let appended = store
+            .append_items(initial.revision_id, vec![first.clone(), second.clone()])
+            .unwrap();
+        let edited = store
+            .edit(
+                appended.revision_id,
+                PlanEdit::SetChoice {
+                    item_id: first_id,
+                    choice: Choice::Keep,
+                },
+            )
+            .unwrap();
+        let edited = store
+            .edit(
+                edited.snapshot.revision_id,
+                PlanEdit::SetMembership {
+                    item_id: second_id,
+                    in_plan: false,
+                },
+            )
+            .unwrap();
+        let set_id = DuplicateGroupId::new();
+        let set = DuplicateSet {
+            id: set_id,
+            item_ids: vec![first_id, second_id],
+            survivor_id: None,
+        };
+        let evidence = store
+            .append_duplicate_evidence(
+                edited.snapshot.revision_id,
+                vec![
+                    duplicate_evidence_item(first.clone()),
+                    duplicate_evidence_item(second.clone()),
+                ],
+                vec![set.clone()],
+            )
+            .unwrap();
+        let selected = store
+            .edit(
+                evidence.revision_id,
+                PlanEdit::SetDuplicateSurvivor {
+                    duplicate_set_id: set_id,
+                    survivor_id: first_id,
+                },
+            )
+            .unwrap();
+        let frozen = store.freeze_review(selected.snapshot.revision_id).unwrap();
+        let third = metadata_only_item("same-c.bin");
+        let fourth = metadata_only_item("same-d.bin");
+        let new_set = DuplicateSet {
+            id: DuplicateGroupId::new(),
+            item_ids: vec![third.id, fourth.id],
+            survivor_id: None,
+        };
+        let mut combined = vec![
+            duplicate_evidence_item(first.clone()),
+            duplicate_evidence_item(second.clone()),
+            duplicate_evidence_item(third.clone()),
+            duplicate_evidence_item(fourth.clone()),
+        ];
+        // Reuse the first native evidence exactly to exercise idempotent enrichment.
+        combined[0] = evidence
+            .items
+            .iter()
+            .find(|row| row.item_id == first_id)
+            .map(|row| {
+                let mut value = first.clone();
+                value.evidence = row.evidence.clone();
+                value.blockers = row.blockers.clone();
+                value
+            })
+            .unwrap();
+        let combined = store
+            .append_duplicate_evidence(
+                selected.snapshot.revision_id,
+                combined,
+                vec![set.clone(), new_set.clone()],
+            )
+            .unwrap();
+        assert!(!combined.execution_available);
+        assert_eq!(
+            combined
+                .items
+                .iter()
+                .find(|row| row.item_id == first_id)
+                .unwrap()
+                .user_choice,
+            Some(Choice::Keep)
+        );
+        assert!(
+            !combined
+                .items
+                .iter()
+                .find(|row| row.item_id == second_id)
+                .unwrap()
+                .in_plan
+        );
+        assert_eq!(
+            combined
+                .duplicates
+                .iter()
+                .find(|row| row.id == set_id)
+                .unwrap()
+                .survivor_id,
+            Some(first_id)
+        );
+        for id in [third.id, fourth.id] {
+            let row = combined.items.iter().find(|row| row.item_id == id).unwrap();
+            assert_eq!(row.suggestion.choice, Choice::Keep);
+            assert!(row
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "read_only_comparison"));
+        }
+        assert_eq!(store.get_saved_review(frozen.review_id).unwrap(), frozen);
+
+        let unchanged = store.get_plan().unwrap();
+        assert!(matches!(
+            store.append_duplicate_evidence(RevisionId::new(), vec![], vec![]),
+            Err(StoreError::StaleRevision)
+        ));
+        assert_eq!(store.get_plan().unwrap(), unchanged);
+        let mut changed_name = duplicate_evidence_item(first);
+        changed_name.label = "different-name.bin".to_owned();
+        assert!(matches!(
+            store.append_duplicate_evidence(
+                unchanged.revision_id,
+                vec![changed_name, duplicate_evidence_item(second.clone())],
+                vec![set.clone()],
+            ),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(store.get_plan().unwrap(), unchanged);
+
+        let undone = store.undo(combined.revision_id).unwrap();
+        assert_eq!(undone.items.len(), selected.snapshot.items.len());
+        assert_eq!(
+            undone
+                .duplicates
+                .iter()
+                .find(|row| row.id == set_id)
+                .unwrap()
+                .survivor_id,
+            Some(first_id)
+        );
+        drop(store);
+        let mut reopened = GeneralPlanStore::open(&path, FixtureScale::Pilot1000).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), undone);
+        assert_eq!(reopened.get_saved_review(frozen.review_id).unwrap(), frozen);
+        let redone = reopened.redo(undone.revision_id).unwrap();
+        assert_eq!(redone.items.len(), combined.items.len());
+        assert_eq!(
+            redone
+                .duplicates
+                .iter()
+                .find(|row| row.id == set_id)
+                .unwrap()
+                .survivor_id,
+            Some(first_id)
+        );
+        assert_eq!(reopened.get_saved_review(frozen.review_id).unwrap(), frozen);
+    }
+
+    #[test]
+    fn duplicate_evidence_import_enforces_safe_merged_logical_total_atomically() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let mut large = metadata_only_item("near-safe-limit.bin");
+        large.logical_bytes = Some(MAX_SAFE_JS_LOGICAL_BYTES - 23);
+        let initial = store.get_plan().unwrap();
+        let base = store.append_item(initial.revision_id, large).unwrap();
+        let first = metadata_only_item("equal-a.bin");
+        let second = metadata_only_item("equal-b.bin");
+        let set = DuplicateSet {
+            id: DuplicateGroupId::new(),
+            item_ids: vec![first.id, second.id],
+            survivor_id: None,
+        };
+        let before = store.get_plan().unwrap();
+        assert!(matches!(
+            store.append_duplicate_evidence(
+                base.revision_id,
+                vec![
+                    duplicate_evidence_item(first),
+                    duplicate_evidence_item(second)
+                ],
+                vec![set],
+            ),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(store.get_plan().unwrap(), before);
     }
 
     #[test]

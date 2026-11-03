@@ -1268,6 +1268,7 @@ export default function FolderInventoryPanel({
             </select>
           </label>
           <DuplicateComparisonPanel
+            onOpenPlan={onOpenPlan}
             key={snapshot.observationId}
             snapshot={snapshot}
             native={native}

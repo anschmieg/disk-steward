@@ -214,6 +214,7 @@ pub(super) fn resume(
         return Err("The selected folder changed during checkpoint replay.");
     }
 
+    session.duplicate_evidence = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
