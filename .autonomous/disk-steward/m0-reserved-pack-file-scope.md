@@ -1,0 +1,7 @@
+# M0 durable admission before pack file writes
+
+Connect closedprivate BudgetFileSink to VerificationStoreRegistry: nativevolume preflight first, openfreshprivate fixedregistry under validatedtaskroot, registeractualrootdirectoryidentity, commitfixed128KiBreservation BEFOREexclusivepack.downloadcreation. Sinkholdsregistrylease duringwrite, verifiesobservedpayloadhighwaterdoesnotexceedadmission (overshootcancels/retainsactualcharge). No claimswhole-storecapacity/perfilesystemreservation/globalaggregate; fixed512logicallimit/nativeallocationguardunchanged.
+
+SuccessfulrealGit/privateTLS andpartial5byterefusal closefiles/registry thenreopenrecord: reservationexact128KiBsurvives/NeedsRecon blocksreservationgrowth. Existingunreconciledregistrypreventsnewpayloadfilecreation. No adoption/release/cleanup/renderer/newCLI/userpath/liveGitHub. This is oneclosedattempt/inprocessclose-reopen, notprocessdeath/powerloss/fullproductionworker/globalcontrolroot integration.
+
+Luna owns nestedtestbudget_file.rs only/rootfixturetests/manifestdevdep/docs/progress/reviewbeforeexecution. Branch atop57b9bad0f/mainba0b9aebaseline/localnotes preserved; existing46–57watchesnotpolled/nooverlappingbuilds/CARGO_INCREMENTAL=0/2GiBreserve/host8.1GiBfree/version0.0.17/no releases.
