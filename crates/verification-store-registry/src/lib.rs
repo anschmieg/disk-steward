@@ -7,7 +7,7 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix::{
-    fs::{flock, FlockOperation},
+    fs::{flock, open, openat, FlockOperation, OFlags},
     process::geteuid,
 };
 use std::path::Path;
@@ -18,7 +18,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -111,6 +111,47 @@ pub struct StoreRecord {
     pub prior_state: Option<StoreState>,
     /// `u64::MAX` marks a migrated v1 row whose prior usage is unknown.
     pub reserved_bytes: u64,
+}
+
+/// Opaque, stable snapshot of the registry's fixed database and lease files.
+/// It exposes identities and a checked current byte observation, never paths or FDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlFootprint {
+    parent_identity: (u64, u64),
+    database_identity: (u64, u64),
+    lease_identity: (u64, u64),
+    observed_bytes: u64,
+    database_stamp: ControlFileStamp,
+    lease_stamp: ControlFileStamp,
+}
+
+impl ControlFootprint {
+    pub fn parent_identity(self) -> (u64, u64) {
+        self.parent_identity
+    }
+
+    pub fn file_identities(self) -> [(u64, u64); 2] {
+        [self.database_identity, self.lease_identity]
+    }
+
+    /// Sum of `max(file length, native 512-byte block count)` for the two files.
+    pub fn observed_bytes(self) -> u64 {
+        self.observed_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControlFileStamp {
+    identity: (u64, u64),
+    len: u64,
+    blocks: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 #[derive(Debug)]
@@ -447,6 +488,58 @@ impl VerificationStoreRegistry {
         Ok(record)
     }
 
+    /// Mark an incomplete live attempt as needing reconciliation without
+    /// changing its identity or reservation. This records failure state only;
+    /// it does not adopt the store or authorize cleanup.
+    pub fn require_reconciliation(
+        &mut self,
+        id: &str,
+        expected: StoreState,
+    ) -> Result<StoreRecord, RegistryError> {
+        self.validate_lease()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RegistryError::Storage)?;
+        validate_schema(&tx)?;
+        validate_records(&tx)?;
+        validate_id(id)?;
+        if !matches!(
+            expected,
+            StoreState::Registered
+                | StoreState::Active
+                | StoreState::Stopped
+                | StoreState::CleanupPending
+        ) {
+            return Err(RegistryError::InvalidTransition);
+        }
+        let changed = tx.execute(
+            "UPDATE verification_stores SET state='needs_reconciliation', prior_state=?2 WHERE store_id=?1 AND state=?2",
+            params![id, expected.as_str()],
+        ).map_err(|_| RegistryError::Storage)?;
+        if changed == 0 {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM verification_stores WHERE store_id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| RegistryError::Storage)?;
+            return Err(if exists {
+                RegistryError::StaleState
+            } else {
+                RegistryError::NotFound
+            });
+        }
+        let record = tx.query_row(
+            "SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes FROM verification_stores WHERE store_id=?1",
+            [id],
+            read_record,
+        ).map_err(|_| RegistryError::Storage)?;
+        tx.commit().map_err(|_| RegistryError::Storage)?;
+        Ok(record)
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<StoreRecord>, RegistryError> {
         self.validate_lease()?;
         let tx = self
@@ -459,6 +552,145 @@ impl VerificationStoreRegistry {
         let record = tx.query_row("SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes FROM verification_stores WHERE store_id=?1", [id], read_record).optional().map_err(|_| RegistryError::Storage)?;
         tx.commit().map_err(|_| RegistryError::Storage)?;
         Ok(record)
+    }
+
+    /// Observe only the fixed private registry database and lease files.
+    /// This returns no filesystem capability and makes no admission claim.
+    pub fn observe_control_footprint(&self) -> Result<ControlFootprint, RegistryError> {
+        self.validate_lease()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| RegistryError::Storage)?;
+        validate_schema(&tx)?;
+        validate_records(&tx)?;
+        tx.commit().map_err(|_| RegistryError::Storage)?;
+        check_footprint_deadline(deadline)?;
+
+        let parent = open(
+            &self.parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|_| RegistryError::UnsafePath)?;
+        let parent_metadata = rustix::fs::fstat(&parent).map_err(|_| RegistryError::UnsafePath)?;
+        if (
+            parent_metadata.st_dev as u64,
+            parent_metadata.st_ino as u64,
+            parent_metadata.st_uid,
+        ) != self.parent_identity
+            || parent_metadata.st_mode & 0o7777 != 0o700
+            || parent_metadata.st_uid != geteuid().as_raw()
+        {
+            return Err(RegistryError::UnsafePath);
+        }
+        check_footprint_deadline(deadline)?;
+        let database_name = self
+            .database_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RegistryError::UnsafePath)?;
+        let lease_name = self
+            .lease_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RegistryError::UnsafePath)?;
+        let database = File::from(
+            openat(
+                &parent,
+                database_name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| RegistryError::UnsafePath)?,
+        );
+        let lease = File::from(
+            openat(
+                &parent,
+                lease_name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| RegistryError::UnsafePath)?,
+        );
+        check_footprint_deadline(deadline)?;
+        let database_meta = database.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        let lease_meta = lease.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        validate_control_file(
+            &database_meta,
+            Some((self.database_identity.0, self.database_identity.1)),
+        )?;
+        let held_lease_meta = self
+            ._lease
+            .metadata()
+            .map_err(|_| RegistryError::UnsafePath)?;
+        let held_lease_id = (held_lease_meta.dev(), held_lease_meta.ino());
+        validate_control_file(&held_lease_meta, Some(held_lease_id))?;
+        validate_control_file(&lease_meta, Some(held_lease_id))?;
+        let database_stamp = ControlFileStamp::from(&database_meta);
+        let lease_stamp = ControlFileStamp::from(&lease_meta);
+        let database_named =
+            fs::symlink_metadata(&self.database_path).map_err(|_| RegistryError::UnsafePath)?;
+        let lease_named =
+            fs::symlink_metadata(&self.lease_path).map_err(|_| RegistryError::UnsafePath)?;
+        validate_control_file(
+            &database_named,
+            Some((self.database_identity.0, self.database_identity.1)),
+        )?;
+        validate_control_file(&lease_named, Some(lease_stamp.identity))?;
+        if ControlFileStamp::from(&database_named) != database_stamp
+            || ControlFileStamp::from(&lease_named) != lease_stamp
+        {
+            return Err(RegistryError::UnsafePath);
+        }
+        check_footprint_deadline(deadline)?;
+        self.validate_lease()?;
+        let database_after = database.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        let lease_after = lease.metadata().map_err(|_| RegistryError::UnsafePath)?;
+        let database_named_after =
+            fs::symlink_metadata(&self.database_path).map_err(|_| RegistryError::UnsafePath)?;
+        let lease_named_after =
+            fs::symlink_metadata(&self.lease_path).map_err(|_| RegistryError::UnsafePath)?;
+        if ControlFileStamp::from(&database_after) != database_stamp
+            || ControlFileStamp::from(&lease_after) != lease_stamp
+            || ControlFileStamp::from(&database_named_after) != database_stamp
+            || ControlFileStamp::from(&lease_named_after) != lease_stamp
+        {
+            return Err(RegistryError::UnsafePath);
+        }
+        self.validate_lease()?;
+        check_footprint_deadline(deadline)?;
+        let database_bytes = database_stamp.len.max(
+            database_stamp
+                .blocks
+                .checked_mul(512)
+                .ok_or(RegistryError::Storage)?,
+        );
+        let lease_bytes = lease_stamp.len.max(
+            lease_stamp
+                .blocks
+                .checked_mul(512)
+                .ok_or(RegistryError::Storage)?,
+        );
+        let observed_bytes = database_bytes
+            .checked_add(lease_bytes)
+            .ok_or(RegistryError::Storage)?;
+        let parent =
+            fs::symlink_metadata(&self.parent_path).map_err(|_| RegistryError::UnsafePath)?;
+        validate_private_dir(&self.parent_path)?;
+        if (parent.dev(), parent.ino(), parent.uid()) != self.parent_identity {
+            return Err(RegistryError::UnsafePath);
+        }
+        check_footprint_deadline(deadline)?;
+        Ok(ControlFootprint {
+            parent_identity: (self.parent_identity.0, self.parent_identity.1),
+            database_identity: database_stamp.identity,
+            lease_identity: lease_stamp.identity,
+            observed_bytes,
+            database_stamp,
+            lease_stamp,
+        })
     }
 
     /// Bounded keyset page, at most 256 records. `after` is an opaque store ID cursor.
@@ -549,6 +781,49 @@ fn read_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoreRecord> {
             .parse()
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_control_file(
+    metadata: &fs::Metadata,
+    expected_id: Option<(u64, u64)>,
+) -> Result<(), RegistryError> {
+    if !metadata.is_file()
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || expected_id.is_some_and(|expected| (metadata.dev(), metadata.ino()) != expected)
+    {
+        return Err(RegistryError::UnsafePath);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl From<&fs::Metadata> for ControlFileStamp {
+    fn from(metadata: &fs::Metadata) -> Self {
+        Self {
+            identity: (metadata.dev(), metadata.ino()),
+            len: metadata.len(),
+            blocks: metadata.blocks(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            uid: metadata.uid(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_footprint_deadline(deadline: Instant) -> Result<(), RegistryError> {
+    if Instant::now() >= deadline {
+        Err(RegistryError::Storage)
+    } else {
+        Ok(())
+    }
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_id(id: &str) -> Result<(), RegistryError> {
@@ -893,7 +1168,17 @@ impl VerificationStoreRegistry {
     ) -> Result<StoreRecord, RegistryError> {
         Err(RegistryError::UnsupportedPlatform)
     }
+    pub fn require_reconciliation(
+        &mut self,
+        _: &str,
+        _: StoreState,
+    ) -> Result<StoreRecord, RegistryError> {
+        Err(RegistryError::UnsupportedPlatform)
+    }
     pub fn get(&self, _: &str) -> Result<Option<StoreRecord>, RegistryError> {
+        Err(RegistryError::UnsupportedPlatform)
+    }
+    pub fn observe_control_footprint(&self) -> Result<ControlFootprint, RegistryError> {
         Err(RegistryError::UnsupportedPlatform)
     }
     pub fn list(&self, _: Option<&str>, _: usize) -> Result<Vec<StoreRecord>, RegistryError> {
@@ -986,6 +1271,170 @@ mod tests {
     }
 
     #[test]
+    fn live_reconciliation_latch_preserves_identity_reservation_and_prior_state() {
+        let (_dir, path) = setup();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
+        let cases = [
+            ("10000000000000000000000000000001", StoreState::Registered),
+            ("10000000000000000000000000000002", StoreState::Active),
+            ("10000000000000000000000000000003", StoreState::Stopped),
+            (
+                "10000000000000000000000000000004",
+                StoreState::CleanupPending,
+            ),
+        ];
+        for (index, (id, expected)) in cases.iter().enumerate() {
+            let identity = (
+                index as u64 + 10,
+                index as u64 + 20,
+                index as u64 + 30,
+                index as u64 + 40,
+            );
+            registry
+                .register(id, identity.0, identity.1, identity.2, identity.3)
+                .unwrap();
+            registry.reserve(id, 0, 4096 + index as u64).unwrap();
+            for (from, to) in [
+                (StoreState::Registered, StoreState::Active),
+                (StoreState::Active, StoreState::Stopped),
+                (StoreState::Stopped, StoreState::CleanupPending),
+            ] {
+                if *expected == StoreState::Registered {
+                    break;
+                }
+                registry.transition(id, from, to).unwrap();
+                if *expected == to {
+                    break;
+                }
+            }
+        }
+        for (index, (id, expected)) in cases.iter().enumerate() {
+            let record = registry.require_reconciliation(id, *expected).unwrap();
+            assert_eq!(record.state, StoreState::NeedsReconciliation);
+            assert_eq!(record.prior_state, Some(*expected));
+            assert_eq!(record.reserved_bytes, 4096 + index as u64);
+            let identity = (
+                index as u64 + 10,
+                index as u64 + 20,
+                index as u64 + 30,
+                index as u64 + 40,
+            );
+            assert_eq!(
+                (
+                    record.parent_dev,
+                    record.parent_ino,
+                    record.root_dev,
+                    record.root_ino
+                ),
+                identity
+            );
+            assert!(matches!(
+                registry.require_reconciliation(id, *expected),
+                Err(RegistryError::StaleState)
+            ));
+            assert!(matches!(
+                registry.require_reconciliation(id, StoreState::NeedsReconciliation),
+                Err(RegistryError::InvalidTransition)
+            ));
+        }
+        drop(registry);
+        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        for (id, expected) in cases {
+            let record = registry.get(id).unwrap().unwrap();
+            assert_eq!(record.state, StoreState::NeedsReconciliation);
+            assert_eq!(record.prior_state, Some(expected));
+        }
+    }
+
+    #[test]
+    fn live_reconciliation_latch_refuses_invalid_stale_missing_and_complete_rows() {
+        let (_dir, path) = setup();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
+        let id = "20000000000000000000000000000001";
+        registry.register(id, 1, 2, 3, 4).unwrap();
+        registry.reserve(id, 0, 8192).unwrap();
+        assert!(matches!(
+            registry.require_reconciliation(id, StoreState::Active),
+            Err(RegistryError::StaleState)
+        ));
+        assert!(matches!(
+            registry.require_reconciliation("not-an-id", StoreState::Registered),
+            Err(RegistryError::InvalidInput)
+        ));
+        assert!(matches!(
+            registry
+                .require_reconciliation("20000000000000000000000000000002", StoreState::Registered),
+            Err(RegistryError::NotFound)
+        ));
+        let registered = registry.get(id).unwrap().unwrap();
+        assert_eq!(registered.state, StoreState::Registered);
+        assert_eq!(registered.reserved_bytes, 8192);
+        registry
+            .transition(id, StoreState::Registered, StoreState::Active)
+            .unwrap();
+        registry
+            .transition(id, StoreState::Active, StoreState::Stopped)
+            .unwrap();
+        registry
+            .transition(id, StoreState::Stopped, StoreState::CleanupPending)
+            .unwrap();
+        registry
+            .transition(id, StoreState::CleanupPending, StoreState::CleanupComplete)
+            .unwrap();
+        assert!(matches!(
+            registry.require_reconciliation(id, StoreState::CleanupComplete),
+            Err(RegistryError::InvalidTransition)
+        ));
+        assert!(matches!(
+            registry.require_reconciliation(id, StoreState::Registered),
+            Err(RegistryError::StaleState)
+        ));
+        let complete = registry.get(id).unwrap().unwrap();
+        assert_eq!(complete.state, StoreState::CleanupComplete);
+        assert_eq!(complete.prior_state, None);
+        assert_eq!(complete.reserved_bytes, 8192);
+    }
+
+    #[test]
+    fn live_reconciliation_latch_blocks_admission_across_registered_rows() {
+        let (_dir, path) = setup();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
+        let a = "30000000000000000000000000000001";
+        let b = "30000000000000000000000000000002";
+        let c = "30000000000000000000000000000003";
+        registry.register(a, 1, 2, 3, 4).unwrap();
+        registry.register(b, 5, 6, 7, 8).unwrap();
+        registry.register(c, 9, 10, 11, 12).unwrap();
+        registry.reserve(a, 0, 1024).unwrap();
+        registry.reserve(b, 0, 2048).unwrap();
+        registry.reserve(c, 0, 4096).unwrap();
+        registry
+            .transition(b, StoreState::Registered, StoreState::Active)
+            .unwrap();
+        registry
+            .require_reconciliation(a, StoreState::Registered)
+            .unwrap();
+        assert_eq!(
+            registry
+                .transition(b, StoreState::Active, StoreState::Stopped)
+                .unwrap()
+                .state,
+            StoreState::Stopped
+        );
+        assert!(matches!(
+            registry.reserve(c, 4096, 8192),
+            Err(RegistryError::ReconciliationRequired)
+        ));
+        assert_eq!(registry.get(b).unwrap().unwrap().reserved_bytes, 2048);
+        assert_eq!(registry.get(b).unwrap().unwrap().state, StoreState::Stopped);
+        assert_eq!(registry.get(c).unwrap().unwrap().reserved_bytes, 4096);
+        assert_eq!(
+            registry.get(c).unwrap().unwrap().state,
+            StoreState::Registered
+        );
+    }
+
+    #[test]
     fn reservations_are_monotonic_bounded_and_survive_reopen() {
         let (_dir, path) = setup();
         let id = "cccccccccccccccccccccccccccccccc";
@@ -1013,6 +1462,22 @@ mod tests {
             r.reserve(id, 1024, 2048),
             Err(RegistryError::ReconciliationRequired)
         ));
+    }
+
+    #[test]
+    fn control_footprint_snapshot_is_stable_and_fixed_to_two_private_files() {
+        let (_dir, path) = setup();
+        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        let before = registry.observe_control_footprint().unwrap();
+        let after = registry.observe_control_footprint().unwrap();
+        assert_eq!(before, after);
+        assert_eq!(before.parent_identity().0, registry.parent_identity.0);
+        assert_eq!(
+            before.file_identities()[0],
+            (registry.database_identity.0, registry.database_identity.1)
+        );
+        assert_ne!(before.file_identities()[0], before.file_identities()[1]);
+        assert!(before.observed_bytes() > 0);
     }
 
     #[test]
@@ -1343,6 +1808,14 @@ mod tests {
             Err(RegistryError::UnsupportedSchema)
         ));
         assert!(matches!(
+            registry.observe_control_footprint(),
+            Err(RegistryError::UnsupportedSchema)
+        ));
+        assert!(matches!(
+            registry.require_reconciliation(id, StoreState::Registered),
+            Err(RegistryError::UnsupportedSchema)
+        ));
+        assert!(matches!(
             registry.register("dddddddddddddddddddddddddddddddd", 1, 2, 3, 4),
             Err(RegistryError::UnsupportedSchema)
         ));
@@ -1433,7 +1906,7 @@ mod tests {
     #[test]
     fn replaced_lease_and_database_paths_are_refused() {
         let (dir, path) = setup();
-        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
         let lease = sibling(&path, ".lease").unwrap();
         let moved_lease = dir.path().join("old.lease");
         fs::rename(&lease, &moved_lease).unwrap();
@@ -1447,10 +1920,19 @@ mod tests {
             registry.get("ffffffffffffffffffffffffffffffff"),
             Err(RegistryError::UnsafePath)
         ));
+        assert!(matches!(
+            registry.observe_control_footprint(),
+            Err(RegistryError::UnsafePath)
+        ));
+        assert!(matches!(
+            registry
+                .require_reconciliation("ffffffffffffffffffffffffffffffff", StoreState::Registered),
+            Err(RegistryError::UnsafePath)
+        ));
         drop(registry);
 
         let (_dir, path) = setup();
-        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
         let moved_db = path.with_extension("old");
         fs::rename(&path, &moved_db).unwrap();
         OpenOptions::new()
@@ -1461,6 +1943,15 @@ mod tests {
             .unwrap();
         assert!(matches!(
             registry.get("ffffffffffffffffffffffffffffffff"),
+            Err(RegistryError::UnsafePath)
+        ));
+        assert!(matches!(
+            registry.observe_control_footprint(),
+            Err(RegistryError::UnsafePath)
+        ));
+        assert!(matches!(
+            registry
+                .require_reconciliation("ffffffffffffffffffffffffffffffff", StoreState::Registered),
             Err(RegistryError::UnsafePath)
         ));
     }
