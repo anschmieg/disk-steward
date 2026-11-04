@@ -4,6 +4,8 @@
 
 ## Scope and API boundary
 
+The original service entry point accepts only `FixtureProfile::SyntheticV1`. Preparation, revalidation and claimed batch execution reject the closed pytest corpus profile before claiming a review or touching files. A separate backend corpus entry point uses a distinct control identity, exact two-record plan, review kind and manifest adapter version; see [the corpus execution contract](pytest-corpus-execution-v1.md). Synthetic reviews and adapter versions remain unchanged and cannot authorize corpus records.
+
 Purge may target only one to five exact `(ActionId, ReceiptId)` pairs for one `SessionId`, where each receipt is currently staged in that session. The caller selects every target explicitly. There is no “all staged” default, path input, recursive operation, timer, Trash access, arbitrary file support, or renderer authority. Every selected action must also be `Include` in the current five-action fixture example plan (`review-plan::ReviewPlanStore`). The general inventory editor and its metadata-only reviews remain non-executable and cannot authorize fixture operations. The prepared review freezes the exact plan, included actions, session, receipt identities, and purge targets; preparation fails if any selected action is absent, excluded, stale, duplicated, or not staged.
 
 Proposed trusted Rust API:
