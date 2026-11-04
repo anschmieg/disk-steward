@@ -245,7 +245,7 @@ is gated to the registry adapter's Linux/macOS targets. No application or
 renderer calls this test sink.
 
 The fixed system-Git fixture supervises repository setup and local receiver
-verification with a ten-second per-command budget, while upload-pack RPC
+verification with a thirty-second per-command budget, while upload-pack RPC
 commands retain a three-second budget. Shared macOS CI exceeded the earlier
 three-second setup budget; the failing child was reaped. These are test-fixture
 limits, not changes to transport or product attempt deadlines.
@@ -377,3 +377,27 @@ or authorize cleanup. These limits and backward-only resolution do not establish
 product Git support. Tests cover real Git object correspondence, independent
 REF/OFS vectors, depth and cumulative limits, unsupported bases, exact object
 counts, corruption, truncation and extra data.
+
+### Structural tree links
+
+`parse_sha1_tree` parses one raw SHA-1 tree body into borrowed raw names,
+canonical mode classes and nonzero object IDs. It checks exact entry framing,
+Git's directory-aware ordering and duplicate basenames, including duplicates
+separated by other names. Mode and name searches are bounded; metadata allocation
+is fallible. Experimental limits are 16 MiB input, 4,096 entries and 1,024 bytes
+per name, with a caller-lowered entry ceiling and cooperative attempt controls.
+
+Names are neither converted into paths nor extracted. Slash, dot, dot-dot and
+ASCII-case-insensitive `.git` are refused, but this is not comprehensive platform
+path validation or full Git fsck. Gitlink mode is reported as external commit
+metadata and never followed; complex-layout product gates remain. Callers must
+bind the body to its tree type and object ID, verify referenced object types and
+presence, and validate relevant graphs before making any product decision.
+Tests cover raw non-UTF-8 names, every canonical mode, malformed/truncated entries,
+ordering/duplicate traps, limits, and Git-generated tree correspondence.
+
+The test-only local Git setup/receiver allowance is now thirty seconds after
+macOS CI reaped two cold fixture setup commands at the previous ten-second
+limit. The three-second protocol RPC deadline and production attempt limits
+remain unchanged. This does not turn a timeout into a successful verification;
+commands must still finish successfully within the bounded fixture allowance.

@@ -4,6 +4,8 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod tree;
+pub use tree::{parse_sha1_tree, GitTreeEntry, GitTreeMode};
 mod decode;
 pub use decode::{decode_sha1_pack, DecodedPack, DecodedPackObject};
 mod object_identity;
@@ -2124,6 +2126,7 @@ mod tests {
     mod inflate_tests;
     mod object_identity_tests;
     mod pack_tests;
+    mod tree_tests;
 
     use super::*;
     use gix_transport::bstr::ByteSlice as _;
