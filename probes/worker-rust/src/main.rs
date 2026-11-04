@@ -386,23 +386,29 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             }
             Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
         }
+        let footprint = store
+            .observe_stopped_partial_fixture_footprint(&registry, &receipt)
+            .map_err(|_| "partial stopped fixture footprint observation refused".to_owned())?;
+        if footprint.object_count != 6 || footprint.observed_bytes < partial.high_water_bytes {
+            return Err("partial fixture snapshot count or payload coverage mismatch".into());
+        }
         let free_after = store
             .sample_free_space_bytes()
-            .map_err(|_| "sample stopped partial payload free space refused".to_owned())?;
+            .map_err(|_| "sample stopped partial fixture free space refused".to_owned())?;
         let accounted = settle_parent_store_budget(
             &mut admission_budget,
             admission.job_id,
-            partial.high_water_bytes,
+            footprint.observed_bytes,
             free_after,
             elapsed_millis(attempt_started),
         )
-        .map_err(|_| "parent partial-payload accounting refused".to_owned())?;
-        if accounted != partial.high_water_bytes
-            || partial.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
+        .map_err(|_| "parent partial-fixture accounting refused".to_owned())?;
+        if accounted != footprint.observed_bytes
+            || footprint.observed_bytes > store::WORKER_PAYLOAD_RESERVATION
             || admission_budget
                 .snapshot(admission.job_id)
                 .map(|job| {
-                    job.usage.stored_bytes != partial.high_water_bytes
+                    job.usage.stored_bytes != footprint.observed_bytes
                         || job.state
                             != (JobState::Failed {
                                 reason: verification_budget::BlockReason::StoreIncomplete,
@@ -411,7 +417,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
                 })
                 .unwrap_or(true)
         {
-            return Err("partial payload accounting or reservation mismatch".into());
+            return Err("partial fixture accounting or reservation mismatch".into());
         }
         let live_state = store
             .inspect_state()
@@ -458,7 +464,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             }
             Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
         }
-        println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} parent_observed_accounted_bytes={accounted} parent_accounting_scope=payload_only parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
         return Ok(());
     }
     if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {

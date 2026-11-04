@@ -14,6 +14,32 @@ const REGISTRY_LEASE_NAME: &str = "verification-registry.sqlite3.lease";
 const JOURNAL_NAME: &str = "owner.journal";
 const OBJECT_COUNT: u8 = 6;
 
+#[derive(Clone, Copy)]
+enum FixturePayloadKind {
+    Complete,
+    Partial,
+}
+
+impl FixturePayloadKind {
+    fn expected_bytes(self) -> u64 {
+        match self {
+            Self::Complete => super::payload::LIMIT,
+            Self::Partial => super::payload::PARTIAL_FIXTURE_BYTES,
+        }
+    }
+
+    fn inspect(
+        self,
+        store: &OwnedStore,
+        receipt: &StopReceipt,
+    ) -> Result<super::WorkerPayloadObservation, StoreError> {
+        match self {
+            Self::Complete => store.inspect_stopped_worker_payload(receipt),
+            Self::Partial => store.inspect_stopped_worker_partial_payload(receipt),
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ObjectStamp {
@@ -53,7 +79,27 @@ pub(super) fn observe_stopped_fixture(
     registry: &VerificationStoreRegistry,
     receipt: &StopReceipt,
 ) -> Result<FixtureFootprintObservation, StoreError> {
-    observe_with_checkpoint(store, registry, receipt, |_| Ok(()))
+    observe_with_checkpoint(
+        store,
+        registry,
+        receipt,
+        FixturePayloadKind::Complete,
+        |_| Ok(()),
+    )
+}
+
+pub(super) fn observe_stopped_partial_fixture(
+    store: &OwnedStore,
+    registry: &VerificationStoreRegistry,
+    receipt: &StopReceipt,
+) -> Result<FixtureFootprintObservation, StoreError> {
+    observe_with_checkpoint(
+        store,
+        registry,
+        receipt,
+        FixturePayloadKind::Partial,
+        |_| Ok(()),
+    )
 }
 
 // Private checkpoint supports deterministic mutation coverage without races.
@@ -61,6 +107,7 @@ fn observe_with_checkpoint(
     store: &OwnedStore,
     registry: &VerificationStoreRegistry,
     receipt: &StopReceipt,
+    payload_kind: FixturePayloadKind,
     after_snapshot: impl FnOnce(&OwnedStore) -> Result<(), StoreError>,
 ) -> Result<FixtureFootprintObservation, StoreError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -79,7 +126,7 @@ fn observe_with_checkpoint(
         {
             return Err(StoreError::InvalidJournal);
         }
-        store.inspect_stopped_worker_payload(receipt)?;
+        payload_kind.inspect(store, receipt)?;
         check_deadline(deadline)?;
         store.inspect_state()?;
         check_deadline(deadline)?;
@@ -177,12 +224,13 @@ fn observe_with_checkpoint(
             validate_regular(&marker, store.journal_id.ok_or(StoreError::InvalidJournal)?)?;
         let payload_meta = payload.metadata()?;
         let payload_stamp = validate_regular(&payload, (payload_meta.dev(), payload_meta.ino()))?;
-        if payload_stamp.len != super::payload::LIMIT
+        let expected_payload_bytes = payload_kind.expected_bytes();
+        if payload_stamp.len != expected_payload_bytes
             || payload_stamp.uid != rustix::process::geteuid().as_raw()
         {
             return Err(StoreError::InvalidIdentity);
         }
-        super::handoff::read_and_verify_payload(&payload, deadline, super::payload::LIMIT)?;
+        super::handoff::read_and_verify_payload(&payload, deadline, expected_payload_bytes)?;
         let mut marker_copy = marker.try_clone()?;
         let journal_bytes = super::handoff::read_bounded_marker(&mut marker_copy)?;
         if journal_bytes.len() > 512 || journal_bytes != store.journal_contents().as_bytes() {
@@ -287,7 +335,7 @@ fn observe_with_checkpoint(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (store, registry, receipt, after_snapshot);
+        let _ = (store, registry, receipt, payload_kind, after_snapshot);
         Err(StoreError::UnsupportedPlatform)
     }
 }
@@ -336,7 +384,7 @@ mod tests {
 
     const FIXTURE_ID: &str = "0123456789abcdef0123456789abcdef";
 
-    fn completed_fixture() -> (OwnedStore, VerificationStoreRegistry, StopReceipt) {
+    fn fixture(partial: bool) -> (OwnedStore, VerificationStoreRegistry, StopReceipt) {
         let mut store = OwnedStore::create().unwrap();
         let registry_path = store.control_registry_path().unwrap();
         let (parent, root) = store.control_identity().unwrap();
@@ -358,7 +406,11 @@ mod tests {
         let descriptor = store.worker_stdin_once().unwrap();
         let pid = std::process::id();
         store.bind_worker(pid).unwrap();
-        super::super::handoff::write_payload_from_root(&descriptor).unwrap();
+        if partial {
+            assert!(super::super::handoff::write_partial_payload_from_root(&descriptor).is_err());
+        } else {
+            super::super::handoff::write_payload_from_root(&descriptor).unwrap();
+        }
         let receipt = StopReceipt::confirmed(store.token(), pid);
         store.record_stopped(&receipt).unwrap();
         registry
@@ -369,6 +421,14 @@ mod tests {
             )
             .unwrap();
         (store, registry, receipt)
+    }
+
+    fn completed_fixture() -> (OwnedStore, VerificationStoreRegistry, StopReceipt) {
+        fixture(false)
+    }
+
+    fn partial_fixture() -> (OwnedStore, VerificationStoreRegistry, StopReceipt) {
+        fixture(true)
     }
 
     #[test]
@@ -386,14 +446,20 @@ mod tests {
     fn payload_change_after_initial_snapshot_refuses_the_observation() {
         let (store, registry, receipt) = completed_fixture();
         let invoked = std::cell::Cell::new(false);
-        let result = observe_with_checkpoint(&store, &registry, &receipt, |owned| {
-            invoked.set(true);
-            let payload = fs::OpenOptions::new()
-                .write(true)
-                .open(owned.parent_path.join("store/payload.bin"))?;
-            payload.set_len(super::super::payload::LIMIT - 1)?;
-            Ok(())
-        });
+        let result = observe_with_checkpoint(
+            &store,
+            &registry,
+            &receipt,
+            FixturePayloadKind::Complete,
+            |owned| {
+                invoked.set(true);
+                let payload = fs::OpenOptions::new()
+                    .write(true)
+                    .open(owned.parent_path.join("store/payload.bin"))?;
+                payload.set_len(super::super::payload::LIMIT - 1)?;
+                Ok(())
+            },
+        );
         assert!(
             invoked.get(),
             "mutation must happen after the initial snapshot"
@@ -473,5 +539,81 @@ mod tests {
         assert!(store
             .observe_stopped_fixture_footprint(&registry, &receipt)
             .is_err());
+    }
+
+    #[test]
+    fn partial_stopped_fixture_footprint_is_exactly_distinct_from_complete() {
+        let (store, registry, receipt) = partial_fixture();
+        let partial = store
+            .observe_stopped_partial_fixture_footprint(&registry, &receipt)
+            .unwrap();
+        assert_eq!(partial.object_count, OBJECT_COUNT);
+        assert!(partial.observed_bytes >= super::super::payload::PARTIAL_FIXTURE_BYTES);
+        assert!(partial.observed_bytes <= super::super::WORKER_PAYLOAD_RESERVATION);
+        assert!(store
+            .observe_stopped_fixture_footprint(&registry, &receipt)
+            .is_err());
+
+        let (store, registry, receipt) = completed_fixture();
+        assert!(store
+            .observe_stopped_partial_fixture_footprint(&registry, &receipt)
+            .is_err());
+    }
+
+    #[test]
+    fn partial_fixture_snapshot_refuses_wrong_receipt_unknown_entries_and_sidecars() {
+        let (store, registry, receipt) = partial_fixture();
+        let wrong = StopReceipt::confirmed("different-token", receipt.pid());
+        assert!(store
+            .observe_stopped_partial_fixture_footprint(&registry, &wrong)
+            .is_err());
+
+        let (store, registry, receipt) = partial_fixture();
+        let wrong_pid =
+            StopReceipt::confirmed(receipt.token(), receipt.pid().wrapping_add(1).max(1));
+        assert!(store
+            .observe_stopped_partial_fixture_footprint(&registry, &wrong_pid)
+            .is_err());
+
+        let (store, registry, receipt) = partial_fixture();
+        fs::write(
+            store.parent_path.join("verification-registry.sqlite3-shm"),
+            b"x",
+        )
+        .unwrap();
+        assert!(store
+            .observe_stopped_partial_fixture_footprint(&registry, &receipt)
+            .is_err());
+
+        let (store, registry, receipt) = partial_fixture();
+        fs::write(store.parent_path.join("store/unexpected"), b"x").unwrap();
+        assert!(store
+            .observe_stopped_partial_fixture_footprint(&registry, &receipt)
+            .is_err());
+    }
+
+    #[test]
+    fn partial_payload_mutation_after_initial_snapshot_refuses_the_observation() {
+        let (store, registry, receipt) = partial_fixture();
+        let invoked = std::cell::Cell::new(false);
+        let result = observe_with_checkpoint(
+            &store,
+            &registry,
+            &receipt,
+            FixturePayloadKind::Partial,
+            |owned| {
+                invoked.set(true);
+                let payload = fs::OpenOptions::new()
+                    .write(true)
+                    .open(owned.parent_path.join("store/payload.bin"))?;
+                payload.set_len(super::super::payload::PARTIAL_FIXTURE_BYTES + 1)?;
+                Ok(())
+            },
+        );
+        assert!(
+            invoked.get(),
+            "mutation must happen after the initial snapshot"
+        );
+        assert!(matches!(result, Err(StoreError::InvalidIdentity)));
     }
 }
