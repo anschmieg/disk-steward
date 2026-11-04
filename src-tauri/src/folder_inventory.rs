@@ -593,6 +593,42 @@ impl FolderInventoryState {
         )
     }
 
+    #[cfg(unix)]
+    pub(crate) fn pytest_review_bundle(
+        &self,
+        expected_observation_id: InventoryItemId,
+        inspection_id: InventoryItemId,
+        policy: &crate::global_exclusions::SummaryExclusionPolicy,
+        revision: disk_steward_core::RevisionId,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<Vec<disk_steward_plan_model::InventoryItem>, &'static str> {
+        let state = self.0.lock().map_err(|_| "observation_unavailable")?;
+        let session = state.as_ref().ok_or("observation_unavailable")?;
+        pytest_records::review_bundle(
+            session,
+            expected_observation_id,
+            inspection_id,
+            policy,
+            revision,
+            started,
+            duration,
+        )
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn pytest_review_bundle(
+        &self,
+        _: InventoryItemId,
+        _: InventoryItemId,
+        _: &crate::global_exclusions::SummaryExclusionPolicy,
+        _: disk_steward_core::RevisionId,
+        _: Instant,
+        _: Duration,
+    ) -> Result<Vec<disk_steward_plan_model::InventoryItem>, &'static str> {
+        Err("observation_unavailable")
+    }
+
     #[cfg(not(unix))]
     pub(crate) fn blocked_items_for_observation(
         &self,
@@ -637,6 +673,7 @@ struct Session {
     cursor: Option<DirectoryCursor>,
     subtree_job: Option<subtree_job::SubtreeJob>,
     duplicate_evidence: Option<duplicate_compare::RetainedComparison>,
+    pytest_evidence: Option<pytest_records::RetainedInspection>,
 }
 
 #[cfg(not(unix))]
@@ -1323,6 +1360,7 @@ fn selected_root_session(
         cursor: scanned.cursor,
         subtree_job: None,
         duplicate_evidence: None,
+        pytest_evidence: None,
     };
     Ok((session, scanned.snapshot))
 }
@@ -1495,6 +1533,7 @@ fn navigate_session(
         session.frames.truncate(current_index);
         session.subtree_job = None;
         session.duplicate_evidence = None;
+        session.pytest_evidence = None;
         session.observation_id = scanned.snapshot.observation_id;
         session.entries = scanned.entries;
         session.snapshot = scanned.snapshot.clone();
@@ -1591,6 +1630,7 @@ fn navigate_session(
     session.frames.push(child);
     session.subtree_job = None;
     session.duplicate_evidence = None;
+    session.pytest_evidence = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
@@ -1668,6 +1708,7 @@ fn continue_session(
     }
     session.subtree_job = None;
     session.duplicate_evidence = None;
+    session.pytest_evidence = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
@@ -1716,6 +1757,7 @@ fn refresh_session(
 
     session.subtree_job = None;
     session.duplicate_evidence = None;
+    session.pytest_evidence = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();

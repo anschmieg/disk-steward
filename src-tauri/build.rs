@@ -48,6 +48,7 @@ fn main() {
             "add_selected_general_folder",
             "import_observed_review_items",
             "import_duplicate_review_items",
+            "import_pytest_review_items",
             "get_exclusion_registry",
             "add_global_exclusion",
             "remove_global_exclusion",

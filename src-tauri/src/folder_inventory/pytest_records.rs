@@ -8,7 +8,7 @@ use super::{
 };
 use crate::global_exclusions::{ExclusionState, SummaryExclusionPolicy};
 use crate::summary_control::SummaryControlState;
-use disk_steward_core::{InventoryItemId, SummaryAttemptId};
+use disk_steward_core::{InventoryItemId, RevisionId, SummaryAttemptId};
 use rustix::fs::{fstat, openat, statat, AtFlags, FileType, Mode, OFlags, Stat};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 const MAX_DURATION: Duration = Duration::from_secs(2);
 const MAX_RECORD_BYTES: u64 = disk_steward_generated_evidence::MAX_INPUT_BYTES as u64;
 const MAX_TOTAL_RECORD_BYTES: u64 = MAX_RECORD_BYTES * 2;
+const RETAINED_REVIEW_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -58,10 +59,25 @@ pub(crate) struct InspectedRecord {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Inspection {
     observation_id: InventoryItemId,
+    inspection_id: InventoryItemId,
     detector_version: String,
     reference_version: String,
     bytes_read: String,
     records: Vec<InspectedRecord>,
+}
+
+pub(super) struct RetainedInspection {
+    inspection: Inspection,
+    exclusion_revision: RevisionId,
+    created_at: Instant,
+    items: Vec<disk_steward_plan_model::InventoryItem>,
+    stamps: Vec<(InventoryItemId, super::checkpoint_store::RootStamp)>,
+}
+
+fn invalidate_retained_inspection(session: &mut Session) {
+    // An accepted explicit attempt supersedes prior importable evidence even
+    // when that attempt later fails validation, reading, or policy checks.
+    session.pytest_evidence = None;
 }
 
 #[tauri::command]
@@ -98,6 +114,7 @@ pub(crate) async fn inspect_pytest_cache_records(
         {
             return Err("Folder observation is stale. Inspect it again.".into());
         }
+        invalidate_retained_inspection(session);
         check(cancellation, started)?;
         let (revision, policy) = exclusions
             .summary_policy(started, MAX_DURATION)
@@ -129,7 +146,10 @@ pub(crate) async fn inspect_pytest_cache_records(
         policy
             .ensure_ancestor_scope_allowed(&frame.fd, started, MAX_DURATION)
             .map_err(str::to_owned)?;
+        revalidate_named_records(session, &request.entry_ids, started, cancellation)?;
+        validate_session_bindings(session, started, MAX_DURATION).map_err(str::to_owned)?;
         check(cancellation, started)?;
+        retain_after_success(session, &inspection, revision).map_err(str::to_owned)?;
         Ok(inspection)
     })
     .await
@@ -184,7 +204,7 @@ fn inspect_session(
         return Err("Each selected cache record must be unique.".into());
     }
     validate_cache_context(session)?;
-    validate_session_bindings(session, started, duration).map_err(str::to_owned)?;
+    validate_session_bindings(session, started, duration)?;
     let frame = session
         .frames
         .last()
@@ -347,6 +367,7 @@ fn inspect_session(
     check(cancellation, started)?;
     Ok(Inspection {
         observation_id: session.observation_id,
+        inspection_id: InventoryItemId::new(),
         detector_version: disk_steward_generated_evidence::DETECTOR_VERSION.to_owned(),
         reference_version: disk_steward_generated_evidence::REFERENCE_PYTEST_VERSION.to_owned(),
         bytes_read: bytes_read.to_string(),
@@ -486,6 +507,281 @@ fn validate_record_json(kind: RecordKind, bytes: &[u8]) -> Result<u32, String> {
         .map_err(|_| "Selected cache record has an unsupported format.".to_owned())
 }
 
+fn retain_after_success(
+    session: &mut Session,
+    inspection: &Inspection,
+    exclusion_revision: RevisionId,
+) -> Result<(), &'static str> {
+    use disk_steward_plan_model::{
+        Blocker, Choice, EvidenceRef, InventoryItem, ItemKind, Suggestion,
+    };
+
+    if inspection.observation_id != session.observation_id
+        || session.snapshot.observation_id != session.observation_id
+        || inspection.detector_version != disk_steward_generated_evidence::DETECTOR_VERSION
+        || inspection.reference_version != disk_steward_generated_evidence::REFERENCE_PYTEST_VERSION
+        || inspection.records.is_empty()
+        || inspection.records.len() > 2
+        || inspection
+            .bytes_read
+            .parse::<u64>()
+            .ok()
+            .is_none_or(|bytes| bytes > MAX_TOTAL_RECORD_BYTES + 2)
+    {
+        return Err("Pytest inspection could not be retained for this observation.");
+    }
+    let inspection_text = serde_json::to_value(inspection.inspection_id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("Pytest inspection could not be retained for this observation.")?;
+    let observation_text = serde_json::to_value(inspection.observation_id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("Pytest inspection could not be retained for this observation.")?;
+    let mut seen = HashSet::new();
+    let mut items = Vec::with_capacity(inspection.records.len());
+    let mut stamps = Vec::with_capacity(inspection.records.len());
+    for record in &inspection.records {
+        if !seen.insert(record.entry_id) || record.record_count > 512 {
+            return Err("Pytest inspection contains invalid record evidence.");
+        }
+        let observed = session
+            .entries
+            .iter()
+            .find(|entry| entry.id == record.entry_id)
+            .ok_or("Pytest inspection no longer matches the observation.")?;
+        let display = session
+            .snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == record.entry_id)
+            .ok_or("Pytest inspection no longer matches the observation.")?;
+        let expected_name: &[u8] = match record.kind {
+            RecordKind::NodeIds => b"nodeids",
+            RecordKind::LastFailed => b"lastfailed",
+        };
+        if observed.name.as_slice() != expected_name
+            || observed.file_type != FileType::RegularFile
+            || observed.identity.device != session.root_device
+            || display.kind != "file"
+            || display.availability == "dataless"
+            || display.link_count.as_deref() != Some("1")
+        {
+            return Err("Pytest inspection no longer matches eligible cache records.");
+        }
+        let stamp = observed
+            .content_stamp
+            .clone()
+            .ok_or("Pytest record metadata is unavailable.")?;
+        let size = display
+            .logical_bytes
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|size| {
+                *size <= MAX_RECORD_BYTES && i64::try_from(*size).ok() == Some(stamp.size)
+            })
+            .ok_or("Pytest record size is unavailable.")?;
+        let kind_label = match record.kind {
+            RecordKind::NodeIds => "nodeids",
+            RecordKind::LastFailed => "lastfailed",
+        };
+        let summary = format!(
+            "Native inspection {inspection_text} for observation {observation_text}. {} Selected pytest {kind_label} record parsed with detector {} using reference pytest {}; {} record entries were counted. This structural format evidence does not establish the installed pytest version, project/cache ownership, active-test state, regenerability, or cleanup eligibility. It is historical as of inspection; importing does not refresh the cache, and later changes remain unknown. Record contents were discarded after explicit inspection. No content digest or path is retained.",
+            super::observation_window_evidence(&session.snapshot.observation_window),
+            inspection.detector_version,
+            inspection.reference_version,
+            record.record_count,
+        );
+        if summary.len() > 2048 {
+            return Err("Pytest inspection evidence exceeded its size limit.");
+        }
+        items.push(InventoryItem {
+            id: record.entry_id,
+            parent_id: None,
+            label: display.name.clone(),
+            kind: ItemKind::File,
+            logical_bytes: Some(size),
+            recovery_lower_bytes: None,
+            recovery_upper_bytes: None,
+            storage_identity: None,
+            blockers: vec![
+                Blocker {
+                    code: "read_only_pytest".to_owned(),
+                    reason: "Pytest record-format evidence supports review only and does not establish that this cache record is safe to remove.".to_owned(),
+                },
+                Blocker {
+                    code: "pytest_ownership_unverified".to_owned(),
+                    reason: "The project and cache ownership have not been verified.".to_owned(),
+                },
+                Blocker {
+                    code: "pytest_active_use_unknown".to_owned(),
+                    reason: "Whether tests or another process are using this cache is unknown.".to_owned(),
+                },
+                Blocker {
+                    code: "pytest_regeneration_unverified".to_owned(),
+                    reason: "A safe regeneration path has not been verified.".to_owned(),
+                },
+                Blocker {
+                    code: "no_execution_adapter".to_owned(),
+                    reason: "No native cleanup adapter is available for this item.".to_owned(),
+                },
+            ],
+            evidence: vec![EvidenceRef {
+                id: disk_steward_core::EvidenceId::new(),
+                summary,
+            }],
+            suggestion: Suggestion {
+                choice: Choice::Keep,
+                rationale: "Keep by default; format recognition does not establish cleanup safety.".to_owned(),
+            },
+        });
+        stamps.push((record.entry_id, stamp));
+    }
+    session.pytest_evidence = Some(RetainedInspection {
+        inspection: inspection.clone(),
+        exclusion_revision,
+        created_at: Instant::now(),
+        items,
+        stamps,
+    });
+    Ok(())
+}
+
+pub(super) fn review_bundle(
+    session: &Session,
+    expected_observation_id: InventoryItemId,
+    inspection_id: InventoryItemId,
+    current_policy: &SummaryExclusionPolicy,
+    revision: RevisionId,
+    started: Instant,
+    duration: Duration,
+) -> Result<Vec<disk_steward_plan_model::InventoryItem>, &'static str> {
+    let check_deadline = || {
+        if started.elapsed() >= duration {
+            Err("Pytest review evidence exceeded its time limit.")
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
+    if session.observation_id != expected_observation_id
+        || session.snapshot.observation_id != expected_observation_id
+    {
+        return Err("Folder observation is stale.");
+    }
+    let retained = session
+        .pytest_evidence
+        .as_ref()
+        .ok_or("No retained pytest inspection is available.")?;
+    if retained.inspection.inspection_id != inspection_id
+        || retained.inspection.observation_id != expected_observation_id
+        || retained.exclusion_revision != revision
+        || retained.items.is_empty()
+        || retained.items.len() > 2
+        || retained.items.len() != retained.inspection.records.len()
+        || retained.stamps.len() != retained.items.len()
+    {
+        return Err("Pytest inspection evidence is stale or unavailable.");
+    }
+    if started
+        .checked_duration_since(retained.created_at)
+        .is_none_or(|age| age >= RETAINED_REVIEW_TTL)
+    {
+        return Err("Pytest inspection evidence expired. Inspect the records again.");
+    }
+    validate_cache_context(session).map_err(|_| "Pytest cache context changed.")?;
+    validate_session_bindings(session, started, duration)?;
+    let frame = session
+        .frames
+        .last()
+        .ok_or("The current folder observation is unavailable.")?;
+    super::duplicate_scope::ensure_allowed(&frame.fd, started, duration)?;
+    current_policy.ensure_ancestor_scope_allowed(&frame.fd, started, duration)?;
+
+    let validate_retained_names = || -> Result<(), &'static str> {
+        for ((entry_id, expected_stamp), record) in retained
+            .stamps
+            .iter()
+            .zip(retained.inspection.records.iter())
+        {
+            check_deadline()?;
+            if *entry_id != record.entry_id {
+                return Err("Retained pytest inspection metadata is inconsistent.");
+            }
+            let observed = session
+                .entries
+                .iter()
+                .find(|entry| entry.id == *entry_id)
+                .ok_or("Pytest evidence no longer matches the observation.")?;
+            let display = session
+                .snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == *entry_id)
+                .ok_or("Pytest evidence no longer matches the observation.")?;
+            let expected_name: &[u8] = match record.kind {
+                RecordKind::NodeIds => b"nodeids",
+                RecordKind::LastFailed => b"lastfailed",
+            };
+            let item = retained
+                .items
+                .iter()
+                .find(|item| item.id == *entry_id)
+                .ok_or("Retained pytest item metadata is inconsistent.")?;
+            if observed.name.as_slice() != expected_name
+                || observed.file_type != FileType::RegularFile
+                || observed.identity.device != session.root_device
+                || display.kind != "file"
+                || display.availability == "dataless"
+                || display.link_count.as_deref() != Some("1")
+                || observed.content_stamp.as_ref() != Some(expected_stamp)
+                || item.label != display.name
+                || item.parent_id.is_some()
+                || item.logical_bytes
+                    != display
+                        .logical_bytes
+                        .as_deref()
+                        .and_then(|value| value.parse::<u64>().ok())
+                || item.kind != disk_steward_plan_model::ItemKind::File
+                || item.storage_identity.is_some()
+                || item.recovery_lower_bytes.is_some()
+                || item.recovery_upper_bytes.is_some()
+                || item.suggestion.choice != disk_steward_plan_model::Choice::Keep
+            {
+                return Err("Pytest evidence no longer matches eligible observed records.");
+            }
+            let name = CString::new(observed.name.as_slice())
+                .map_err(|_| "Pytest record name is unavailable.")?;
+            let stat = statat(&frame.fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| "A pytest record changed since inspection.")?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                || stat.st_dev as u64 != session.root_device
+                || identity(&stat) != observed.identity
+                || stat.st_nlink != 1
+                || is_dataless(&stat)
+                || super::checkpoint_replay::stamp(&stat)
+                    .map_err(|_| "Pytest record metadata is unavailable.")?
+                    != *expected_stamp
+            {
+                return Err("A pytest record changed since inspection. Inspect it again.");
+            }
+        }
+        Ok(())
+    };
+    validate_retained_names()?;
+    check_deadline()?;
+    validate_session_bindings(session, started, duration)?;
+    super::duplicate_scope::ensure_allowed(&frame.fd, started, duration)?;
+    current_policy.ensure_ancestor_scope_allowed(&frame.fd, started, duration)?;
+    validate_retained_names()?;
+    validate_session_bindings(session, started, duration)?;
+    check_deadline()?;
+    if retained.created_at.elapsed() >= RETAINED_REVIEW_TTL {
+        return Err("Pytest inspection evidence expired. Inspect the records again.");
+    }
+    Ok(retained.items.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +894,30 @@ mod tests {
         (session, ids)
     }
 
+    #[cfg(target_os = "macos")]
+    fn retained_fixture() -> (tempfile::TempDir, Session, Inspection, RevisionId) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("pytest-project");
+        std::fs::create_dir(&project).unwrap();
+        let nodeids =
+            include_bytes!("../../../probes/generated_cache/fixtures/pytest-9.2.0/nodeids.json");
+        let lastfailed =
+            include_bytes!("../../../probes/generated_cache/fixtures/pytest-9.2.0/lastfailed.json");
+        let (mut session, ids) = selected_cache_session(&project, nodeids, lastfailed, false);
+        let revision = RevisionId::new();
+        let inspection = inspect_session(
+            &session,
+            &ids,
+            &SummaryExclusionPolicy::empty_for_tests(),
+            &std::sync::atomic::AtomicBool::new(false),
+            Instant::now(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        retain_after_success(&mut session, &inspection, revision).unwrap();
+        (temp, session, inspection, revision)
+    }
+
     #[test]
     fn native_context_requires_exact_raw_navigation_suffix() {
         let temp = tempfile::tempdir().unwrap();
@@ -649,6 +969,226 @@ mod tests {
         assert!(!wire.contains("test_generated.py"));
         assert!(!wire.contains(project.to_str().unwrap()));
         assert!(!wire.contains("lastfailed.json"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_pytest_review_bundle_is_stable_blocked_and_metadata_only() {
+        let (temp, session, inspection, revision) = retained_fixture();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
+        let first = review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &policy,
+            revision,
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let repeated = review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &policy,
+            revision,
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(first, repeated);
+        assert_eq!(first.len(), 2);
+        for item in &first {
+            assert_eq!(item.parent_id, None);
+            assert_eq!(item.kind, disk_steward_plan_model::ItemKind::File);
+            assert_eq!(
+                item.suggestion.choice,
+                disk_steward_plan_model::Choice::Keep
+            );
+            assert_eq!(item.storage_identity, None);
+            assert_eq!(item.recovery_lower_bytes, None);
+            assert_eq!(item.recovery_upper_bytes, None);
+            for code in [
+                "read_only_pytest",
+                "pytest_ownership_unverified",
+                "pytest_active_use_unknown",
+                "pytest_regeneration_unverified",
+                "no_execution_adapter",
+            ] {
+                assert!(item.blockers.iter().any(|blocker| blocker.code == code));
+            }
+            assert!(item.evidence[0].summary.contains("pytest-cache-format-v1"));
+            assert!(item.evidence[0].summary.contains("pytest 9.2.0"));
+            assert!(item.evidence[0].summary.contains("active-test state"));
+            assert!(item.evidence[0].summary.len() <= 2048);
+            assert!(!item.evidence[0]
+                .summary
+                .contains(temp.path().to_str().unwrap()));
+            assert!(!item.evidence[0].summary.contains("test_generated.py"));
+            assert!(!item.evidence[0].summary.contains("test_one"));
+            assert!(!item.evidence[0].summary.contains("test_two"));
+        }
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            InventoryItemId::new(),
+            &policy,
+            revision,
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+        assert!(review_bundle(
+            &session,
+            InventoryItemId::new(),
+            inspection.inspection_id,
+            &policy,
+            revision,
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &policy,
+            RevisionId::new(),
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_pytest_review_refuses_changed_files_expiry_and_new_failed_attempts() {
+        let (temp, mut session, inspection, revision) = retained_fixture();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
+        let cache = temp.path().join("pytest-project/.pytest_cache/v/cache");
+        std::fs::write(cache.join("nodeids"), b"[]").unwrap();
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &policy,
+            revision,
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+
+        let (_temp, mut expired_session, expired_inspection, expired_revision) = retained_fixture();
+        expired_session.pytest_evidence.as_mut().unwrap().created_at =
+            Instant::now() - RETAINED_REVIEW_TTL - Duration::from_secs(1);
+        assert!(review_bundle(
+            &expired_session,
+            expired_session.observation_id,
+            expired_inspection.inspection_id,
+            &policy,
+            expired_revision,
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+
+        let invalid_ids = vec![InventoryItemId::new()];
+        invalidate_retained_inspection(&mut session);
+        assert!(inspect_session(
+            &session,
+            &invalid_ids,
+            &policy,
+            &std::sync::atomic::AtomicBool::new(false),
+            Instant::now(),
+            Duration::from_secs(5),
+        )
+        .is_err());
+        assert!(session.pytest_evidence.is_none());
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &policy,
+            revision,
+            Instant::now(),
+            Duration::from_secs(30),
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_manager_corpus_import_persists_without_contents_or_execution_authority() {
+        use disk_steward_plan_store::{FixtureScale, GeneralPlanStore};
+        let (temp, session, inspection, revision) = retained_fixture();
+        let bundle = review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &SummaryExclusionPolicy::empty_for_tests(),
+            revision,
+            Instant::now(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let path = temp.path().join("review-fixture.sqlite3");
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let before = store.get_plan().unwrap();
+        let imported = store
+            .append_pytest_evidence(before.revision_id, bundle.clone())
+            .unwrap();
+        assert_eq!(imported.items.len(), 2);
+        assert!(!imported.execution_available);
+        for row in &imported.items {
+            assert_eq!(row.suggestion.choice, disk_steward_plan_model::Choice::Keep);
+            assert!(row
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "read_only_pytest"));
+        }
+        assert_eq!(
+            store
+                .append_pytest_evidence(imported.revision_id, bundle)
+                .unwrap(),
+            imported
+        );
+        drop(store);
+        let mut reopened = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), imported);
+        let frozen = reopened.freeze_review(imported.revision_id).unwrap();
+        assert!(!frozen.execution_available);
+        let serialized = serde_json::to_string(&frozen).unwrap();
+        assert!(!serialized.contains("test_generated.py"));
+        assert!(!serialized.contains(temp.path().to_str().unwrap()));
+        assert!(serialized.contains("record entries were counted"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_import_rechecks_excluded_scope_and_deadline() {
+        let (_temp, session, inspection, revision) = retained_fixture();
+        let root = identity(&fstat(&session.frames[0].fd).unwrap());
+        let excluded = SummaryExclusionPolicy::for_tests(vec![(root.device, root.inode)]);
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &excluded,
+            revision,
+            Instant::now(),
+            Duration::from_secs(2)
+        )
+        .is_err());
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            inspection.inspection_id,
+            &SummaryExclusionPolicy::empty_for_tests(),
+            revision,
+            Instant::now(),
+            Duration::ZERO
+        )
+        .is_err());
     }
 
     #[cfg(target_os = "macos")]

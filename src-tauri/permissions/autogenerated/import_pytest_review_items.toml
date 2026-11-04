@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-import-pytest-review-items"
+description = "Enables the import_pytest_review_items command without any pre-configured scope."
+commands.allow = ["import_pytest_review_items"]
+
+[[permission]]
+identifier = "deny-import-pytest-review-items"
+description = "Denies the import_pytest_review_items command without any pre-configured scope."
+commands.deny = ["import_pytest_review_items"]

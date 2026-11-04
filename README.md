@@ -144,3 +144,19 @@ tests review, stage, restore, and separately approved permanent removal using
 copies of the committed pytest corpus in its own private temporary fixture.
 It does not enable cleanup in selected projects or establish recovered-space
 acceptance.
+
+### Pytest format evidence in the editable plan
+
+After inspecting selected `nodeids` or `lastfailed` records, explicitly import
+the current result into the live review plan. The backend revalidates the
+retained inspection against the current observation, file metadata and
+exclusion policy. The proof expires after five minutes and is invalidated by a
+new inspection attempt or folder-observation change. Import does not reread the
+record contents. Import-time change detection uses captured metadata stamps;
+it is not a fresh content comparison or an atomic filesystem snapshot.
+
+New records default to Keep and carry a read-only pytest blocker. Import adds
+evidence without replacing prior decisions, exclusions, groups or survivor
+choices; the change is undoable. Counts establish recognized format only.
+Project ownership, active-use safety and regeneration remain unresolved, and
+these records cannot be executed as cleanup actions.

@@ -1269,6 +1269,7 @@ export default function FolderInventoryPanel({
             </select>
           </label>
           <PytestCachePanel
+            onOpenPlan={onOpenPlan}
             key={`pytest-${snapshot.observationId}`}
             snapshot={snapshot}
             native={native}

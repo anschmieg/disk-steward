@@ -1,5 +1,6 @@
 import { useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { EditorSnapshot } from "../general-plan-contract";
 import type { FolderInventory } from "./FolderInventoryPanel";
 
 const MAX_RECORD_BYTES = 65_536n;
@@ -8,12 +9,14 @@ const MAX_RECORDS = 512;
 const DETECTOR_VERSION = "pytest-cache-format-v1";
 const REFERENCE_VERSION = "9.2.0";
 const ATTEMPT_PREFIX = "disk-steward:summary-attempt:v1:";
+const INSPECTION_ID_PREFIX = "disk-steward:inventory-item:v1:";
 const CACHE_NAMES = ["nodeids", "lastfailed"] as const;
 
 type CacheKind = "node_ids" | "last_failed";
 type CacheRecord = { entryId: string; kind: CacheKind; recordCount: number };
 type InspectionResult = {
   observationId: string;
+  inspectionId: string;
   detectorVersion: typeof DETECTOR_VERSION;
   referenceVersion: typeof REFERENCE_VERSION;
   bytesRead: string;
@@ -37,6 +40,17 @@ function canonicalBytes(value: unknown): bigint | null {
 
 function formatBytes(value: bigint | string): string {
   return `${typeof value === "bigint" ? value : BigInt(value)} bytes`;
+}
+
+function validInspectionId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.startsWith(INSPECTION_ID_PREFIX) &&
+    value.length === INSPECTION_ID_PREFIX.length + 36 &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value.slice(INSPECTION_ID_PREFIX.length),
+    )
+  );
 }
 
 function eligibilityReason(
@@ -67,6 +81,7 @@ function validateResult(
   if (!value || typeof value !== "object") throw new Error("Invalid result");
   const result = value as Record<string, unknown>;
   const bytesRead = canonicalBytes(result.bytesRead);
+  const inspectionId = result.inspectionId;
   const selected = new Set(selectedIds);
   const entries = new Map(snapshot.entries.map((entry) => [entry.id, entry]));
   let expectedBytes = 0n;
@@ -79,6 +94,7 @@ function validateResult(
   }
   if (
     result.observationId !== snapshot.observationId ||
+    !validInspectionId(inspectionId) ||
     result.detectorVersion !== DETECTOR_VERSION ||
     result.referenceVersion !== REFERENCE_VERSION ||
     bytesRead === null ||
@@ -122,6 +138,7 @@ function validateResult(
   }
   return {
     observationId: snapshot.observationId,
+    inspectionId,
     detectorVersion: DETECTOR_VERSION,
     referenceVersion: REFERENCE_VERSION,
     bytesRead: bytesRead.toString(),
@@ -134,15 +151,18 @@ export default function PytestCachePanel({
   native,
   busy,
   onBusyChange,
+  onOpenPlan,
 }: {
   snapshot: FolderInventory;
   native: boolean;
   busy: boolean;
   onBusyChange: (busy: boolean) => void;
+  onOpenPlan?: () => void;
 }) {
   const headingId = useId();
   const consentId = useId();
   const activeAttempt = useRef<ActiveAttempt | null>(null);
+  const importPendingRef = useRef(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [contentConsent, setContentConsent] = useState(false);
   const [running, setRunning] = useState(false);
@@ -152,6 +172,10 @@ export default function PytestCachePanel({
   const [result, setResult] = useState<InspectionResult | null>(null);
   const [resultSelection, setResultSelection] = useState<string[]>([]);
   const [resultHistorical, setResultHistorical] = useState(false);
+  const [importPending, setImportPending] = useState(false);
+  const [importedInspectionId, setImportedInspectionId] = useState<
+    string | null
+  >(null);
   const [message, setMessage] = useState("");
   const candidates = snapshot.entries.filter((entry) =>
     CACHE_NAMES.includes(entry.name as (typeof CACHE_NAMES)[number]),
@@ -165,7 +189,8 @@ export default function PytestCachePanel({
       resultSelection.some((id) => !selectedIds.includes(id)));
 
   const select = (entryId: string, checked: boolean) => {
-    if (busy || running || activeAttempt.current) return;
+    if (busy || running || activeAttempt.current || importPendingRef.current)
+      return;
     setSelectedIds((current) =>
       checked ? [...current, entryId] : current.filter((id) => id !== entryId),
     );
@@ -179,6 +204,7 @@ export default function PytestCachePanel({
       !native ||
       busy ||
       running ||
+      importPendingRef.current ||
       activeAttempt.current ||
       !contentConsent ||
       selectedIds.length < 1 ||
@@ -196,6 +222,7 @@ export default function PytestCachePanel({
     setContentConsent(false);
     setMessage("");
     if (result) setResultHistorical(true);
+    setImportedInspectionId(null);
     onBusyChange(true);
     try {
       const raw = await invoke<unknown>("inspect_pytest_cache_records", {
@@ -210,6 +237,7 @@ export default function PytestCachePanel({
       setResult(verified);
       setResultSelection(ids);
       setResultHistorical(false);
+      setImportedInspectionId(null);
       setMessage("Selected pytest cache records were inspected locally.");
     } catch {
       setMessage(
@@ -219,6 +247,49 @@ export default function PytestCachePanel({
       if (activeAttempt.current === attempt) activeAttempt.current = null;
       setRunning(false);
       setCancelPhase("ready");
+      onBusyChange(false);
+    }
+  };
+
+  const importRecords = async () => {
+    if (
+      !native ||
+      busy ||
+      running ||
+      importPendingRef.current ||
+      activeAttempt.current ||
+      !result ||
+      historical ||
+      result.records.length === 0 ||
+      importedInspectionId === result.inspectionId
+    )
+      return;
+    importPendingRef.current = true;
+    setImportPending(true);
+    setMessage("");
+    onBusyChange(true);
+    try {
+      const before = await invoke<EditorSnapshot>("get_general_plan", {
+        request: { profile: "live" },
+      });
+      await invoke<EditorSnapshot>("import_pytest_review_items", {
+        request: {
+          expectedObservationId: snapshot.observationId,
+          inspectionId: result.inspectionId,
+          expectedRevisionId: before.revisionId,
+        },
+      });
+      setImportedInspectionId(result.inspectionId);
+      setMessage(
+        "Selected cache records were saved to the read-only plan. New records default to Keep; existing choices are preserved. Ownership, active use, provenance, and regeneration safety remain unknown. No cleanup was executed.",
+      );
+    } catch {
+      setMessage(
+        "The plan import could not be verified. The inspection evidence and selection remain; open your plan to check its latest state before trying again.",
+      );
+    } finally {
+      importPendingRef.current = false;
+      setImportPending(false);
       onBusyChange(false);
     }
   };
@@ -257,7 +328,7 @@ export default function PytestCachePanel({
     <section
       className="pytest-cache-panel"
       aria-labelledby={headingId}
-      aria-busy={busy || running}
+      aria-busy={busy || running || importPending}
     >
       <h3 id={headingId}>Inspect selected pytest cache records</h3>
       <p>
@@ -276,6 +347,7 @@ export default function PytestCachePanel({
             !native ||
             busy ||
             running ||
+            importPending ||
             !eligible ||
             (!checked && selectedIds.length >= 2);
           const bytes = canonicalBytes(entry.logicalBytes);
@@ -311,7 +383,13 @@ export default function PytestCachePanel({
           id={consentId}
           type="checkbox"
           checked={contentConsent}
-          disabled={!native || busy || running || selectedIds.length === 0}
+          disabled={
+            !native ||
+            busy ||
+            running ||
+            importPending ||
+            selectedIds.length === 0
+          }
           onChange={(event) => setContentConsent(event.currentTarget.checked)}
         />
         Allow local content reads for these selected records for this inspection
@@ -331,6 +409,7 @@ export default function PytestCachePanel({
           !native ||
           busy ||
           running ||
+          importPending ||
           !contentConsent ||
           selectedIds.length === 0 ||
           selectedIds.length > 2
@@ -374,6 +453,44 @@ export default function PytestCachePanel({
             </p>
           ))}
         </section>
+      )}
+      {result && result.records.length > 0 && !historical && (
+        <div>
+          <p>
+            Adding records saves selected names, logical sizes, and inspection
+            evidence locally. It does not save record contents. Ownership,
+            active use, pytest provenance, and regeneration safety remain
+            unknown; the plan offers no execution authority.
+          </p>
+          <button
+            className="button secondary"
+            type="button"
+            disabled={
+              !native ||
+              busy ||
+              running ||
+              importPending ||
+              importedInspectionId === result.inspectionId
+            }
+            onClick={() => void importRecords()}
+          >
+            {importPending
+              ? "Adding cache records…"
+              : importedInspectionId === result.inspectionId
+                ? "Cache records added to plan"
+                : "Add inspected records to plan"}
+          </button>
+          {importedInspectionId === result.inspectionId && onOpenPlan && (
+            <button
+              className="button secondary"
+              type="button"
+              disabled={busy || importPending}
+              onClick={onOpenPlan}
+            >
+              Review cache records in plan
+            </button>
+          )}
+        </div>
       )}
       <p>
         A valid format does not show who owns this project, which pytest version
