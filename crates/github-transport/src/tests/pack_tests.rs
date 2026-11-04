@@ -726,3 +726,265 @@ fn transfer_decode_and_coverage_require_the_expected_repository_context() {
         io::ErrorKind::InvalidInput
     );
 }
+
+#[test]
+fn named_ref_coverage_retains_names_needing_disposition_and_binds_attempt() {
+    use super::graph_tests::{hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let a = b"a".to_vec();
+    let b = b"b".to_vec();
+    let a_id = oid(K::Blob, &a);
+    let b_id = oid(K::Blob, &b);
+    let bytes = pack_bytes(&[(K::Blob, a), (K::Blob, b)]);
+    let refs = format!(
+        "{} refs/tags/exact\n{} refs/tags/moved\n",
+        hex(&a_id),
+        hex(&b_id)
+    )
+    .into_bytes();
+    let report = advertised_decode_fixture(refs.clone(), &bytes);
+    let checked = decode_report(&report, &bytes).unwrap();
+    let expected = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let inputs = [
+        RequiredRefInput {
+            name: b"refs/tags/exact",
+            oid: a_id,
+            kind: K::Blob,
+        },
+        RequiredRefInput {
+            name: b"refs/tags/local",
+            oid: a_id,
+            kind: K::Blob,
+        },
+        RequiredRefInput {
+            name: b"refs/tags/moved",
+            oid: a_id,
+            kind: K::Blob,
+        },
+    ];
+    let manifest = RequiredRefManifest::capture(
+        &inputs,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let coverage = checked
+        .check_required_refs(
+            &expected,
+            &report,
+            &manifest,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(coverage.manifest().digest(), manifest.digest());
+    assert_eq!(coverage.coverage().required_object_count(), 3);
+    assert_eq!(
+        coverage
+            .unmatched_remote_refs()
+            .map(|(e, r)| (e.name(), r))
+            .collect::<Vec<_>>(),
+        [
+            (
+                b"refs/tags/local".as_slice(),
+                RemoteRefMismatch::MissingName
+            ),
+            (
+                b"refs/tags/moved".as_slice(),
+                RemoteRefMismatch::DifferentTarget
+            )
+        ]
+    );
+    let cloned = report.clone();
+    assert!(checked
+        .check_required_refs(
+            &expected,
+            &cloned,
+            &manifest,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .is_ok());
+    let different_attempt = advertised_decode_fixture(refs, &bytes);
+    assert_eq!(
+        checked
+            .check_required_refs(
+                &expected,
+                &different_attempt,
+                &manifest,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    let missing = RequiredRefManifest::capture(
+        &[RequiredRefInput {
+            name: b"refs/tags/missing",
+            oid: [1; 20],
+            kind: K::Blob,
+        }],
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        checked
+            .check_required_refs(
+                &expected,
+                &report,
+                &missing,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn named_coverage_recheck_refuses_changed_claims_without_reviving_old_evidence() {
+    use super::graph_tests::{hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let bytes = pack_bytes(&[(K::Blob, b"x".to_vec())]);
+    let id = oid(K::Blob, b"x");
+    let report =
+        advertised_decode_fixture(format!("{} refs/tags/a\n", hex(&id)).into_bytes(), &bytes);
+    let checked = decode_report(&report, &bytes).unwrap();
+    let expected = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let capture = |input: &[RequiredRefInput<'_>]| {
+        RequiredRefManifest::capture(
+            input,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let original = capture(&[RequiredRefInput {
+        name: b"refs/tags/a",
+        oid: id,
+        kind: K::Blob,
+    }]);
+    let controls = checked
+        .check_required_refs(
+            &expected,
+            &report,
+            &original,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    let wrong = RepositoryUrl::parse("https://github.com/other/repo.git").unwrap();
+    assert_eq!(
+        controls
+            .recheck_manifest(
+                &wrong,
+                &original,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let cancel = CancellationHandle::new();
+    cancel.cancel();
+    assert_eq!(
+        controls
+            .recheck_manifest(
+                &expected,
+                &original,
+                &cancel,
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    assert_eq!(
+        controls
+            .recheck_manifest(
+                &expected,
+                &original,
+                &CancellationHandle::new(),
+                Instant::now()
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    controls
+        .recheck_manifest(
+            &expected,
+            &original,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    for claims in [
+        vec![RequiredRefInput {
+            name: b"refs/tags/renamed",
+            oid: id,
+            kind: K::Blob,
+        }],
+        vec![RequiredRefInput {
+            name: b"refs/tags/a",
+            oid: [1; 20],
+            kind: K::Blob,
+        }],
+        vec![RequiredRefInput {
+            name: b"refs/tags/a",
+            oid: id,
+            kind: K::Tree,
+        }],
+        vec![
+            RequiredRefInput {
+                name: b"refs/tags/a",
+                oid: id,
+                kind: K::Blob,
+            },
+            RequiredRefInput {
+                name: b"refs/tags/new",
+                oid: id,
+                kind: K::Blob,
+            },
+        ],
+    ] {
+        let current = capture(&claims);
+        let coverage = checked
+            .check_required_refs(
+                &expected,
+                &report,
+                &original,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(
+            coverage
+                .recheck_manifest(
+                    &expected,
+                    &current,
+                    &CancellationHandle::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            coverage
+                .recheck_manifest(
+                    &expected,
+                    &original,
+                    &CancellationHandle::new(),
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}

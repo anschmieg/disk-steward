@@ -454,6 +454,44 @@ fn real_git_verification_child() {
     stdout.flush().unwrap();
 }
 
+fn capture_fixture_ref_manifest(root: &PrivateRoot, source_repo: &str) -> RequiredRefManifest {
+    let current_refs = checked_git(
+        root,
+        &[
+            "-C",
+            source_repo,
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(objecttype)",
+        ],
+        b"",
+    )
+    .unwrap();
+    let inputs = current_refs
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let parts: Vec<_> = line.split(|b| *b == b' ').collect();
+            assert_eq!(parts.len(), 3);
+            let kind = match parts[2] {
+                b"commit" => GitObjectKind::Commit,
+                b"tag" => GitObjectKind::Tag,
+                _ => panic!("unexpected fixture ref kind"),
+            };
+            RequiredRefInput {
+                name: parts[0],
+                oid: hex_oid(std::str::from_utf8(parts[1]).unwrap()),
+                kind,
+            }
+        })
+        .collect::<Vec<_>>();
+    RequiredRefManifest::capture(
+        &inputs,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap()
+}
+
 fn run_real_git_verification() {
     let root = PrivateRoot::create().unwrap();
     let (repo, blob, tree, commit, tag_object) = make_repository(&root).unwrap();
@@ -590,6 +628,117 @@ fn run_real_git_verification() {
         .unwrap();
     assert_eq!(coverage.required_object_count(), 4);
     assert_eq!(coverage.graph().reachable_objects(), 4);
+
+    let source_repo = root.repo().to_str().unwrap().to_owned();
+    // This local name has covered history but did not exist in the advertisement.
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "refs/heads/local-only",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    let manifest = capture_fixture_ref_manifest(&root, &source_repo);
+    let expected_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let named = advertised_closure
+        .check_required_refs(
+            &expected_repository,
+            &fetch_report,
+            &manifest,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(named.coverage().required_object_count(), 3);
+    assert_eq!(
+        named
+            .unmatched_remote_refs()
+            .map(|(entry, reason)| (entry.name(), reason))
+            .collect::<Vec<_>>(),
+        [(
+            b"refs/heads/local-only".as_slice(),
+            RemoteRefMismatch::MissingName
+        )]
+    );
+
+    let unchanged = capture_fixture_ref_manifest(&root, &source_repo);
+    named
+        .recheck_manifest(
+            &expected_repository,
+            &unchanged,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "refs/heads/renamed",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "-d",
+            "refs/heads/local-only",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    let renamed = capture_fixture_ref_manifest(&root, &source_repo);
+    assert_ne!(manifest.digest(), renamed.digest());
+    assert_eq!(
+        manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.oid())
+            .collect::<Vec<_>>(),
+        renamed
+            .entries()
+            .iter()
+            .map(|entry| entry.oid())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        named
+            .recheck_manifest(
+                &expected_repository,
+                &renamed,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    // An old caller snapshot cannot revive an already-invalidated named result.
+    assert_eq!(
+        named
+            .recheck_manifest(
+                &expected_repository,
+                &manifest,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
 
     let closure = check_pack_graph_closure(
         &decoded_pack,
