@@ -264,3 +264,30 @@ the task-owned fixture. No cleanup authority or source-repository access is
 added. This is process-exit evidence, not synchronized power-loss durability,
 production worker isolation, global store accounting, credential validation or
 milestone acceptance.
+
+## Worker reservation binding
+
+The indexed complete and partial payload fixtures bind the fixed 128 KiB
+registry reservation into the owner journal after admission succeeds and before
+handing the directory to the child. The once-only binding is available only in
+the fresh store phase. The child requires that exact reservation together with
+its PID, root identity and unchanged bound journal before creating the payload.
+The descriptor-only and stall modes retain their unreserved journal behavior.
+
+The worker writer uses the bound ceiling as an additional check around the
+shared accounting core: high-water usage plus the next chunk must fit before
+writing. Actual allocation growth is charged before an over-cap observation
+refuses further work, including after synchronization. No readiness is emitted
+on failure; partial bytes and the durable reservation remain retained. The
+parent still requires stopped-worker identity-bound readback and registry reopen
+reconciliation checks.
+
+This binds a fixed synthetic payload operation to its precommitted admission.
+It does not measure directory/index footprint, impose a filesystem quota or
+prevent allocation growth between observations. It adds no cleanup, schema,
+renderer access, arbitrary reservation input, production aggregate ownership,
+credential acceptance or milestone-completion claim.
+The child validates a journal claim from the trusted supervisor, not the SQLite
+row itself. The closed supervisor is responsible for ordering and checking the
+registry admission before journal binding. Same-user mutation races and dynamic
+reservation revocation are not established by this immutable fixture.

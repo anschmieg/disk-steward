@@ -194,12 +194,19 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         .register(FIXTURE_ID, parent.0, parent.1, root.0, root.1)
         .map_err(|e| format!("register store: {e}"))?;
     // Commit admission before child access; directory/index overhead is not measured.
-    const RESERVATION: u64 = 128 * 1024;
     let reserved = registry
-        .reserve(FIXTURE_ID, 0, RESERVATION)
+        .reserve(FIXTURE_ID, 0, store::WORKER_PAYLOAD_RESERVATION)
         .map_err(|e| format!("reserve indexed fixture: {e}"))?;
-    if reserved.reserved_bytes != RESERVATION {
+    if reserved.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION {
         return Err("registry reservation mismatch".into());
+    }
+    if matches!(
+        mode,
+        IndexedWorkerMode::Payload | IndexedWorkerMode::PartialPayload
+    ) {
+        store
+            .bind_worker_payload_reservation()
+            .map_err(|_| "bind worker payload reservation refused".to_owned())?;
     }
     let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let child_stdin = if descriptor_handoff {
@@ -313,7 +320,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             .inspect_stopped_worker_partial_payload(&receipt)
             .map_err(|_| "retained partial payload validation refused".to_owned())?;
         if partial.written_bytes != store::PARTIAL_PAYLOAD_FIXTURE_BYTES
-            || partial.high_water_bytes > RESERVATION
+            || partial.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
             || store.inspect_stopped_worker_payload(&receipt).is_ok()
         {
             return Err("partial payload observation or complete-payload refusal mismatch".into());
@@ -329,7 +336,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             .get(FIXTURE_ID)
             .map_err(|error| format!("read interrupted registry: {error}"))?
             .ok_or("interrupted registry row disappeared")?;
-        if record.reserved_bytes != RESERVATION
+        if record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
             || record.state != RState::NeedsReconciliation
             || record.prior_state != Some(RState::Registered)
             || (
@@ -341,7 +348,11 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         {
             return Err("interrupted registry identity/state mismatch".into());
         }
-        match reopened.reserve(FIXTURE_ID, RESERVATION, RESERVATION * 2) {
+        match reopened.reserve(
+            FIXTURE_ID,
+            store::WORKER_PAYLOAD_RESERVATION,
+            store::WORKER_PAYLOAD_RESERVATION * 2,
+        ) {
             Err(RegistryError::ReconciliationRequired) => {}
             Err(other) => {
                 return Err(format!(
@@ -359,7 +370,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             }
             Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
         }
-        println!("worker_joined=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reopened_reconciliation=true prior_registered=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes);
+        println!("worker_joined=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
         return Ok(());
     }
     if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
@@ -397,7 +408,9 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         let observation = store
             .inspect_stopped_worker_payload(&receipt)
             .map_err(|_| "stopped worker payload validation refused".to_owned())?;
-        if observation.high_water_bytes > RESERVATION || observation.written_bytes != 32 * 1024 {
+        if observation.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
+            || observation.written_bytes != 32 * 1024
+        {
             return Err("worker payload exceeds fixed admission".into());
         }
         Some(observation)
@@ -412,7 +425,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         .get(FIXTURE_ID)
         .map_err(|e| format!("read reopened registry: {e}"))?
         .ok_or("registry row disappeared")?;
-    if record.reserved_bytes != RESERVATION
+    if record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
         || record.state != RState::NeedsReconciliation
         || record.prior_state != Some(RState::Stopped)
         || (
@@ -424,7 +437,11 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     {
         return Err("reopened registry identity/state mismatch".into());
     }
-    match reopened.reserve(FIXTURE_ID, RESERVATION, RESERVATION * 2) {
+    match reopened.reserve(
+        FIXTURE_ID,
+        store::WORKER_PAYLOAD_RESERVATION,
+        store::WORKER_PAYLOAD_RESERVATION * 2,
+    ) {
         Err(RegistryError::ReconciliationRequired) => {}
         Err(other) => {
             return Err(format!(
@@ -445,11 +462,11 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     if let Some(observation) = payload_observation {
         let written = observation.written_bytes;
         let high_water = observation.high_water_bytes;
-        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     } else if descriptor_handoff {
-        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     } else {
-        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     }
     Ok(())
 }

@@ -1,0 +1,13 @@
+# M0: bind worker payload admission to the committed reservation
+
+The indexed supervisor already commits a fixed 128 KiB identity-bound registry reservation before launch, but the worker's local budget does not know that ceiling. Bind the exact fixed reservation into the owned store journal after successful registry admission and before issuing the directory capability. The binding is immutable and available only while the store is fresh; no caller-selected amount or new launch mode is introduced. Existing descriptor-only and stall fixtures retain their existing journal behavior.
+
+Both fixed complete and partial payload children require that exact journal reservation before creating payload.bin. PID/root/journal identity and exact bytes remain checked through the handoff. The shared accounting core receives the private fixed ceiling only for worker payloads. It checks admitted high-water plus the next chunk before writing, accounts actual observed allocation even on errors, and refuses continuation/readiness when observed growth exceeds the fixed ceiling, including after sync. Original in-process payload accounting remains unchanged.
+
+Use small disposable fixtures and injected observations to validate missing/mismatched binding refusal before creation, once-only binding and handoff ordering, failed-binding poisoning, prewrite ceiling refusal, and late over-cap growth retaining its charge while stopping further writes. Parent post-stop readback and reopened registry identity/reservation/reconciliation checks remain required. No schema migration, cleanup or renderer permission is added.
+
+This contributes to tasks0.1/0.3 and R5.8. It ties one synthetic admitted operation to its fixed payload cap, not directory/index footprint accounting, a hard filesystem allocation quota, production aggregate ownership, arbitrary remote transfer, OS containment, power-loss recovery, private authentication, preservation or milestone acceptance. Allocation can grow during a write before observation; late bytes must remain accounted and retained. Main remains eventual integration baseline; branch builds on PR92. Versions remain0.0.x/no release.
+
+The child validates the journal claim supplied by the trusted supervisor; it does not open SQLite or independently prove registry ownership. The closed supervisor orders and cross-checks admission and journal binding. Same-user mutation races and later reservation revocation are outside this fixed immutable fixture's claims.
+
+Late observed growth is charged to the child-local budget; this change does not add durable measured-byte fields to the registry. An incomplete child result retains the reservation and store for reconciliation rather than pretending the reservation proves actual disk usage.
