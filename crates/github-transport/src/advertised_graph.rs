@@ -56,6 +56,7 @@ impl RequiredObjectCoverageReport {
 pub enum RemoteRefMismatch {
     MissingName,
     DifferentTarget,
+    DifferentSymrefTarget,
 }
 
 /// Reachable typed objects plus names that still need explicit disposition.
@@ -173,6 +174,9 @@ impl AdvertisedPackReport {
                 None => unmatched.push((index, RemoteRefMismatch::MissingName)),
                 Some(advertised) if advertised.oid() != entry.oid() => {
                     unmatched.push((index, RemoteRefMismatch::DifferentTarget))
+                }
+                Some(advertised) if advertised.symref_target() != entry.symref_target() => {
+                    unmatched.push((index, RemoteRefMismatch::DifferentSymrefTarget))
                 }
                 _ => {}
             }

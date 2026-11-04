@@ -579,23 +579,25 @@ without sleeps and require the expected endpoint through the private TLS flow.
 
 ### Required ref names and manifest identity
 
-`RequiredRefManifest` captures caller-supplied raw ref names, typed IDs and a
+`RequiredRefManifest` captures caller-supplied raw ref names, typed IDs, optional symbolic targets and a
 canonical SHA-256 digest. It preserves distinct names pointing to the same ID,
 rejects duplicate names and validates the supported Git name subset. Names are
 copied with fallible allocation, sorted byte-for-byte and never converted into
 paths or commands. Bounds are 1–1,024 entries, 1,024 bytes per name and 64 KiB of
-name bytes in total. `check_unchanged` compares the full canonical entry sequence;
+combined name and symbolic-target bytes in total. Symbolic targets use the same
+1,024-byte name cap, must be full `refs/` names, and cannot point to themselves.
+`None` explicitly claims a direct ref. The digest uses the v2 domain and encodes
+target presence and length. `check_unchanged` compares the full canonical entry sequence;
 changed names, targets, kinds or membership require renewed verification.
 
 `check_required_refs` requires a current expected-repository context and the same
 transfer attempt as the decoded report. It checks typed object reachability and
 returns manifest-backed entries whose names are absent remotely or whose remote
-names point elsewhere. A local branch can need preservation even when its commit
+names point elsewhere, including a separate symbolic-target mismatch. A local branch can need preservation even when its commit
 is covered by another remote branch. Matching remote names do not promise future
 retention. The report borrows the immutable manifest and exposes no cleanup flag.
 
-The manifest is a caller claim, not discovery of all local refs, symref/detached
-HEAD state, working files, configuration, stashes or recoverable objects. It is
+The manifest is a caller claim, not discovery of all local refs or complete HEAD state, working files, configuration, stashes or recoverable objects. It is
 not a backup or an explicit discard decision, and it does not replace native
 source revalidation or a persisted receipt. Existing clock, worker/store,
 authentication, platform and cleanup gates remain. Tests include an independent
@@ -613,3 +615,7 @@ historical evidence, not a current-validity flag. The real-Git fixture recapture
 native refs, accepts an unchanged observation, then rejects a name-only rename
 that leaves the covered object IDs unchanged. These observations are not atomic
 and do not establish a comprehensive user-repository inventory.
+
+The disposable Git fixture also captures HEAD explicitly and detects switching its
+symbolic branch or detaching it at the same commit ID. This does not prove native
+capture completeness, atomicity, unborn-HEAD handling or absence of symref cycles.

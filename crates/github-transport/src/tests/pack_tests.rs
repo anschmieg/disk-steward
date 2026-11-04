@@ -747,16 +747,19 @@ fn named_ref_coverage_retains_names_needing_disposition_and_binds_attempt() {
     let expected = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let inputs = [
         RequiredRefInput {
+            symref_target: None,
             name: b"refs/tags/exact",
             oid: a_id,
             kind: K::Blob,
         },
         RequiredRefInput {
+            symref_target: None,
             name: b"refs/tags/local",
             oid: a_id,
             kind: K::Blob,
         },
         RequiredRefInput {
+            symref_target: None,
             name: b"refs/tags/moved",
             oid: a_id,
             kind: K::Blob,
@@ -821,6 +824,7 @@ fn named_ref_coverage_retains_names_needing_disposition_and_binds_attempt() {
     );
     let missing = RequiredRefManifest::capture(
         &[RequiredRefInput {
+            symref_target: None,
             name: b"refs/tags/missing",
             oid: [1; 20],
             kind: K::Blob,
@@ -863,6 +867,7 @@ fn named_coverage_recheck_refuses_changed_claims_without_reviving_old_evidence()
         .unwrap()
     };
     let original = capture(&[RequiredRefInput {
+        symref_target: None,
         name: b"refs/tags/a",
         oid: id,
         kind: K::Blob,
@@ -925,27 +930,32 @@ fn named_coverage_recheck_refuses_changed_claims_without_reviving_old_evidence()
         .unwrap();
     for claims in [
         vec![RequiredRefInput {
+            symref_target: None,
             name: b"refs/tags/renamed",
             oid: id,
             kind: K::Blob,
         }],
         vec![RequiredRefInput {
+            symref_target: None,
             name: b"refs/tags/a",
             oid: [1; 20],
             kind: K::Blob,
         }],
         vec![RequiredRefInput {
+            symref_target: None,
             name: b"refs/tags/a",
             oid: id,
             kind: K::Tree,
         }],
         vec![
             RequiredRefInput {
+                symref_target: None,
                 name: b"refs/tags/a",
                 oid: id,
                 kind: K::Blob,
             },
             RequiredRefInput {
+                symref_target: None,
                 name: b"refs/tags/new",
                 oid: id,
                 kind: K::Blob,
