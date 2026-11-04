@@ -1,0 +1,16 @@
+[package]
+name = "verification-admission"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+verification-budget = { path = "../verification-budget" }
+verification-store-registry = { path = "../verification-store-registry" }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true
