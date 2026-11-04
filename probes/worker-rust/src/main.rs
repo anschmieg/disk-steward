@@ -209,230 +209,416 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         free_bytes,
     )
     .map_err(|_| "coordinated pre-handoff admission refused".to_owned())?;
-    if admission.record.state != RState::Registered
-        || admission.record.prior_state.is_some()
-        || admission.record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
-        || (
-            admission.record.parent_dev,
-            admission.record.parent_ino,
-            admission.record.root_dev,
-            admission.record.root_ino,
-        ) != (parent.0, parent.1, root.0, root.1)
-        || admission_budget
-            .snapshot(admission.job_id)
-            .map(|job| job.state != JobState::Running || job.usage.stored_bytes != 0)
-            .unwrap_or(true)
-    {
-        return Err("coordinated pre-handoff admission record mismatch".into());
-    }
-    if matches!(
-        mode,
-        IndexedWorkerMode::Payload | IndexedWorkerMode::PartialPayload
-    ) {
-        store
-            .bind_worker_payload_reservation()
-            .map_err(|_| "bind worker payload reservation refused".to_owned())?;
-    }
-    let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
-    let child_stdin = if descriptor_handoff {
-        let root = store
-            .worker_stdin_once()
-            .map_err(|_| "prepare store descriptor handoff refused".to_owned())?;
-        Stdio::from(root)
-    } else {
-        Stdio::null()
-    };
-    let child_mode = match mode {
-        IndexedWorkerMode::Stall => "stall",
-        IndexedWorkerMode::DescriptorOnly => "store-handoff",
-        IndexedWorkerMode::Payload => "store-payload",
-        IndexedWorkerMode::PartialPayload => "store-payload-partial",
-    };
-    let mut child = Command::new(exe)
-        .env_clear()
-        .arg("--child")
-        .arg(child_mode)
-        .stdin(child_stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("start fixed child: {e}"))?;
-    let pid = child.id();
-    if let Err(e) = store.bind_worker(pid) {
-        return match stop_and_reap(&mut child) {
-            Ok(()) => Err(format!("bind worker: {e}")),
-            Err(s) => Err(format!("bind worker: {e}; cleanup failed: {s}")),
+    let admitted_record = admission.record.clone();
+    let mut registry_slot = Some(registry);
+    guard_indexed_attempt(&mut registry_slot, &admitted_record, |registry_slot| {
+        macro_rules! registry_mut {
+            () => {
+                registry_slot.as_mut().ok_or_else(|| {
+                    "registry lease unavailable inside admitted attempt".to_owned()
+                })?
+            };
+        }
+        macro_rules! registry_ref {
+            () => {
+                registry_slot.as_ref().ok_or_else(|| {
+                    "registry lease unavailable inside admitted attempt".to_owned()
+                })?
+            };
+        }
+        if admission.record.state != RState::Registered
+            || admission.record.prior_state.is_some()
+            || admission.record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+            || (
+                admission.record.parent_dev,
+                admission.record.parent_ino,
+                admission.record.root_dev,
+                admission.record.root_ino,
+            ) != (parent.0, parent.1, root.0, root.1)
+            || admission_budget
+                .snapshot(admission.job_id)
+                .map(|job| job.state != JobState::Running || job.usage.stored_bytes != 0)
+                .unwrap_or(true)
+        {
+            return Err("coordinated pre-handoff admission record mismatch".into());
+        }
+        if matches!(
+            mode,
+            IndexedWorkerMode::Payload | IndexedWorkerMode::PartialPayload
+        ) {
+            store
+                .bind_worker_payload_reservation()
+                .map_err(|_| "bind worker payload reservation refused".to_owned())?;
+        }
+        let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
+        let child_stdin = if descriptor_handoff {
+            let root = store
+                .worker_stdin_once()
+                .map_err(|_| "prepare store descriptor handoff refused".to_owned())?;
+            Stdio::from(root)
+        } else {
+            Stdio::null()
         };
-    }
-    let stdout = match child.stdout.take() {
-        Some(v) => v,
-        None => {
-            return match stop_and_reap(&mut child) {
-                Ok(()) => Err("child stdout unavailable".into()),
-                Err(e) => Err(format!("child stdout unavailable; cleanup failed: {e}")),
-            }
-        }
-    };
-    let (tx, rx) = mpsc::sync_channel(2);
-    let reader = match thread::Builder::new()
-        .name("indexed-store-stdout".into())
-        .spawn(move || read_bounded(stdout, tx))
-    {
-        Ok(v) => v,
-        Err(e) => {
-            return match stop_and_reap(&mut child) {
-                Ok(()) => Err(format!("start reader: {e}")),
-                Err(s) => Err(format!("start reader: {e}; cleanup failed: {s}")),
-            }
-        }
-    };
-    if mode == IndexedWorkerMode::PartialPayload {
-        let failure_deadline = Instant::now() + OUTER_DEADLINE;
-        let receive_time = failure_deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(receive_time) {
-            Ok(ReaderEvent::Finished {
-                bytes: 0,
-                failed: false,
-            }) => {}
-            Ok(event) => {
-                return finish_after_error(
-                    child,
-                    reader,
-                    rx,
-                    format!("partial payload child emitted unexpected stdout event: {event:?}"),
-                )
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return finish_after_error(
-                    child,
-                    reader,
-                    rx,
-                    "partial payload child did not finish before deadline".into(),
-                )
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return finish_after_error(
-                    child,
-                    reader,
-                    rx,
-                    "partial payload reader stopped without a result".into(),
-                )
-            }
-        }
-        let status = match wait_for_child_exit(&mut child, failure_deadline) {
-            Ok(status) => status,
-            Err(error) => return finish_after_error(child, reader, rx, error),
+        let child_mode = match mode {
+            IndexedWorkerMode::Stall => "stall",
+            IndexedWorkerMode::DescriptorOnly => "store-handoff",
+            IndexedWorkerMode::Payload => "store-payload",
+            IndexedWorkerMode::PartialPayload => "store-payload-partial",
         };
-        if let Err(error) = stop_and_reap(&mut child) {
+        let mut child = Command::new(exe)
+            .env_clear()
+            .arg("--child")
+            .arg(child_mode)
+            .stdin(child_stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("start fixed child: {e}"))?;
+        let pid = child.id();
+        if let Err(e) = store.bind_worker(pid) {
+            return match stop_and_reap(&mut child) {
+                Ok(()) => Err(format!("bind worker: {e}")),
+                Err(s) => Err(format!("bind worker: {e}; cleanup failed: {s}")),
+            };
+        }
+        let stdout = match child.stdout.take() {
+            Some(v) => v,
+            None => {
+                return match stop_and_reap(&mut child) {
+                    Ok(()) => Err("child stdout unavailable".into()),
+                    Err(e) => Err(format!("child stdout unavailable; cleanup failed: {e}")),
+                }
+            }
+        };
+        let (tx, rx) = mpsc::sync_channel(2);
+        let reader = match thread::Builder::new()
+            .name("indexed-store-stdout".into())
+            .spawn(move || read_bounded(stdout, tx))
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return match stop_and_reap(&mut child) {
+                    Ok(()) => Err(format!("start reader: {e}")),
+                    Err(s) => Err(format!("start reader: {e}; cleanup failed: {s}")),
+                }
+            }
+        };
+        if mode == IndexedWorkerMode::PartialPayload {
+            let failure_deadline = Instant::now() + OUTER_DEADLINE;
+            let receive_time = failure_deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(receive_time) {
+                Ok(ReaderEvent::Finished {
+                    bytes: 0,
+                    failed: false,
+                }) => {}
+                Ok(event) => {
+                    return finish_after_error(
+                        child,
+                        reader,
+                        rx,
+                        format!("partial payload child emitted unexpected stdout event: {event:?}"),
+                    )
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return finish_after_error(
+                        child,
+                        reader,
+                        rx,
+                        "partial payload child did not finish before deadline".into(),
+                    )
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return finish_after_error(
+                        child,
+                        reader,
+                        rx,
+                        "partial payload reader stopped without a result".into(),
+                    )
+                }
+            }
+            let status = match wait_for_child_exit(&mut child, failure_deadline) {
+                Ok(status) => status,
+                Err(error) => return finish_after_error(child, reader, rx, error),
+            };
+            if let Err(error) = stop_and_reap(&mut child) {
+                let _ = reader.join();
+                return Err(format!(
+                    "partial payload child shutdown unconfirmed: {error}"
+                ));
+            }
+            if reader.join().is_err() {
+                return Err("partial payload reader join failed; stop receipt withheld".into());
+            }
+            if status.code() != Some(86) {
+                return Err(
+                    "partial payload child did not report the fixed injected write failure".into(),
+                );
+            }
+            let receipt = StopReceipt::confirmed(store.token(), pid);
+            store
+                .record_stopped(&receipt)
+                .map_err(|error| format!("record interrupted worker stop: {error}"))?;
+            let partial = store
+                .inspect_stopped_worker_partial_payload(&receipt)
+                .map_err(|_| "retained partial payload validation refused".to_owned())?;
+            if partial.written_bytes != store::PARTIAL_PAYLOAD_FIXTURE_BYTES
+                || store.inspect_stopped_worker_payload(&receipt).is_ok()
+            {
+                return Err(
+                    "partial payload observation or complete-payload refusal mismatch".into(),
+                );
+            }
+            let latched = registry_mut!()
+                .require_reconciliation(FIXTURE_ID, RState::Registered)
+                .map_err(|error| format!("latch interrupted registry attempt: {error}"))?;
+            if latched.state != RState::NeedsReconciliation
+                || latched.prior_state != Some(RState::Registered)
+                || latched.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+                || (
+                    latched.parent_dev,
+                    latched.parent_ino,
+                    latched.root_dev,
+                    latched.root_ino,
+                ) != (parent.0, parent.1, root.0, root.1)
+            {
+                return Err(
+                    "live reconciliation latch changed store identity or reservation".into(),
+                );
+            }
+            match registry_mut!().reserve(
+                FIXTURE_ID,
+                store::WORKER_PAYLOAD_RESERVATION,
+                store::WORKER_PAYLOAD_RESERVATION * 2,
+            ) {
+                Err(RegistryError::ReconciliationRequired) => {}
+                Err(other) => {
+                    return Err(format!(
+                        "partial retry refused for unexpected reason: {other}"
+                    ))
+                }
+                Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
+            }
+            match registry_mut!().transition(
+                FIXTURE_ID,
+                RState::NeedsReconciliation,
+                RState::Active,
+            ) {
+                Err(RegistryError::InvalidTransition) => {}
+                Err(other) => {
+                    return Err(format!(
+                        "latched attempt transition refused unexpectedly: {other}"
+                    ))
+                }
+                Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+            }
+            let footprint = store
+                .observe_stopped_partial_fixture_footprint(registry_ref!(), &receipt)
+                .map_err(|_| "partial stopped fixture footprint observation refused".to_owned())?;
+            if footprint.object_count != 6 || footprint.observed_bytes < partial.high_water_bytes {
+                return Err("partial fixture snapshot count or payload coverage mismatch".into());
+            }
+            let free_after = store
+                .sample_free_space_bytes()
+                .map_err(|_| "sample stopped partial fixture free space refused".to_owned())?;
+            let accounted = settle_parent_store_budget(
+                &mut admission_budget,
+                admission.job_id,
+                footprint.observed_bytes,
+                free_after,
+                elapsed_millis(attempt_started),
+            )
+            .map_err(|_| "parent partial-fixture accounting refused".to_owned())?;
+            if accounted != footprint.observed_bytes
+                || footprint.observed_bytes > store::WORKER_PAYLOAD_RESERVATION
+                || admission_budget
+                    .snapshot(admission.job_id)
+                    .map(|job| {
+                        job.usage.stored_bytes != footprint.observed_bytes
+                            || job.state
+                                != (JobState::Failed {
+                                    reason: verification_budget::BlockReason::StoreIncomplete,
+                                    worker_stopped: true,
+                                })
+                    })
+                    .unwrap_or(true)
+            {
+                return Err("partial fixture accounting or reservation mismatch".into());
+            }
+            let live_state = store
+                .inspect_state()
+                .map_err(|error| format!("inspect interrupted store: {error}"))?;
+            drop(registry_slot.take());
+            drop(store);
+            let mut reopened = VerificationStoreRegistry::open(&registry_path)
+                .map_err(|error| format!("reopen interrupted registry: {error}"))?;
+            let record = reopened
+                .get(FIXTURE_ID)
+                .map_err(|error| format!("read interrupted registry: {error}"))?
+                .ok_or("interrupted registry row disappeared")?;
+            if record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+                || record.state != RState::NeedsReconciliation
+                || record.prior_state != Some(RState::Registered)
+                || (
+                    record.parent_dev,
+                    record.parent_ino,
+                    record.root_dev,
+                    record.root_ino,
+                ) != (parent.0, parent.1, root.0, root.1)
+            {
+                return Err("interrupted registry identity/state mismatch".into());
+            }
+            match reopened.reserve(
+                FIXTURE_ID,
+                store::WORKER_PAYLOAD_RESERVATION,
+                store::WORKER_PAYLOAD_RESERVATION * 2,
+            ) {
+                Err(RegistryError::ReconciliationRequired) => {}
+                Err(other) => {
+                    return Err(format!(
+                        "partial retry refused for unexpected reason: {other}"
+                    ))
+                }
+                Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
+            }
+            match reopened.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
+                Err(RegistryError::InvalidTransition) => {}
+                Err(other) => {
+                    return Err(format!(
+                        "partial retry lifecycle refused unexpectedly: {other}"
+                    ))
+                }
+                Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+            }
+            println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+            return Ok(());
+        }
+        if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
+            return finish_after_error(child, reader, rx, e);
+        }
+        if let Err(e) = registry_mut!().transition(FIXTURE_ID, RState::Registered, RState::Active) {
+            return finish_after_error(child, reader, rx, format!("activate store: {e}"));
+        }
+        if let Err(e) = stop_and_reap(&mut child) {
             let _ = reader.join();
-            return Err(format!(
-                "partial payload child shutdown unconfirmed: {error}"
-            ));
+            return Err(format!("child shutdown unconfirmed: {e}"));
         }
         if reader.join().is_err() {
-            return Err("partial payload reader join failed; stop receipt withheld".into());
+            return Err("reader join failed; stop receipt withheld".into());
         }
-        if status.code() != Some(86) {
-            return Err(
-                "partial payload child did not report the fixed injected write failure".into(),
-            );
+        let status = child
+            .try_wait()
+            .map_err(|e| format!("confirm child exit: {e}"))?
+            .ok_or("child exit missing")?;
+        let (bytes, failed) = drain_reader_result(&rx)?;
+        if failed || bytes != 1 {
+            return Err("unexpected worker output; stop receipt withheld".into());
         }
         let receipt = StopReceipt::confirmed(store.token(), pid);
         store
             .record_stopped(&receipt)
-            .map_err(|error| format!("record interrupted worker stop: {error}"))?;
-        let partial = store
-            .inspect_stopped_worker_partial_payload(&receipt)
-            .map_err(|_| "retained partial payload validation refused".to_owned())?;
-        if partial.written_bytes != store::PARTIAL_PAYLOAD_FIXTURE_BYTES
-            || store.inspect_stopped_worker_payload(&receipt).is_ok()
-        {
-            return Err("partial payload observation or complete-payload refusal mismatch".into());
-        }
-        let latched = registry
-            .require_reconciliation(FIXTURE_ID, RState::Registered)
-            .map_err(|error| format!("latch interrupted registry attempt: {error}"))?;
-        if latched.state != RState::NeedsReconciliation
-            || latched.prior_state != Some(RState::Registered)
-            || latched.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
-            || (
-                latched.parent_dev,
-                latched.parent_ino,
-                latched.root_dev,
-                latched.root_ino,
-            ) != (parent.0, parent.1, root.0, root.1)
-        {
-            return Err("live reconciliation latch changed store identity or reservation".into());
-        }
-        match registry.reserve(
+            .map_err(|e| format!("record stopped: {e}"))?;
+        registry_mut!()
+            .transition(FIXTURE_ID, RState::Active, RState::Stopped)
+            .map_err(|e| format!("record registry stop: {e}"))?;
+        let (_, live_state) = latch_stopped_registry_attempt(
+            registry_mut!(),
             FIXTURE_ID,
             store::WORKER_PAYLOAD_RESERVATION,
-            store::WORKER_PAYLOAD_RESERVATION * 2,
-        ) {
-            Err(RegistryError::ReconciliationRequired) => {}
-            Err(other) => {
-                return Err(format!(
-                    "partial retry refused for unexpected reason: {other}"
-                ))
+            parent,
+            root,
+            || {
+                store
+                    .inspect_state()
+                    .map_err(|_| "inspect stopped store refused".to_owned())
+            },
+        )?;
+        let payload_observation = if mode == IndexedWorkerMode::Payload {
+            let observation = store
+                .inspect_stopped_worker_payload(&receipt)
+                .map_err(|_| "stopped worker payload validation refused".to_owned())?;
+            if observation.written_bytes != 32 * 1024 {
+                return Err("worker payload exceeds fixed admission".into());
             }
-            Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
-        }
-        match registry.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
-            Err(RegistryError::InvalidTransition) => {}
-            Err(other) => {
-                return Err(format!(
-                    "latched attempt transition refused unexpectedly: {other}"
-                ))
+            Some(observation)
+        } else {
+            None
+        };
+        let fixture_footprint = match mode {
+            IndexedWorkerMode::Payload => Some(
+                store
+                    .observe_stopped_fixture_footprint(registry_ref!(), &receipt)
+                    .map_err(|_| {
+                        "complete stopped fixture footprint observation refused".to_owned()
+                    })?,
+            ),
+            IndexedWorkerMode::PartialPayload => Some(
+                store
+                    .observe_stopped_partial_fixture_footprint(registry_ref!(), &receipt)
+                    .map_err(|_| {
+                        "partial stopped fixture footprint observation refused".to_owned()
+                    })?,
+            ),
+            IndexedWorkerMode::Stall | IndexedWorkerMode::DescriptorOnly => Some(
+                store
+                    .observe_stopped_control_fixture_footprint(registry_ref!(), &receipt)
+                    .map_err(|_| {
+                        "stopped control fixture footprint observation refused".to_owned()
+                    })?,
+            ),
+        };
+        let parent_observed_accounted_bytes = if let Some(footprint) = fixture_footprint {
+            let free_after = store
+                .sample_free_space_bytes()
+                .map_err(|_| "sample stopped fixture free space refused".to_owned())?;
+            let expected_objects = if payload_observation.is_some() { 6 } else { 5 };
+            if footprint.object_count != expected_objects {
+                return Err("fixed fixture footprint object count mismatch".into());
             }
-            Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
-        }
-        let footprint = store
-            .observe_stopped_partial_fixture_footprint(&registry, &receipt)
-            .map_err(|_| "partial stopped fixture footprint observation refused".to_owned())?;
-        if footprint.object_count != 6 || footprint.observed_bytes < partial.high_water_bytes {
-            return Err("partial fixture snapshot count or payload coverage mismatch".into());
-        }
-        let free_after = store
-            .sample_free_space_bytes()
-            .map_err(|_| "sample stopped partial fixture free space refused".to_owned())?;
-        let accounted = settle_parent_store_budget(
-            &mut admission_budget,
-            admission.job_id,
-            footprint.observed_bytes,
-            free_after,
-            elapsed_millis(attempt_started),
-        )
-        .map_err(|_| "parent partial-fixture accounting refused".to_owned())?;
-        if accounted != footprint.observed_bytes
-            || footprint.observed_bytes > store::WORKER_PAYLOAD_RESERVATION
-            || admission_budget
-                .snapshot(admission.job_id)
-                .map(|job| {
-                    job.usage.stored_bytes != footprint.observed_bytes
-                        || job.state
-                            != (JobState::Failed {
-                                reason: verification_budget::BlockReason::StoreIncomplete,
-                                worker_stopped: true,
-                            })
-                })
-                .unwrap_or(true)
-        {
-            return Err("partial fixture accounting or reservation mismatch".into());
-        }
-        let live_state = store
-            .inspect_state()
-            .map_err(|error| format!("inspect interrupted store: {error}"))?;
-        drop(registry);
+            if payload_observation
+                .map(|payload| footprint.observed_bytes < payload.high_water_bytes)
+                .unwrap_or(false)
+            {
+                return Err("fixed fixture observation is below payload high-water".into());
+            }
+            let accounted = settle_parent_store_budget(
+                &mut admission_budget,
+                admission.job_id,
+                footprint.observed_bytes,
+                free_after,
+                elapsed_millis(attempt_started),
+            )
+            .map_err(|_| "parent fixture accounting refused".to_owned())?;
+            if accounted != footprint.observed_bytes
+                || footprint.observed_bytes > store::WORKER_PAYLOAD_RESERVATION
+                || admission_budget
+                    .snapshot(admission.job_id)
+                    .map(|job| {
+                        job.usage.stored_bytes != footprint.observed_bytes
+                            || job.state
+                                != (JobState::Failed {
+                                    reason: verification_budget::BlockReason::StoreIncomplete,
+                                    worker_stopped: true,
+                                })
+                    })
+                    .unwrap_or(true)
+            {
+                return Err("fixture accounting or reservation mismatch".into());
+            }
+            Some(accounted)
+        } else {
+            None
+        };
+        drop(registry_slot.take());
         drop(store);
         let mut reopened = VerificationStoreRegistry::open(&registry_path)
-            .map_err(|error| format!("reopen interrupted registry: {error}"))?;
+            .map_err(|e| format!("reopen private registry: {e}"))?;
         let record = reopened
             .get(FIXTURE_ID)
-            .map_err(|error| format!("read interrupted registry: {error}"))?
-            .ok_or("interrupted registry row disappeared")?;
+            .map_err(|e| format!("read reopened registry: {e}"))?
+            .ok_or("registry row disappeared")?;
         if record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
             || record.state != RState::NeedsReconciliation
-            || record.prior_state != Some(RState::Registered)
+            || record.prior_state != Some(RState::Stopped)
             || (
                 record.parent_dev,
                 record.parent_ino,
@@ -440,7 +626,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
                 record.root_ino,
             ) != (parent.0, parent.1, root.0, root.1)
         {
-            return Err("interrupted registry identity/state mismatch".into());
+            return Err("reopened registry identity/state mismatch".into());
         }
         match reopened.reserve(
             FIXTURE_ID,
@@ -450,196 +636,317 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             Err(RegistryError::ReconciliationRequired) => {}
             Err(other) => {
                 return Err(format!(
-                    "partial retry refused for unexpected reason: {other}"
+                    "reservation refusal was not reconciliation: {other}"
                 ))
             }
-            Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
+            Ok(_) => return Err("reopened registry unexpectedly admitted reservation".into()),
         }
         match reopened.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
             Err(RegistryError::InvalidTransition) => {}
             Err(other) => {
                 return Err(format!(
-                    "partial retry lifecycle refused unexpectedly: {other}"
+                    "retry refusal was not the expected lifecycle gate: {other}"
                 ))
             }
-            Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+            Ok(_) => return Err("reopened reconciliation row unexpectedly became active".into()),
         }
-        println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+        if let Some(observation) = payload_observation {
+            let written = observation.written_bytes;
+            let high_water = observation.high_water_bytes;
+            let footprint =
+                fixture_footprint.ok_or("complete payload footprint observation missing")?;
+            let accounted =
+                parent_observed_accounted_bytes.ok_or("parent fixture accounting missing")?;
+            println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+        } else if let Some(footprint) = fixture_footprint {
+            let accounted = parent_observed_accounted_bytes
+                .ok_or("parent control fixture accounting missing")?;
+            let handoff = if descriptor_handoff {
+                " descriptor_handoff=true"
+            } else {
+                ""
+            };
+            println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true{handoff} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_five_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+        } else {
+            return Err("stopped fixture accounting observation missing".into());
+        }
+        Ok(())
+    })
+}
+
+fn guard_indexed_attempt<T>(
+    registry_slot: &mut Option<verification_store_registry::VerificationStoreRegistry>,
+    expected: &verification_store_registry::StoreRecord,
+    operation: impl FnOnce(
+        &mut Option<verification_store_registry::VerificationStoreRegistry>,
+    ) -> Result<T, String>,
+) -> Result<T, String> {
+    match operation(registry_slot) {
+        Ok(value) => Ok(value),
+        Err(original) => {
+            let Some(registry) = registry_slot.as_mut() else {
+                // Deliberate close points occur only after the successful live latch.
+                return Err(original);
+            };
+            match latch_admitted_registry_row(registry, expected) {
+                Ok(()) => Err(original),
+                Err(()) => Err(format!(
+                    "{original}; live registry reconciliation latch could not be established"
+                )),
+            }
+        }
+    }
+}
+
+fn latch_admitted_registry_row(
+    registry: &mut verification_store_registry::VerificationStoreRegistry,
+    expected: &verification_store_registry::StoreRecord,
+) -> Result<(), ()> {
+    use verification_store_registry::StoreState;
+
+    let current = registry
+        .get(&expected.store_id)
+        .map_err(|_| ())?
+        .ok_or(())?;
+    if current.store_id != expected.store_id
+        || current.parent_dev != expected.parent_dev
+        || current.parent_ino != expected.parent_ino
+        || current.root_dev != expected.root_dev
+        || current.root_ino != expected.root_ino
+        || current.reserved_bytes != expected.reserved_bytes
+    {
+        return Err(());
+    }
+    if current.state == StoreState::NeedsReconciliation {
+        if !matches!(
+            current.prior_state,
+            Some(StoreState::Registered | StoreState::Active | StoreState::Stopped)
+        ) {
+            return Err(());
+        }
         return Ok(());
     }
-    if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
-        return finish_after_error(child, reader, rx, e);
-    }
-    if let Err(e) = registry.transition(FIXTURE_ID, RState::Registered, RState::Active) {
-        return finish_after_error(child, reader, rx, format!("activate store: {e}"));
-    }
-    if let Err(e) = stop_and_reap(&mut child) {
-        let _ = reader.join();
-        return Err(format!("child shutdown unconfirmed: {e}"));
-    }
-    if reader.join().is_err() {
-        return Err("reader join failed; stop receipt withheld".into());
-    }
-    let status = child
-        .try_wait()
-        .map_err(|e| format!("confirm child exit: {e}"))?
-        .ok_or("child exit missing")?;
-    let (bytes, failed) = drain_reader_result(&rx)?;
-    if failed || bytes != 1 {
-        return Err("unexpected worker output; stop receipt withheld".into());
-    }
-    let receipt = StopReceipt::confirmed(store.token(), pid);
-    store
-        .record_stopped(&receipt)
-        .map_err(|e| format!("record stopped: {e}"))?;
-    registry
-        .transition(FIXTURE_ID, RState::Active, RState::Stopped)
-        .map_err(|e| format!("record registry stop: {e}"))?;
-    let (_, live_state) = latch_stopped_registry_attempt(
-        &mut registry,
-        FIXTURE_ID,
-        store::WORKER_PAYLOAD_RESERVATION,
-        parent,
-        root,
-        || {
-            store
-                .inspect_state()
-                .map_err(|_| "inspect stopped store refused".to_owned())
-        },
-    )?;
-    let payload_observation = if mode == IndexedWorkerMode::Payload {
-        let observation = store
-            .inspect_stopped_worker_payload(&receipt)
-            .map_err(|_| "stopped worker payload validation refused".to_owned())?;
-        if observation.written_bytes != 32 * 1024 {
-            return Err("worker payload exceeds fixed admission".into());
-        }
-        Some(observation)
-    } else {
-        None
-    };
-    let fixture_footprint = match mode {
-        IndexedWorkerMode::Payload => Some(
-            store
-                .observe_stopped_fixture_footprint(&registry, &receipt)
-                .map_err(|_| "complete stopped fixture footprint observation refused".to_owned())?,
-        ),
-        IndexedWorkerMode::PartialPayload => Some(
-            store
-                .observe_stopped_partial_fixture_footprint(&registry, &receipt)
-                .map_err(|_| "partial stopped fixture footprint observation refused".to_owned())?,
-        ),
-        IndexedWorkerMode::Stall | IndexedWorkerMode::DescriptorOnly => Some(
-            store
-                .observe_stopped_control_fixture_footprint(&registry, &receipt)
-                .map_err(|_| "stopped control fixture footprint observation refused".to_owned())?,
-        ),
-    };
-    let parent_observed_accounted_bytes = if let Some(footprint) = fixture_footprint {
-        let free_after = store
-            .sample_free_space_bytes()
-            .map_err(|_| "sample stopped fixture free space refused".to_owned())?;
-        let expected_objects = if payload_observation.is_some() { 6 } else { 5 };
-        if footprint.object_count != expected_objects {
-            return Err("fixed fixture footprint object count mismatch".into());
-        }
-        if payload_observation
-            .map(|payload| footprint.observed_bytes < payload.high_water_bytes)
-            .unwrap_or(false)
-        {
-            return Err("fixed fixture observation is below payload high-water".into());
-        }
-        let accounted = settle_parent_store_budget(
-            &mut admission_budget,
-            admission.job_id,
-            footprint.observed_bytes,
-            free_after,
-            elapsed_millis(attempt_started),
-        )
-        .map_err(|_| "parent fixture accounting refused".to_owned())?;
-        if accounted != footprint.observed_bytes
-            || footprint.observed_bytes > store::WORKER_PAYLOAD_RESERVATION
-            || admission_budget
-                .snapshot(admission.job_id)
-                .map(|job| {
-                    job.usage.stored_bytes != footprint.observed_bytes
-                        || job.state
-                            != (JobState::Failed {
-                                reason: verification_budget::BlockReason::StoreIncomplete,
-                                worker_stopped: true,
-                            })
-                })
-                .unwrap_or(true)
-        {
-            return Err("fixture accounting or reservation mismatch".into());
-        }
-        Some(accounted)
-    } else {
-        None
-    };
-    drop(registry);
-    drop(store);
-    let mut reopened = VerificationStoreRegistry::open(&registry_path)
-        .map_err(|e| format!("reopen private registry: {e}"))?;
-    let record = reopened
-        .get(FIXTURE_ID)
-        .map_err(|e| format!("read reopened registry: {e}"))?
-        .ok_or("registry row disappeared")?;
-    if record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
-        || record.state != RState::NeedsReconciliation
-        || record.prior_state != Some(RState::Stopped)
-        || (
-            record.parent_dev,
-            record.parent_ino,
-            record.root_dev,
-            record.root_ino,
-        ) != (parent.0, parent.1, root.0, root.1)
+    if !matches!(
+        current.state,
+        StoreState::Registered | StoreState::Active | StoreState::Stopped
+    ) || current.prior_state.is_some()
     {
-        return Err("reopened registry identity/state mismatch".into());
+        return Err(());
     }
-    match reopened.reserve(
-        FIXTURE_ID,
-        store::WORKER_PAYLOAD_RESERVATION,
-        store::WORKER_PAYLOAD_RESERVATION * 2,
-    ) {
-        Err(RegistryError::ReconciliationRequired) => {}
-        Err(other) => {
-            return Err(format!(
-                "reservation refusal was not reconciliation: {other}"
-            ))
-        }
-        Ok(_) => return Err("reopened registry unexpectedly admitted reservation".into()),
-    }
-    match reopened.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
-        Err(RegistryError::InvalidTransition) => {}
-        Err(other) => {
-            return Err(format!(
-                "retry refusal was not the expected lifecycle gate: {other}"
-            ))
-        }
-        Ok(_) => return Err("reopened reconciliation row unexpectedly became active".into()),
-    }
-    if let Some(observation) = payload_observation {
-        let written = observation.written_bytes;
-        let high_water = observation.high_water_bytes;
-        let footprint =
-            fixture_footprint.ok_or("complete payload footprint observation missing")?;
-        let accounted =
-            parent_observed_accounted_bytes.ok_or("parent fixture accounting missing")?;
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
-    } else if let Some(footprint) = fixture_footprint {
-        let accounted =
-            parent_observed_accounted_bytes.ok_or("parent control fixture accounting missing")?;
-        let handoff = if descriptor_handoff {
-            " descriptor_handoff=true"
-        } else {
-            ""
-        };
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reconciliation_latched=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true{handoff} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_five_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
-    } else {
-        return Err("stopped fixture accounting observation missing".into());
+    let latched = registry
+        .require_reconciliation(&current.store_id, current.state)
+        .map_err(|_| ())?;
+    if latched.store_id != expected.store_id
+        || latched.parent_dev != expected.parent_dev
+        || latched.parent_ino != expected.parent_ino
+        || latched.root_dev != expected.root_dev
+        || latched.root_ino != expected.root_ino
+        || latched.reserved_bytes != expected.reserved_bytes
+        || latched.state != StoreState::NeedsReconciliation
+        || latched.prior_state != Some(current.state)
+    {
+        return Err(());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod admitted_error_latch_tests {
+    use super::guard_indexed_attempt;
+    use super::store::OwnedStore;
+    use verification_store_registry::{
+        RegistryError, StoreRecord, StoreState, VerificationStoreRegistry,
+    };
+
+    const RESERVATION: u64 = 128 * 1024;
+
+    fn fixture(target: StoreState) -> (OwnedStore, VerificationStoreRegistry, StoreRecord) {
+        const ID: &str = "aabbccddeeff00112233445566778899";
+        let store = OwnedStore::create().unwrap();
+        let path = store.control_registry_path().unwrap();
+        let (parent, root) = store.control_identity().unwrap();
+        let mut registry = VerificationStoreRegistry::open(path).unwrap();
+        registry
+            .register(ID, parent.0, parent.1, root.0, root.1)
+            .unwrap();
+        let expected = registry.reserve(ID, 0, RESERVATION).unwrap();
+        if matches!(target, StoreState::Active | StoreState::Stopped) {
+            registry
+                .transition(ID, StoreState::Registered, StoreState::Active)
+                .unwrap();
+        }
+        if target == StoreState::Stopped {
+            registry
+                .transition(ID, StoreState::Active, StoreState::Stopped)
+                .unwrap();
+        }
+        if target == StoreState::NeedsReconciliation {
+            registry
+                .require_reconciliation(ID, StoreState::Registered)
+                .unwrap();
+        }
+        (store, registry, expected)
+    }
+
+    #[test]
+    fn injected_errors_latch_actual_registered_active_and_stopped_states() {
+        for state in [
+            StoreState::Registered,
+            StoreState::Active,
+            StoreState::Stopped,
+        ] {
+            let (_store, registry, expected) = fixture(state);
+            let mut slot = Some(registry);
+            assert_eq!(
+                guard_indexed_attempt(&mut slot, &expected, |_| {
+                    Err::<(), _>("injected post-admission failure".into())
+                }),
+                Err("injected post-admission failure".into())
+            );
+            let registry = slot.as_ref().unwrap();
+            let row = registry.get(&expected.store_id).unwrap().unwrap();
+            assert_eq!(row.state, StoreState::NeedsReconciliation);
+            assert_eq!(row.prior_state, Some(state));
+            assert_eq!(row.reserved_bytes, RESERVATION);
+            assert_eq!(
+                (row.parent_dev, row.parent_ino, row.root_dev, row.root_ino),
+                (
+                    expected.parent_dev,
+                    expected.parent_ino,
+                    expected.root_dev,
+                    expected.root_ino
+                )
+            );
+            assert!(matches!(
+                slot.as_mut()
+                    .unwrap()
+                    .reserve(&expected.store_id, RESERVATION, RESERVATION + 1),
+                Err(RegistryError::ReconciliationRequired)
+            ));
+            assert!(matches!(
+                slot.as_mut().unwrap().transition(
+                    &expected.store_id,
+                    StoreState::NeedsReconciliation,
+                    StoreState::Active
+                ),
+                Err(RegistryError::InvalidTransition)
+            ));
+        }
+    }
+
+    #[test]
+    fn already_latched_error_is_preserved_without_changing_prior_state() {
+        let (_store, registry, expected) = fixture(StoreState::NeedsReconciliation);
+        let mut slot = Some(registry);
+        assert_eq!(
+            guard_indexed_attempt(&mut slot, &expected, |_| {
+                Err::<(), _>("injected later failure".into())
+            }),
+            Err("injected later failure".into())
+        );
+        let row = slot
+            .as_ref()
+            .unwrap()
+            .get(&expected.store_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, StoreState::NeedsReconciliation);
+        assert_eq!(row.prior_state, Some(StoreState::Registered));
+        assert_eq!(row.reserved_bytes, RESERVATION);
+    }
+
+    #[test]
+    fn missing_or_mismatched_admitted_row_refuses_latch_without_mutation() {
+        for mismatch in ["missing", "identity", "reservation"] {
+            let (_store, registry, admitted) = fixture(StoreState::Registered);
+            let mut expected = admitted.clone();
+            match mismatch {
+                "missing" => expected.store_id = "00112233445566778899aabbccddeeff".into(),
+                "identity" => expected.root_ino = expected.root_ino.saturating_add(1),
+                "reservation" => expected.reserved_bytes += 1,
+                _ => unreachable!(),
+            }
+            let mut slot = Some(registry);
+            let error = guard_indexed_attempt(&mut slot, &expected, |_| {
+                Err::<(), _>("original launch failure".into())
+            })
+            .unwrap_err();
+            assert!(
+                error.starts_with("original launch failure; live registry reconciliation latch")
+            );
+            let registry = slot.as_ref().unwrap();
+            let row = registry.get(&admitted.store_id).unwrap().unwrap();
+            assert_eq!(row.state, StoreState::Registered);
+            assert_eq!(row.prior_state, None);
+            assert_eq!(row.reserved_bytes, RESERVATION);
+        }
+    }
+
+    #[test]
+    fn cleanup_states_are_not_adopted_or_reset_by_error_finalization() {
+        for complete in [false, true] {
+            let (_store, mut registry, expected) = fixture(StoreState::Stopped);
+            registry
+                .transition(
+                    &expected.store_id,
+                    StoreState::Stopped,
+                    StoreState::CleanupPending,
+                )
+                .unwrap();
+            if complete {
+                registry
+                    .transition(
+                        &expected.store_id,
+                        StoreState::CleanupPending,
+                        StoreState::CleanupComplete,
+                    )
+                    .unwrap();
+            }
+            let retained = registry.get(&expected.store_id).unwrap().unwrap();
+            let mut slot = Some(registry);
+            let error = guard_indexed_attempt(&mut slot, &expected, |_| {
+                Err::<(), _>("original lifecycle failure".into())
+            })
+            .unwrap_err();
+            assert!(
+                error.starts_with("original lifecycle failure; live registry reconciliation latch")
+            );
+            assert_eq!(
+                slot.as_ref()
+                    .unwrap()
+                    .get(&expected.store_id)
+                    .unwrap()
+                    .unwrap(),
+                retained
+            );
+        }
+    }
+
+    #[test]
+    fn no_slot_keeps_original_error_and_success_does_not_latch() {
+        let (_store, registry, expected) = fixture(StoreState::Registered);
+        let mut closed = None;
+        assert_eq!(
+            guard_indexed_attempt(&mut closed, &expected, |_| {
+                Err::<(), _>("original closed-lease error".into())
+            }),
+            Err("original closed-lease error".into())
+        );
+
+        let mut slot = Some(registry);
+        assert_eq!(
+            guard_indexed_attempt(&mut slot, &expected, |_| Ok::<_, String>(7)),
+            Ok(7)
+        );
+        let row = slot
+            .as_ref()
+            .unwrap()
+            .get(&expected.store_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, StoreState::Registered);
+        assert_eq!(row.prior_state, None);
+    }
 }
 
 /// Charge the caller's validated stopped-worker byte observation to the parent
