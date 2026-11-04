@@ -101,6 +101,7 @@ type SubtreeProgress = FolderTreeSummary & {
     systemBoundaries: number;
     depthLimitedDirectories: number;
     pendingDirectories: number;
+    inaccessibleDirectories: number;
   };
   scanReleased?: boolean;
 };
@@ -790,6 +791,10 @@ export default function FolderInventoryPanel({
                     <dd>
                       {treeSummary.coverageBreakdown.depthLimitedDirectories}
                     </dd>
+                    <dt>Directories denied at open</dt>
+                    <dd>
+                      {treeSummary.coverageBreakdown.inaccessibleDirectories}
+                    </dd>
                     <dt>Unfinished directory streams</dt>
                     <dd>{treeSummary.coverageBreakdown.pendingDirectories}</dd>
                   </dl>
@@ -801,6 +806,16 @@ export default function FolderInventoryPanel({
                     known traversal frontier, not all remaining directories or
                     files. A zero count does not prove that an area is clean.
                   </p>
+                  {treeSummary.coverageBreakdown.inaccessibleDirectories >
+                    0 && (
+                    <p>
+                      Some child directories denied read access and were not
+                      opened. Their contents remain unknown. The scan continued
+                      through readable siblings without retrying denied folders.
+                      After changing access, refresh the current folder and
+                      start a new subtree scan to retry.
+                    </p>
+                  )}
                 </section>
               )}
               <p>
@@ -1181,4 +1196,6 @@ const summaryReasons: Record<string, string> = {
   time_limit: "The observation time limit was reached.",
   logical_size_overflow: "The logical-byte total exceeded the supported range.",
   directory_changed: "A directory changed during inspection.",
+  directory_access_denied:
+    "Some child directories denied read access; their contents remain unknown.",
 };

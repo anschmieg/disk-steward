@@ -970,6 +970,7 @@ const chunkProgress = {
     systemBoundaries: 0,
     depthLimitedDirectories: 0,
     pendingDirectories: 1,
+    inaccessibleDirectories: 0,
   },
 };
 
@@ -1113,6 +1114,7 @@ test("subtree coverage exposes distinct boundary reasons without implying comple
         systemBoundaries: 8,
         depthLimitedDirectories: 9,
         pendingDirectories: 0,
+        inaccessibleDirectories: 10,
       },
     });
   render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
@@ -1135,6 +1137,7 @@ test("subtree coverage exposes distinct boundary reasons without implying comple
     ["System directory boundaries", "8"],
     ["Directories beyond the depth limit", "9"],
     ["Unfinished directory streams", "0"],
+    ["Directories denied at open", "10"],
   ]) {
     expect(
       within(details).getByText(label).nextElementSibling,
@@ -1144,6 +1147,9 @@ test("subtree coverage exposes distinct boundary reasons without implying comple
   expect(details).toHaveTextContent(
     "A zero count does not prove that an area is clean",
   );
+  expect(details).toHaveTextContent("Their contents remain unknown");
+  expect(details).toHaveTextContent("without retrying denied folders");
+  expect(details).toHaveTextContent("start a new subtree scan to retry");
   expect(screen.getByText("Incomplete subtree coverage.")).toBeInTheDocument();
   expect(screen.getByRole("table").textContent).toBe(page);
 });

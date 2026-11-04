@@ -7,6 +7,7 @@ use super::{
 use crate::global_exclusions::SummaryExclusionPolicy;
 use disk_steward_core::{InventoryItemId, RevisionId};
 use rustix::fs::{fstat, openat, statat, AtFlags, Dir, FileType, Mode, OFlags, Stat};
+use rustix::io::Errno;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -45,7 +46,22 @@ pub(crate) struct CoverageBreakdown {
     pub managed_boundaries: u32,
     pub system_boundaries: u32,
     pub depth_limited_directories: u32,
+    pub inaccessible_directories: u32,
     pub pending_directories: u32,
+}
+
+fn is_permission_denial(error: Errno) -> bool {
+    error == Errno::ACCESS || error == Errno::PERM
+}
+
+fn denied_child_binding_matches(named_before: &Stat, named_after: &Stat, root_device: u64) -> bool {
+    identity(named_before) == identity(named_after)
+        && root_metadata_matches(named_before, named_after)
+        && FileType::from_raw_mode(named_before.st_mode) == FileType::Directory
+        && FileType::from_raw_mode(named_after.st_mode) == FileType::Directory
+        && named_after.st_dev as u64 == root_device
+        && !is_dataless(named_before)
+        && !is_dataless(named_after)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,13 +335,35 @@ impl SubtreeJob {
                 return Err("A folder changed during inspection.");
             }
             guard()?;
-            let child_fd = openat(
+            let child_fd = match openat(
                 &self.frames[top].fd,
                 name.as_c_str(),
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
-            )
-            .map_err(|_| "A folder could not be opened safely.")?;
+            ) {
+                Ok(fd) => fd,
+                Err(error) if is_permission_denial(error) => {
+                    guard()?;
+                    self.validate_stack(&guard)?;
+                    let named_after = statat(
+                        &self.frames[top].fd,
+                        name.as_c_str(),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    )
+                    .map_err(|_| "A folder changed during inspection.")?;
+                    guard()?;
+                    if !denied_child_binding_matches(&named_before, &named_after, self.root_device)
+                    {
+                        return Err("A folder changed during inspection.");
+                    }
+                    self.validate_stack(&guard)?;
+                    guard()?;
+                    self.skip(|coverage| coverage.inaccessible_directories += 1);
+                    self.stop_reason.get_or_insert("directory_access_denied");
+                    continue;
+                }
+                Err(_) => return Err("A folder could not be opened safely."),
+            };
             guard()?;
             let child_stat = fstat(&child_fd).map_err(|_| "A folder changed during inspection.")?;
             guard()?;
@@ -669,6 +707,116 @@ mod tests {
         assert_eq!(final_page.coverage_breakdown.managed_boundaries, 1);
         assert_eq!(final_page.coverage_breakdown.system_boundaries, 1);
         assert_eq!(final_page.summary.skipped_entries, 2);
+    }
+
+    #[test]
+    fn only_permission_errnos_qualify_for_inaccessible_gaps() {
+        use rustix::io::Errno;
+
+        assert!(is_permission_denial(Errno::ACCESS));
+        assert!(is_permission_denial(Errno::PERM));
+        assert!(!is_permission_denial(Errno::NOENT));
+        assert!(!is_permission_denial(Errno::IO));
+    }
+
+    #[test]
+    fn denied_child_must_still_match_full_named_metadata() {
+        use rustix::fs::{statat, AtFlags, CWD};
+
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let before = statat(CWD, &first, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let other = statat(CWD, &second, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert!(!denied_child_binding_matches(
+            &before,
+            &other,
+            before.st_dev as u64
+        ));
+
+        let mut changed = before;
+        changed.st_mtime_nsec = changed.st_mtime_nsec.wrapping_add(1);
+        assert!(!denied_child_binding_matches(
+            &before,
+            &changed,
+            before.st_dev as u64
+        ));
+        assert!(!denied_child_binding_matches(
+            &before,
+            &before,
+            (before.st_dev as u64).wrapping_add(1)
+        ));
+        assert!(denied_child_binding_matches(
+            &before,
+            &before,
+            before.st_dev as u64
+        ));
+    }
+
+    #[test]
+    fn inaccessible_child_is_a_gap_and_readable_siblings_continue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: std::path::PathBuf,
+            mode: u32,
+        }
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.path,
+                    std::fs::Permissions::from_mode(self.mode),
+                );
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let denied = root.path().join("denied");
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::write(denied.join("unreadable-content"), b"fixture").unwrap();
+        std::fs::write(root.path().join("sibling"), b"ok").unwrap();
+        let original_mode = std::fs::metadata(&denied).unwrap().permissions().mode();
+        let _restore = RestorePermissions {
+            path: denied.clone(),
+            mode: original_mode,
+        };
+        std::fs::set_permissions(
+            &denied,
+            std::fs::Permissions::from_mode(original_mode & !0o777),
+        )
+        .unwrap();
+
+        let (session, _) = session(root.path());
+        let mut job = SubtreeJob::start(
+            &session,
+            SummaryExclusionPolicy::empty_for_tests(),
+            RevisionId::new(),
+        )
+        .unwrap();
+        let final_page = drain(&mut job).pop().unwrap();
+        if final_page.coverage_breakdown.inaccessible_directories == 1 {
+            assert_eq!(final_page.summary.files_observed, 1);
+            assert_eq!(final_page.summary.skipped_entries, 1);
+            assert_eq!(
+                final_page.summary.stop_reason,
+                Some("directory_access_denied")
+            );
+            assert!(!final_page.summary.coverage_complete);
+            eprintln!("verified real denied child open with readable sibling preserved");
+        } else {
+            // Root or elevated test processes may still open mode-000 directories.
+            eprintln!("mode-000 directory remained accessible; permission gap path not exercised");
+            assert_eq!(final_page.summary.files_observed, 2);
+            assert_eq!(final_page.summary.skipped_entries, 0);
+        }
+        drop(_restore);
+        assert_eq!(
+            std::fs::read(denied.join("unreadable-content")).unwrap(),
+            b"fixture"
+        );
+        assert_eq!(std::fs::read(root.path().join("sibling")).unwrap(), b"ok");
     }
 
     #[test]
