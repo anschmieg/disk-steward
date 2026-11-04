@@ -3,6 +3,7 @@ import type {
   PilotContext,
   ReviewPilotRecorder,
 } from "../review-pilot-contract";
+import ModeratorObservations from "./ModeratorObservations";
 import "./ReviewPilotPanel.css";
 
 type Props = {
@@ -158,6 +159,7 @@ export default function ReviewPilotPanel({
               decisions.
             </p>
           </section>
+          <ModeratorObservations report={recorder.report} busy={busy} />
           <label className="review-pilot-report">
             Pilot session report
             <textarea
