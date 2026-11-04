@@ -14,6 +14,13 @@ reading after 64 KiB plus one byte, and applies a one-second monotonic deadline.
 On either limit it kills the child, waits for its exit, and joins the reader
 before reporting success.
 
+The shared stdout reader accepts readiness only when the first byte is exactly
+`R`. Other first bytes fail the reader without emitting readiness. Empty EOF
+remains a zero-byte completion for the fixed partial-write failure case.
+Interrupted reads have a cumulative allowance of sixteen; the seventeenth
+fails, and successful reads do not reset the allowance. These checks bound
+protocol handling, not the duration of a blocking OS read or arbitrary peers.
+
 The executable path comes only from `current_exe()`. The stdout parent cases accept none or `--run`; the private child dispatcher accepts only the two
 fixed modes. These stdout cases have no data-file, network, credential, shell, or renderer
 operations, and their children create no descendants.
@@ -163,3 +170,248 @@ stop and registry reopen. Reopen must refuse further reservation growth until
 reconciliation. This is an admission-bookkeeping exercise, not a measurement of
 the fixture's footprint or proof of global aggregate enforcement. The probe
 retains its per-store private control layout and grants no cleanup authority.
+
+All four fixed current-executable child launch paths clear the caller environment
+before spawning. They need no ambient PATH, Git configuration, credentials or
+caller-selected temporary directory. A fixed synthetic sentinel is rejected by
+the private child dispatcher without printing its value. Integration tests first
+prove that direct inheritance is detected, then run stdout supervision, store
+worker, creator-death reinspection and indexed store worker with that sentinel
+set in their parent. This checks the actual launch boundary, not OS-level process
+isolation or production transport integration. Local evidence is macOS; other
+supported-platform behavior requires its current-head CI.
+
+## Descriptor-only store handoff
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-handoff`
+uses the indexed-store fixture with an additional fixed capability handoff. It
+commits the same identity-bound 128 KiB registry reservation before spawn, then
+passes a one-shot clone of the verified store directory as the exact child’s
+stdin. The child receives no path or descriptor-number argument.
+
+Before emitting its readiness byte, the child checks directory type, private
+owner/mode, root device/inode and a bounded regular ownership journal naming its
+own PID. The initial parent bind may be observed as a created or partial journal;
+only valid prefixes may wait, for at most 256 polls and 500 ms. Reads are bounded
+to 513 bytes with at most 16 interruptions, and the named journal is reopened to
+reject replacement. Changed, malformed or foreign identities refuse readiness.
+A failed handoff attempt cannot be renewed by restoring marker permissions.
+
+The child performs read-only validation and the existing fixed stall. After
+readiness the parent kills/reaps the exact child, joins its reader, records
+stopped state, and checks the reopened registry remains reconciliation-required.
+Only then does the report include `descriptor_handoff=true`. The fixture and
+reservation remain retained; no cleanup, payload write, Git access or credential
+operation is authorized by this mode. Existing fixed modes keep their behavior.
+
+Passing a directory descriptor is not an OS sandbox or process-tree containment.
+Cooperative deadlines and ordinary local kill/wait/join evidence do not prove
+hard latency under OS stalls, atomicity against same-user interference, power-loss
+durability or production verification ownership. Linux/macOS paths are supported
+by the probe; this change was locally exercised on macOS arm64 and still needs
+current-head cross-platform CI.
+
+## Fixed payload through the worker descriptor
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-payload`
+adds a separate fixed synthetic write to the directory handoff. The parent
+commits the same 128 KiB identity-bound reservation before launch. The child
+validates its bound directory capability, then writes only `payload.bin` with
+the existing deterministic 32 KiB generator through the shared accounting core.
+That core preserves native free-space sampling, the 2 GiB reserve plus 1 MiB
+headroom, admission checks, allocation-aware high-water charges, partial-write
+accounting, exclusive no-follow creation, identity checks and synchronization.
+The original in-process payload mode uses that same core.
+
+Readiness requires the full fixed write. After exact child shutdown and reader
+join, the parent requires the matching stop receipt and stopped journal before
+readback. It checks all bytes through a held descriptor, exact file metadata,
+size and identity, named-file identity and metadata, EOF, and final unchanged
+metadata. Readback has a cooperative one-second deadline and bounded reads and
+interruptions. The report requires payload high-water usage within the committed
+reservation; reopening the registry must still yield reconciliation-required
+state with the reservation retained. Neither success nor failure deletes the
+payload or authorizes cleanup.
+
+The command accepts no path, data, FD number, endpoint, credential or cleanup
+argument. Missing/wrong capabilities, repeat writes, changed journals/files and
+unconfirmed worker stop refuse acceptance. This is synthetic worker/store
+composition only: no Git transfer, durable byte receipt, directory/index
+footprint accounting, OS hard latency/process-tree/RSS guarantee, private
+authentication, atomicity against same-user interference or milestone completion
+is established. Current-head platform CI remains required.
+
+## Partial payload failure before readiness
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-payload-partial`
+checks a separate fixed failure path. The environment-cleared child receives
+only the identity-bound store directory, writes a deterministic 2 KiB prefix
+through the shared payload accounting core, then injects a write error. It exits
+with a fixed failure status and emits no readiness bytes. This does not simulate
+a real disk-full error or arbitrary kill timing.
+
+The parent requires bounded empty stdout completion, exact child shutdown and
+reader join, and the expected exit status before inspecting the partial file.
+The complete-payload inspector must reject it. A separate fixed partial
+observation checks the prefix, EOF, private metadata, held and named identity,
+and unchanged metadata under the same cooperative readback deadline. The
+observation is evidence of an incomplete attempt, never successful verification.
+
+The 128 KiB reservation remains retained. Because readiness never succeeded,
+the registry never becomes Active; reopening requires reconciliation with prior
+Registered state and refuses retry and reservation growth. The file remains in
+the task-owned fixture. No cleanup authority or source-repository access is
+added. This is process-exit evidence, not synchronized power-loss durability,
+production worker isolation, global store accounting, credential validation or
+milestone acceptance.
+
+## Worker reservation binding
+
+The indexed complete and partial payload fixtures bind the fixed 128 KiB
+registry reservation into the owner journal after admission succeeds and before
+handing the directory to the child. The once-only binding is available only in
+the fresh store phase. The child requires that exact reservation together with
+its PID, root identity and unchanged bound journal before creating the payload.
+The descriptor-only and stall modes retain their unreserved journal behavior.
+
+The worker writer uses the bound ceiling as an additional check around the
+shared accounting core: high-water usage plus the next chunk must fit before
+writing. Actual allocation growth is charged before an over-cap observation
+refuses further work, including after synchronization. No readiness is emitted
+on failure; partial bytes and the durable reservation remain retained. The
+parent still requires stopped-worker identity-bound readback and registry reopen
+reconciliation checks.
+
+This binds a fixed synthetic payload operation to its precommitted admission.
+It does not measure directory/index footprint, impose a filesystem quota or
+prevent allocation growth between observations. It adds no cleanup, schema,
+renderer access, arbitrary reservation input, production aggregate ownership,
+credential acceptance or milestone-completion claim.
+The child validates a journal claim from the trusted supervisor, not the SQLite
+row itself. The closed supervisor is responsible for ordering and checking the
+registry admission before journal binding. Same-user mutation races and dynamic
+reservation revocation are not established by this immutable fixture.
+
+The partial-payload fixture also persists `NeedsReconciliation` through the
+live registry before reopening it, after confirmed child shutdown and retained
+prefix inspection. It checks immediate reservation-growth and lifecycle retry
+refusal, then requires reopening to preserve the same identity, prior Registered
+state and 128 KiB reservation. `reconciliation_latched=true` reports this
+bookkeeping check; it is not a completed reconciliation or cleanup receipt.
+
+## Fixed fixture footprint observations
+
+The complete and partial indexed payload fixtures observe their known parent/store
+directories, owner journal, payload, registry database and lease after confirmed
+worker shutdown and validated payload readback. Each requires exact entry lists,
+private metadata, distinct identities, held/named agreement and unchanged
+metadata across the observation. Unknown entries, SQLite sidecars or changed
+objects refuse the result. Observation uses checked sums of the larger of each
+object's logical length and native allocated blocks, with cooperative deadlines.
+
+The report includes the six-object byte total and count and checks the snapshot
+against 128 KiB. Both modes charge their observation once into the parent
+budget; the existing reservation still admits the payload. This does not establish
+a whole-store quota or lifetime allocation peak. Descriptor-only and stall modes
+use a separate five-object observer for the same controls without payload. A
+payload entry in those modes refuses the observation. Complete and partial
+observers require their own
+exact payload length and content; neither accepts the other's payload. Files and
+reservations remain retained; no cleanup eligibility,
+recovered-space claim, production aggregate accounting, OS containment or
+milestone acceptance is added.
+The report labels this as `fixture_snapshot=before_registry_reopen`. Reopening
+and later SQLite writes can change control-file allocation after the snapshot;
+the value is not a final or maximum footprint for the probe lifecycle.
+
+## Parent observed-store accounting after worker shutdown
+
+The complete and partial indexed payload fixtures each charge their validated
+six-object snapshot once into the same parent budget job that admitted the
+worker. Both report `parent_accounting_scope=fixed_six_objects`; the separate
+payload observation remains visible and is not added again. Partial content is
+still validated as an incomplete 2 KiB prefix, and the complete-payload inspector
+must reject it. The partial snapshot follows its live reconciliation latch.
+
+Descriptor-only and stall modes charge their validated five-object control
+snapshot to their own admission job, reporting
+`parent_accounting_scope=fixed_five_objects` and `fixture_objects=5`. No-payload
+observation requires a stopped receipt and no journal payload-reservation claim;
+it grants no payload-writing authority. It includes both directories, the owner
+journal, registry database and lease, with the same strict roster and metadata
+checks. These jobs also settle as incomplete with confirmed worker stop.
+
+The supervisor samples free space through the owned directory handle after the
+observation, records the observed bytes, then marks verification incomplete and
+acknowledges the already confirmed worker stop. Reports expose
+`parent_observed_accounted_bytes`, `parent_budget_incomplete=true` and
+`parent_worker_stopped=true`. A numeric budget refusal retains the charged bytes
+and its original failure reason. Repeating settlement refuses before a second
+charge. The fixed observation-bound check also follows charging.
+
+All snapshots remain before-registry-reopen checkpoints. Later SQLite writes
+can change allocation, and earlier peaks remain unknown. Neither a complete
+synthetic payload nor a stopped child proves remote verification success. The budget retains usage, the registry
+retains its reservation and reconciliation blocker, and no cleanup is confirmed
+or authorized. Continuous parent monitoring, app-wide ownership and production
+Git verification remain separate work.
+
+Parent settlement checks elapsed milliseconds against the existing five-minute
+budget using one monotonic start captured immediately before coordinated
+admission. The start is retained through worker shutdown and readback; it is not
+renewed for settlement. Observed bytes are charged before the elapsed check. A
+timeout retains those bytes and is acknowledged as worker-stopped; an earlier
+storage or free-space refusal keeps its first reason.
+`parent_elapsed_checked=true` identifies the successful elapsed checkpoint in
+all indexed mode reports. This is a stopped checkpoint, not continuous parent
+monitoring, a bound on noninterruptible system calls, or proof of production
+verification completion.
+
+All indexed modes also latch `NeedsReconciliation` in the live registry before
+fallible post-stop inspection or accounting. For complete, descriptor-only and
+stall modes, the latch follows the confirmed `Active` to `Stopped` transition
+and retains `prior_state=Stopped`. The partial mode keeps its existing
+`prior_state=Registered` latch. `reconciliation_latched=true` identifies the
+live check, including immediate reservation-growth and lifecycle retry refusal.
+Reopening must retain the same identity and reservation. A later observation
+failure cannot undo this latch; it does not establish completed reconciliation,
+cleanup eligibility or verified remote content.
+
+After coordinated admission, indexed-worker errors also pass through an explicit
+live-registry finalizer. While the original lease remains held, it reads and
+validates the exact admitted row and records `NeedsReconciliation` with its
+actual prior Registered, Active or Stopped state. An already latched row must
+retain a valid prior state, identity and reservation. Missing, mismatched or
+unexpected lifecycle rows refuse this fallback without being adopted or reset.
+The original operation error is retained; inability to validate or persist the
+latch is reported alongside it.
+
+This fallback does not infer child shutdown, reader join or observed allocation,
+and does not acknowledge a stopped budget job or confirm cleanup. Errors after
+the deliberate registry close keep their original error: both close points
+already require a validated live latch, and the fallback does not reopen or retry
+a control path. Process termination or storage failure can still prevent durable
+recording; restart reconciliation and the other recorded platform gates remain
+necessary.
+
+Shutdown polling is also bounded independently of readiness capture. The parent
+attempts to stop its exact child, then uses a monotonic deadline and finite
+`try_wait` poll count to confirm a reaped exit. A natural exit racing a kill
+error is accepted only when the status query confirms exit. Reader completion
+is checked with its own finite deadline and poll cap; the parent joins only
+a reader already observed finished.
+
+An unconfirmed child exit or reader completion returns an incomplete error and
+withholds stop receipts. A reader that misses its completion bound may be
+detached when its handle is dropped; that is reported as uncertainty, not as a
+joined reader. These checks do not impose a hard deadline on noninterruptible
+OS calls, stop a descendant process tree, prove production isolation, release
+reservations, or authorize cleanup. Each shutdown stage has its own bound; the
+probe does not claim a single end-to-end hard deadline from these stage limits.
+
+Deterministic shutdown-policy tests inject query, kill, and exit-confirmation
+results through a private operation seam. They check that status-query errors
+still lead to stop and confirmation attempts, that a kill/exit race needs
+independent exit confirmation, and that combined failures retain their reasons.
+The production wrapper continues to operate only on its existing owned child;
+this seam adds no command, renderer route, process selector or stop authority.

@@ -1,0 +1,7 @@
+# M0: parent attempt elapsed-time check at stopped payload settlement
+
+Build on PR97, with main as eventual integration baseline. Capture one Instant immediately before coordinated parent admission. Reuse that start without renewal through worker launch, stop/reap, readback and stopped payload settlement. Convert elapsed milliseconds conservatively to u64 (saturate on overflow); check the existing five-minute BudgetController limit in the same job after charging observed payload bytes and before marking StoreIncomplete. Preserve the first refusal: numeric storage/free-space failure takes precedence when already recorded; otherwise timeout remains the recorded reason. Acknowledge proven worker stop without confirming cleanup or discarding usage/reservations.
+
+Apply to existing complete and partial payload modes only. Existing outer worker, readback and syscall limits stay unchanged. This adds a stopped checkpoint, not continuous parent monitoring or an OS hard deadline. Fixed synthetic payload completion remains incomplete verification. No public API, source-repository access, renderer capability, cleanup eligibility, capacity release, retry, schema or credential changes.
+
+Use numeric elapsed fixtures, no five-minute sleeps: exact boundary, one millisecond beyond, charged bytes on timeout, duplicate refusal, and simultaneous storage/time violation preserving the storage reason. Existing process tests must still pass and report the elapsed checkpoint explicitly. No milestone completion; versions remain 0.0.x and no release.
