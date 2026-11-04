@@ -1,0 +1,5 @@
+# M1B: keep descendant pages within the current snapshot
+
+Build on PR105 with main as eventual integration baseline. The editor must keep descendant preservation controls visible and accurate when an inspected folder survives a snapshot replacement but its descendant set shrinks. Current page state can outlive its page count, leaving an empty list and inverted Showing range.
+
+Derive a bounded page for rendering and synchronize stored page state when the page count shrinks so later growth cannot silently restore an obsolete page. Use that same bounded page for slices, count text, page indicator and navigation. Preserve exact exclusion identity sets, current filtering and bounded 50-row rendering. Cover shrink from a later page to one/multiple pages, regrowth and empty search as appropriate. Prove regression against prior component; run frontend behavioral/type/build/format checks. No backend or execution authority changes, native accessibility/pilot acceptance or milestone closure. Version remains 0.0.x.

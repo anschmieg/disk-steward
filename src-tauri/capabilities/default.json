@@ -9,6 +9,10 @@
     "core:default",
     "allow-foundation-status",
     "allow-check-selected-folder-access",
+    "allow-inspect-selected-folder-entries",
+    "allow-navigate-folder-inventory",
+    "allow-continue-folder-inventory",
+    "allow-clear-folder-inventory",
     "allow-preview-native-review",
     "allow-get-example-plan",
     "allow-edit-example-plan",
@@ -30,6 +34,7 @@
     "allow-list-general-reviews",
     "allow-add-selected-general-item",
     "allow-add-selected-general-folder",
+    "allow-import-observed-review-items",
     "allow-get-exclusion-registry",
     "allow-add-global-exclusion",
     "allow-remove-global-exclusion"
