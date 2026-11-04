@@ -113,10 +113,52 @@ fn write_payload_from_root(root: &File) -> Result<super::payload::PayloadReport,
     })
 }
 
+/// Fixed injected partial-write path for the supervised incomplete-store probe.
+pub(super) fn write_stdin_payload_partial() -> Result<super::payload::PayloadReport, StoreError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::AsFd;
+        let stdin = std::io::stdin();
+        let descriptor = rustix::io::dup(stdin.as_fd())?;
+        let root = File::from(descriptor);
+        write_partial_payload_from_root(&root)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_partial_payload_from_root(
+    root: &File,
+) -> Result<super::payload::PayloadReport, StoreError> {
+    validate_root_descriptor(root)?;
+    let binding = capture_bound_journal(root)?;
+    super::payload::write_worker_payload_partial(root, |has_payload, payload_id| {
+        verify_bound_root(root, &binding, has_payload, payload_id)
+    })
+}
+
 /// Inspect the fixed payload only after this exact worker has been stopped.
 pub(super) fn inspect_stopped_worker_payload(
     store: &OwnedStore,
     receipt: &crate::StopReceipt,
+) -> Result<super::WorkerPayloadObservation, StoreError> {
+    inspect_stopped_payload(store, receipt, super::payload::LIMIT)
+}
+
+pub(super) fn inspect_stopped_worker_partial_payload(
+    store: &OwnedStore,
+    receipt: &crate::StopReceipt,
+) -> Result<super::WorkerPayloadObservation, StoreError> {
+    inspect_stopped_payload(store, receipt, super::payload::PARTIAL_FIXTURE_BYTES)
+}
+
+fn inspect_stopped_payload(
+    store: &OwnedStore,
+    receipt: &crate::StopReceipt,
+    expected_bytes: u64,
 ) -> Result<super::WorkerPayloadObservation, StoreError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -132,18 +174,18 @@ pub(super) fn inspect_stopped_worker_payload(
         }
         let deadline = Instant::now() + Duration::from_secs(1);
         store.inspect_state()?;
-        verify_owned_stopped_root(store)?;
+        verify_owned_stopped_root(store, expected_bytes)?;
         check_readback_deadline(deadline)?;
         let fd = open_payload(&store.root)?;
         let before = fd.metadata()?;
-        super::payload::validate_payload_metadata(&before, None, super::payload::LIMIT)?;
+        super::payload::validate_payload_metadata(&before, None, expected_bytes)?;
         let payload_id = (before.dev(), before.ino());
         let high_water = super::payload::payload_high_water_from_metadata(&before)?;
         let before_stamp = PayloadStamp::from(&before);
-        verify_owned_stopped_root(store)?;
-        read_and_verify_payload(&fd, deadline)?;
+        verify_owned_stopped_root(store, expected_bytes)?;
+        read_and_verify_payload(&fd, deadline, expected_bytes)?;
         let after = fd.metadata()?;
-        super::payload::validate_payload_metadata(&after, Some(payload_id), super::payload::LIMIT)?;
+        super::payload::validate_payload_metadata(&after, Some(payload_id), expected_bytes)?;
         if PayloadStamp::from(&after) != before_stamp {
             return Err(StoreError::InvalidIdentity);
         }
@@ -152,25 +194,25 @@ pub(super) fn inspect_stopped_worker_payload(
         super::payload::validate_payload_metadata(
             &named_metadata,
             Some(payload_id),
-            super::payload::LIMIT,
+            expected_bytes,
         )?;
         if PayloadStamp::from(&named_metadata) != before_stamp {
             return Err(StoreError::InvalidIdentity);
         }
-        verify_owned_stopped_root(store)?;
+        verify_owned_stopped_root(store, expected_bytes)?;
         store.inspect_state()?;
         if PayloadStamp::from(&fd.metadata()?) != before_stamp {
             return Err(StoreError::InvalidIdentity);
         }
         check_readback_deadline(deadline)?;
         Ok(super::WorkerPayloadObservation {
-            written_bytes: super::payload::LIMIT,
+            written_bytes: expected_bytes,
             high_water_bytes: high_water,
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (store, receipt);
+        let _ = (store, receipt, expected_bytes);
         Err(StoreError::UnsupportedPlatform)
     }
 }
@@ -317,7 +359,7 @@ fn open_payload(root: &File) -> Result<File, StoreError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn verify_owned_stopped_root(store: &OwnedStore) -> Result<(), StoreError> {
+fn verify_owned_stopped_root(store: &OwnedStore, expected_bytes: u64) -> Result<(), StoreError> {
     use std::os::unix::fs::MetadataExt;
     if validate_worker_root(&store.root)? != store.root_id {
         return Err(StoreError::InvalidIdentity);
@@ -328,7 +370,7 @@ fn verify_owned_stopped_root(store: &OwnedStore) -> Result<(), StoreError> {
         return Err(StoreError::InvalidJournal);
     }
     let metadata = open_payload(&store.root)?.metadata()?;
-    super::payload::validate_payload_metadata(&metadata, None, super::payload::LIMIT)?;
+    super::payload::validate_payload_metadata(&metadata, None, expected_bytes)?;
     if metadata.uid() != rustix::process::geteuid().as_raw() {
         return Err(StoreError::InvalidIdentity);
     }
@@ -381,13 +423,17 @@ fn check_readback_deadline(deadline: Instant) -> Result<(), StoreError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_and_verify_payload(file: &File, deadline: Instant) -> Result<(), StoreError> {
+fn read_and_verify_payload(
+    file: &File,
+    deadline: Instant,
+    expected_bytes: u64,
+) -> Result<(), StoreError> {
     use std::os::unix::fs::FileExt;
     let mut buffer = [0u8; 4096];
     let mut offset = 0u64;
     let mut interruptions = 0;
-    while offset < super::payload::LIMIT {
-        let want = (super::payload::LIMIT - offset).min(buffer.len() as u64) as usize;
+    while offset < expected_bytes {
+        let want = (expected_bytes - offset).min(buffer.len() as u64) as usize;
         let mut got = 0usize;
         while got < want {
             check_readback_deadline(deadline)?;
@@ -419,7 +465,7 @@ fn read_and_verify_payload(file: &File, deadline: Instant) -> Result<(), StoreEr
     let mut eof_probe = [0u8; 1];
     loop {
         check_readback_deadline(deadline)?;
-        let read = file.read_at(&mut eof_probe, super::payload::LIMIT);
+        let read = file.read_at(&mut eof_probe, expected_bytes);
         check_readback_deadline(deadline)?;
         match read {
             Ok(0) => return Ok(()),
@@ -946,7 +992,7 @@ mod tests {
         store.record_stopped(&receipt).unwrap();
         let file = open_payload(&store.root).unwrap();
         assert!(matches!(
-            read_and_verify_payload(&file, Instant::now()),
+            read_and_verify_payload(&file, Instant::now(), super::super::payload::LIMIT),
             Err(StoreError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
         ));
         let wrong_token = crate::StopReceipt::confirmed("other-token", pid);
@@ -971,5 +1017,56 @@ mod tests {
         assert!(store.inspect_stopped_worker_payload(&receipt).is_err());
         std::fs::write(&path, b"short").unwrap();
         assert!(store.inspect_stopped_worker_payload(&receipt).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn stopped_partial_payload_has_a_separate_exact_inspection_gate() {
+        let mut store = OwnedStore::create().unwrap();
+        let descriptor = store.worker_stdin_once().unwrap();
+        let pid = std::process::id();
+        store.bind_worker(pid).unwrap();
+        assert!(write_partial_payload_from_root(&descriptor).is_err());
+        let path = store
+            .parent_path
+            .join("store")
+            .join(super::super::payload::NAME);
+        let before_repeat = std::fs::read(&path).unwrap();
+        assert!(write_partial_payload_from_root(&descriptor).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before_repeat);
+        let receipt = crate::StopReceipt::confirmed(store.token(), pid);
+        assert!(store
+            .inspect_stopped_worker_partial_payload(&receipt)
+            .is_err());
+        store.record_stopped(&receipt).unwrap();
+        let wrong_receipt = crate::StopReceipt::confirmed("other-token", pid);
+        assert!(store
+            .inspect_stopped_worker_partial_payload(&wrong_receipt)
+            .is_err());
+        let wrong_pid = if pid == u32::MAX { pid - 1 } else { pid + 1 };
+        let wrong_pid_receipt = crate::StopReceipt::confirmed(store.token(), wrong_pid);
+        assert!(store
+            .inspect_stopped_worker_partial_payload(&wrong_pid_receipt)
+            .is_err());
+        let partial = store
+            .inspect_stopped_worker_partial_payload(&receipt)
+            .unwrap();
+        assert_eq!(
+            partial.written_bytes,
+            super::super::payload::PARTIAL_FIXTURE_BYTES
+        );
+        assert!(partial.high_water_bytes >= partial.written_bytes);
+        assert!(store.inspect_stopped_worker_payload(&receipt).is_err());
+
+        let mut changed = std::fs::read(&path).unwrap();
+        changed[31] ^= 0x5a;
+        std::fs::write(&path, &changed).unwrap();
+        assert!(store
+            .inspect_stopped_worker_partial_payload(&receipt)
+            .is_err());
+        std::fs::write(&path, b"short").unwrap();
+        assert!(store
+            .inspect_stopped_worker_partial_payload(&receipt)
+            .is_err());
     }
 }

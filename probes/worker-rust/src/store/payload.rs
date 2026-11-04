@@ -12,6 +12,7 @@ use verification_budget::{BlockReason, BudgetController, Limits};
 
 pub(super) const NAME: &str = "payload.bin";
 pub(super) const LIMIT: u64 = 32 * 1024;
+pub(super) const PARTIAL_FIXTURE_BYTES: u64 = 2048;
 const ATTEMPT_LIMIT: u64 = 64 * 1024;
 const CHUNK: usize = 4096;
 const RESERVE_HEADROOM: u64 = 1024 * 1024;
@@ -67,6 +68,37 @@ pub(super) fn write_worker_payload(
             verify,
             sampled_free_bytes,
             |file, bytes| file.write_all(bytes),
+            File::sync_all,
+            &mut budget,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, verify);
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
+
+/// Fixed failure probe: write exactly one 2 KiB prefix through the same
+/// accounting core, then report an interrupted write. This is not a tunable
+/// writer or a production disk-full simulation.
+pub(super) fn write_worker_payload_partial(
+    root: &File,
+    verify: impl FnMut(bool, Option<(u64, u64)>) -> Result<(), StoreError>,
+) -> Result<PayloadReport, StoreError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        write_payload_accounted_at_root(
+            root,
+            verify,
+            sampled_free_bytes,
+            |file, bytes| {
+                file.write_all(&bytes[..PARTIAL_FIXTURE_BYTES as usize])?;
+                Err(std::io::Error::other("synthetic interrupted payload write"))
+            },
             File::sync_all,
             &mut budget,
         )
