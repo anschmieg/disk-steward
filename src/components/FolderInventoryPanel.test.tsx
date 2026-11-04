@@ -487,6 +487,7 @@ test("subtree summary is explicit, keeps exact totals and leaves page and import
       duplicateHardlinkNames: 1,
       directoriesVisited: 2,
       skippedEntries: 1,
+      excludedDirectories: 2,
       unreadableEntries: 0,
       changedDirectories: 0,
       uniqueFileLogicalBytes: "90071992547409930",
@@ -514,6 +515,10 @@ test("subtree summary is explicit, keeps exact totals and leaves page and import
   });
   expect(summary).toHaveTextContent("90071992547409930");
   expect(summary).toHaveTextContent("Incomplete subtree coverage");
+  expect(
+    within(summary).getByText("Remembered excluded directories")
+      .nextElementSibling,
+  ).toHaveTextContent("2");
   expect(screen.getByRole("table").textContent).toBe(rowsBefore);
   expect(screen.getByText(/Size bars use/)).toHaveTextContent(
     "9007199254741000",

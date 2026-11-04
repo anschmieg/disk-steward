@@ -1,6 +1,7 @@
 use super::{
     identity, is_dataless, is_managed_boundary, root_metadata_matches, FolderTreeSummary, Session,
 };
+use crate::global_exclusions::SummaryExclusionPolicy;
 use disk_steward_core::InventoryItemId;
 use rustix::fs::{fstat, openat, statat, AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use std::collections::BTreeMap;
@@ -22,7 +23,7 @@ struct FileVersion {
     ctime_nsec: i64,
 }
 
-struct WalkState {
+struct WalkState<'a> {
     observation_id: InventoryItemId,
     root_label: String,
     root_device: u64,
@@ -33,6 +34,7 @@ struct WalkState {
     entries_observed: u32,
     files_observed: u32,
     duplicate_hardlink_names: u32,
+    excluded_directories: u32,
     directories_visited: u32,
     skipped_entries: u32,
     unreadable_entries: u32,
@@ -42,9 +44,10 @@ struct WalkState {
     coverage_complete: bool,
     stop_reason: Option<&'static str>,
     halted: bool,
+    exclusion_policy: &'a SummaryExclusionPolicy,
 }
 
-impl WalkState {
+impl WalkState<'_> {
     fn expired(&self) -> bool {
         self.started.elapsed() >= self.duration
     }
@@ -90,6 +93,7 @@ impl WalkState {
             files_observed: self.files_observed,
             unique_file_objects: self.files.len().min(u32::MAX as usize) as u32,
             duplicate_hardlink_names: self.duplicate_hardlink_names,
+            excluded_directories: self.excluded_directories,
             directories_visited: self.directories_visited,
             skipped_entries: self.skipped_entries,
             unreadable_entries: self.unreadable_entries,
@@ -103,6 +107,7 @@ impl WalkState {
 
 pub(super) fn summarize(
     session: &Session,
+    exclusion_policy: &SummaryExclusionPolicy,
     expected_observation_id: InventoryItemId,
     started: Instant,
     duration: Duration,
@@ -129,6 +134,7 @@ pub(super) fn summarize(
         entries_observed: 0,
         files_observed: 0,
         duplicate_hardlink_names: 0,
+        excluded_directories: 0,
         directories_visited: 0,
         skipped_entries: 0,
         unreadable_entries: 0,
@@ -138,6 +144,7 @@ pub(super) fn summarize(
         coverage_complete: true,
         stop_reason: None,
         halted: false,
+        exclusion_policy,
     };
     if state.time_check() {
         return Ok(state.summary());
@@ -160,11 +167,13 @@ pub(super) fn summarize(
         state.changed_directory();
         return Ok(state.summary());
     }
+    exclusion_policy.ensure_ancestor_scope_allowed(&frame.fd, started, state.duration)?;
     walk_directory(&frame.fd, root_stat, 1, &mut state);
+    exclusion_policy.ensure_ancestor_scope_allowed(&frame.fd, started, state.duration)?;
     Ok(state.summary())
 }
 
-fn walk_directory(fd: &OwnedFd, baseline: Stat, depth: usize, state: &mut WalkState) {
+fn walk_directory(fd: &OwnedFd, baseline: Stat, depth: usize, state: &mut WalkState<'_>) {
     if state.halted || state.time_check() {
         return;
     }
@@ -231,10 +240,6 @@ fn walk_directory(fd: &OwnedFd, baseline: Stat, depth: usize, state: &mut WalkSt
         if state.time_check() {
             break;
         }
-        if raw_name.first() == Some(&b'.') {
-            state.skip();
-            continue;
-        }
         let metadata = statat(fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW);
         if state.time_check() {
             break;
@@ -247,6 +252,15 @@ fn walk_directory(fd: &OwnedFd, baseline: Stat, depth: usize, state: &mut WalkSt
             }
         };
         let file_type = FileType::from_raw_mode(metadata.st_mode);
+        if file_type == FileType::Directory && state.exclusion_policy.excludes(&metadata) {
+            state.skip();
+            state.excluded_directories = state.excluded_directories.saturating_add(1);
+            continue;
+        }
+        if raw_name.first() == Some(&b'.') {
+            state.skip();
+            continue;
+        }
         if is_dataless(&metadata) {
             state.skip();
             continue;
@@ -395,7 +409,7 @@ fn walk_directory(fd: &OwnedFd, baseline: Stat, depth: usize, state: &mut WalkSt
     }
 }
 
-fn observe_file(metadata: &Stat, state: &mut WalkState) {
+fn observe_file(metadata: &Stat, state: &mut WalkState<'_>) {
     state.files_observed = state.files_observed.saturating_add(1);
     let logical_bytes = match u64::try_from(metadata.st_size) {
         Ok(bytes) => bytes,
@@ -451,8 +465,10 @@ mod tests {
         duration: Duration,
     ) -> (FolderTreeSummary, Session) {
         let (session, _) = selected_root_session(path, 1, Duration::from_secs(2)).unwrap();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
         let summary = summarize(
             &session,
+            &policy,
             session.observation_id,
             Instant::now(),
             duration,
@@ -491,8 +507,10 @@ mod tests {
             selected_root_session(paged_root.path(), 1, Duration::from_secs(2)).unwrap();
         assert!(paged_session.cursor.is_some());
         let cursor_address = paged_session.cursor.as_ref().unwrap() as *const _;
+        let policy = SummaryExclusionPolicy::empty_for_tests();
         let _ = summarize(
             &paged_session,
+            &policy,
             paged_session.observation_id,
             Instant::now(),
             Duration::from_secs(2),
@@ -506,6 +524,7 @@ mod tests {
         );
         assert!(summarize(
             &paged_session,
+            &policy,
             InventoryItemId::new(),
             Instant::now(),
             Duration::from_secs(2),
@@ -548,8 +567,10 @@ mod tests {
         let root = tempdir().unwrap();
         fs::write(root.path().join("file"), b"x").unwrap();
         let (session, _) = selected_root_session(root.path(), 1, Duration::from_secs(2)).unwrap();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
         assert!(summarize(
             &session,
+            &policy,
             InventoryItemId::new(),
             Instant::now(),
             Duration::from_secs(2),
@@ -559,6 +580,7 @@ mod tests {
         .is_err());
         let expired = summarize(
             &session,
+            &policy,
             session.observation_id,
             Instant::now(),
             Duration::ZERO,
@@ -620,6 +642,79 @@ mod tests {
     }
 
     #[test]
+    fn excluded_child_is_skipped_before_open_and_not_counted() {
+        use rustix::fs::{statat, AtFlags, CWD};
+
+        let root = tempdir().unwrap();
+        let excluded = root.path().join("remembered");
+        fs::create_dir(&excluded).unwrap();
+        fs::write(excluded.join("private-child"), b"must not be counted").unwrap();
+        fs::write(root.path().join("visible"), b"ok").unwrap();
+        let stat = statat(CWD, &excluded, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let policy =
+            SummaryExclusionPolicy::for_tests(vec![(stat.st_dev as u64, stat.st_ino as u64)]);
+        let (session, _) = selected_root_session(root.path(), 1, Duration::from_secs(2)).unwrap();
+        let summary = summarize(
+            &session,
+            &policy,
+            session.observation_id,
+            Instant::now(),
+            Duration::from_secs(2),
+            MAX_ENTRIES,
+            MAX_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(summary.excluded_directories, 1);
+        assert_eq!(summary.skipped_entries, 1);
+        assert_eq!(summary.files_observed, 1);
+        assert_eq!(summary.unique_file_logical_bytes, "2");
+        assert_eq!(summary.directories_visited, 1);
+        assert!(!summary.coverage_complete);
+    }
+
+    #[test]
+    fn excluded_root_and_descendant_selected_through_alias_are_refused() {
+        use rustix::fs::{statat, AtFlags, CWD};
+
+        let base = tempdir().unwrap();
+        let excluded = base.path().join("remembered");
+        fs::create_dir_all(excluded.join("child")).unwrap();
+        fs::write(excluded.join("inside"), b"x").unwrap();
+        let stat = statat(CWD, &excluded, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let policy =
+            SummaryExclusionPolicy::for_tests(vec![(stat.st_dev as u64, stat.st_ino as u64)]);
+
+        let (root_session, _) =
+            selected_root_session(&excluded, 1, Duration::from_secs(2)).unwrap();
+        assert!(summarize(
+            &root_session,
+            &policy,
+            root_session.observation_id,
+            Instant::now(),
+            Duration::from_secs(2),
+            MAX_ENTRIES,
+            MAX_DEPTH,
+        )
+        .is_err());
+
+        let alias = base.path().join("alias");
+        unix_fs::symlink(&excluded, &alias).unwrap();
+        let selected_descendant = alias.join("child");
+        let (descendant_session, _) =
+            selected_root_session(&selected_descendant, 1, Duration::from_secs(2)).unwrap();
+        assert!(summarize(
+            &descendant_session,
+            &policy,
+            descendant_session.observation_id,
+            Instant::now(),
+            Duration::from_secs(2),
+            MAX_ENTRIES,
+            MAX_DEPTH,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn changed_directory_metadata_is_flagged_against_captured_baseline() {
         let root = tempdir().unwrap();
         let fd = rustix::fs::open(
@@ -630,6 +725,7 @@ mod tests {
         .unwrap();
         let baseline = fstat(&fd).unwrap();
         fs::write(root.path().join("created-after-baseline"), b"x").unwrap();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
         let mut state = WalkState {
             observation_id: InventoryItemId::new(),
             root_label: "fixture".to_owned(),
@@ -641,6 +737,7 @@ mod tests {
             entries_observed: 0,
             files_observed: 0,
             duplicate_hardlink_names: 0,
+            excluded_directories: 0,
             directories_visited: 0,
             skipped_entries: 0,
             unreadable_entries: 0,
@@ -650,6 +747,7 @@ mod tests {
             coverage_complete: true,
             stop_reason: None,
             halted: false,
+            exclusion_policy: &policy,
         };
         walk_directory(&fd, baseline, 1, &mut state);
         let summary = state.summary();

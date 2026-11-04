@@ -39,6 +39,7 @@ export type FolderTreeSummary = {
   duplicateHardlinkNames: number;
   directoriesVisited: number;
   skippedEntries: number;
+  excludedDirectories: number;
   unreadableEntries: number;
   changedDirectories: number;
   uniqueFileLogicalBytes: string;
@@ -220,7 +221,7 @@ export default function FolderInventoryPanel({
       setTreeSummary(result);
     } catch {
       setMessage(
-        "The subtree summary could not be completed reliably. The folder page is unchanged; choose the folder again to refresh its scope.",
+        "The subtree summary could not be completed reliably. The folder page is unchanged. Review remembered exclusions or choose the folder again to refresh its scope.",
       );
     } finally {
       activeRequest.current = false;
@@ -291,6 +292,9 @@ export default function FolderInventoryPanel({
             Explicit read-only summary: up to 4,096 entries, 16 levels and
             cooperative two-second checks. File contents are not read. Links and
             unsupported boundaries are skipped; coverage gaps remain visible.
+            Remembered exclusions are verified for this summary; uncertain rules
+            or an excluded selected scope refuse the summary. The immediate-page
+            metadata view remains separate from this scan policy.
           </p>
           {treeSummary && (
             <section
@@ -320,6 +324,8 @@ export default function FolderInventoryPanel({
                 <dd>{treeSummary.duplicateHardlinkNames}</dd>
                 <dt>Directories visited</dt>
                 <dd>{treeSummary.directoriesVisited}</dd>
+                <dt>Remembered excluded directories</dt>
+                <dd>{treeSummary.excludedDirectories}</dd>
                 <dt>Skipped entries</dt>
                 <dd>{treeSummary.skippedEntries}</dd>
                 <dt>Unreadable entries</dt>

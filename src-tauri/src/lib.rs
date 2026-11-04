@@ -5,6 +5,8 @@ mod folder_inventory;
 mod general_plan;
 mod global_exclusions;
 mod selected_metadata;
+#[cfg(unix)]
+mod summary_exclusions;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
