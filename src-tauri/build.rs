@@ -7,6 +7,7 @@ fn main() {
             "navigate_folder_inventory",
             "continue_folder_inventory",
             "clear_folder_inventory",
+            "inspect_folder_tree_summary",
             "preview_native_review",
             "get_example_plan",
             "edit_example_plan",

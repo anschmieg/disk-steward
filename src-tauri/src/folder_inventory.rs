@@ -14,10 +14,14 @@ const MAX_DURATION: Duration = Duration::from_secs(2);
 const MAX_LABEL_CHARS: usize = 120;
 const MAX_NAVIGATION_DEPTH: usize = 16;
 const MAX_PAGES_PER_DIRECTORY: u32 = 128;
+const MAX_TREE_SUMMARY_ENTRIES: usize = 4096;
 
 #[cfg(target_os = "macos")]
 // macOS SDK sys/stat.h defines SF_DATALESS as 0x40000000 (Xcode 16 SDK).
 const SF_DATALESS: u32 = 0x4000_0000;
+
+#[cfg(unix)]
+mod tree_summary;
 
 #[cfg(unix)]
 // Unix stat reports allocation in 512-byte units, not st_blksize units.
@@ -101,6 +105,30 @@ pub struct ContinueInventoryRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClearInventoryRequest {
     expected_observation_id: InventoryItemId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TreeSummaryRequest {
+    expected_observation_id: InventoryItemId,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderTreeSummary {
+    pub observation_id: InventoryItemId,
+    pub root_label: String,
+    pub entries_observed: u32,
+    pub files_observed: u32,
+    pub unique_file_objects: u32,
+    pub duplicate_hardlink_names: u32,
+    pub directories_visited: u32,
+    pub skipped_entries: u32,
+    pub unreadable_entries: u32,
+    pub changed_directories: u32,
+    pub unique_file_logical_bytes: String,
+    pub coverage_complete: bool,
+    pub stop_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Default)]
@@ -1389,6 +1417,53 @@ pub async fn clear_folder_inventory(
     })
     .await
     .map_err(|_| "Folder observation could not be cleared.".to_owned())?
+}
+
+#[tauri::command]
+pub async fn inspect_folder_tree_summary(
+    state: tauri::State<'_, FolderInventoryState>,
+    request: TreeSummaryRequest,
+) -> Result<FolderTreeSummary, String> {
+    let guard = crate::NativeCheckGuard::acquire()?;
+    let sessions = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let current = sessions
+            .lock()
+            .map_err(|_| "Folder inventory state is unavailable.".to_owned())?;
+        let session = current
+            .as_ref()
+            .ok_or_else(|| "Choose a folder before summarizing its contents.".to_owned())?;
+        if session.observation_id != request.expected_observation_id
+            || session.snapshot.observation_id != request.expected_observation_id
+        {
+            return Err(
+                "The folder observation is stale. Inspect the current folder again.".into(),
+            );
+        }
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            validate_session_bindings(session, started, MAX_DURATION).map_err(str::to_owned)?;
+            let summary = tree_summary::summarize(
+                session,
+                request.expected_observation_id,
+                started,
+                MAX_DURATION,
+                MAX_TREE_SUMMARY_ENTRIES,
+                MAX_NAVIGATION_DEPTH,
+            )
+            .map_err(str::to_owned)?;
+            validate_session_bindings(session, started, MAX_DURATION).map_err(str::to_owned)?;
+            Ok(summary)
+        }
+        #[cfg(not(unix))]
+        {
+            Err("Folder subtree summary is unsupported on this platform.".to_owned())
+        }
+    })
+    .await
+    .map_err(|_| "Folder subtree summary did not complete.".to_owned())?
 }
 
 #[cfg(all(test, unix))]

@@ -474,3 +474,72 @@ test("failed scope clear keeps the observation and does not claim release", asyn
   expect(screen.queryByText(/Folder scope cleared/)).not.toBeInTheDocument();
   expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
 });
+
+test("subtree summary is explicit, keeps exact totals and leaves page and import scope unchanged", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce({
+      observationId: sample.observationId,
+      rootLabel: sample.rootLabel,
+      entriesObserved: 8,
+      filesObserved: 5,
+      uniqueFileObjects: 4,
+      duplicateHardlinkNames: 1,
+      directoriesVisited: 2,
+      skippedEntries: 1,
+      unreadableEntries: 0,
+      changedDirectories: 0,
+      uniqueFileLogicalBytes: "90071992547409930",
+      coverageComplete: false,
+      stopReason: "depth_limit",
+    })
+    .mockResolvedValueOnce({
+      ...sample,
+      observationId: "page-2",
+      pageNumber: 2,
+    });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  expect(invoke).toHaveBeenCalledTimes(1);
+  const rowsBefore = screen.getByRole("table").textContent;
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  const summary = await screen.findByRole("region", {
+    name: "Subtree metadata summary",
+  });
+  expect(invoke).toHaveBeenNthCalledWith(2, "inspect_folder_tree_summary", {
+    request: { expectedObservationId: "observation-1" },
+  });
+  expect(summary).toHaveTextContent("90071992547409930");
+  expect(summary).toHaveTextContent("Incomplete subtree coverage");
+  expect(screen.getByRole("table").textContent).toBe(rowsBefore);
+  expect(screen.getByText(/Size bars use/)).toHaveTextContent(
+    "9007199254741000",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("region", { name: "Subtree metadata summary" }),
+    ).not.toBeInTheDocument(),
+  );
+});
+
+test("failed subtree summary sanitizes errors and preserves the current page", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockRejectedValueOnce(new Error("/private/secret"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  await screen.findByText(/subtree summary could not be completed reliably/);
+  expect(screen.queryByText(/private\/secret/)).not.toBeInTheDocument();
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+  expect(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  ).toBeEnabled();
+});
