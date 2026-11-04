@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn probe() -> Command {
     Command::new(env!("CARGO_BIN_EXE_disk-steward-worker-probe"))
@@ -253,4 +253,53 @@ fn fixed_worker_launches_discard_parent_environment() {
         );
         assert!(!stdout.contains("synthetic-parent-only-value"));
     }
+}
+
+#[test]
+fn indexed_store_descriptor_handoff_requires_exact_capability_and_arguments() {
+    for args in [
+        vec!["--run-indexed-store-handoff", "/tmp/caller-path"],
+        vec!["--run-indexed-store-handoff", "--confirm-own-store-cleanup"],
+        vec!["--child", "store-handoff", "extra"],
+    ] {
+        let output = probe().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    let missing = probe()
+        .args(["--child", "store-handoff"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        missing.stdout.is_empty(),
+        "no readiness without directory capability"
+    );
+
+    let output = probe()
+        .arg("--run-indexed-store-handoff")
+        .env(
+            "DISK_STEWARD_WORKER_ENV_SENTINEL",
+            "synthetic-handoff-parent-only",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    for evidence in [
+        "descriptor_handoff=true",
+        "worker_joined=true",
+        "registered_stopped=true",
+        "reopened_reconciliation=true",
+        "cleanup=not_authorized",
+    ] {
+        assert!(report.contains(evidence), "{report}");
+    }
+    assert!(!report.contains("synthetic-handoff-parent-only"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-handoff-parent-only"));
 }
