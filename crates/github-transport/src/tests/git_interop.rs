@@ -432,6 +432,7 @@ fn git_upload_pack(root: &PrivateRoot, args: &[&str], input: &[u8]) -> io::Resul
 }
 
 const VERIFICATION_COMPLETE: &[u8] = b"DISK_STEWARD_GIT_VERIFICATION_COMPLETE\n";
+const NATIVE_DELTA_COMPLETE: &[u8] = b"DISK_STEWARD_NATIVE_DELTA_COMPLETE\n";
 
 #[test]
 fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
@@ -452,6 +453,161 @@ fn real_git_verification_child() {
     let mut stdout = io::stdout();
     stdout.write_all(VERIFICATION_COMPLETE).unwrap();
     stdout.flush().unwrap();
+}
+
+#[test]
+fn native_git_delta_pack_decode_is_supervised() {
+    let receipt = super::completion_supervision::supervise(
+        "tests::git_interop::native_git_delta_decode_child",
+        NATIVE_DELTA_COMPLETE,
+        Duration::from_secs(30),
+    )
+    .expect("bounded native-Git delta verification child must complete");
+    assert!(receipt.reader_joined);
+    assert!(receipt.bytes > NATIVE_DELTA_COMPLETE.len() && receipt.bytes <= 1024);
+}
+
+#[test]
+#[ignore = "selected only by the exact native-Git delta verification supervisor"]
+fn native_git_delta_decode_child() {
+    run_native_git_delta_decode();
+    let mut stdout = io::stdout();
+    stdout.write_all(NATIVE_DELTA_COMPLETE).unwrap();
+    stdout.flush().unwrap();
+}
+
+fn run_native_git_delta_decode() {
+    let root = PrivateRoot::create().unwrap();
+    let (source, first_id, second_id, first_content, second_content) = make_delta_blobs(&root);
+    let object_ids = format!("{first_id}\n{second_id}\n").into_bytes();
+    assert!(object_ids.len() <= MAX_GIT_IN);
+    let cancellation = CancellationHandle::new();
+
+    for (name, extra_args, expect_offset_delta) in [
+        ("offset-delta", vec!["--delta-base-offset"], true),
+        ("reference-delta", vec![], false),
+    ] {
+        let mut args = vec![
+            "-C",
+            &source,
+            "pack-objects",
+            "--stdout",
+            "--window=10",
+            "--depth=10",
+            "--no-reuse-delta",
+            "--no-reuse-object",
+            "--compression=0",
+            "--threads=1",
+        ];
+        args.extend(extra_args);
+        let pack = checked_git(&root, &args, &object_ids).unwrap();
+        assert!(
+            !pack.is_empty() && pack.len() <= MAX_PACK && pack.len() <= MAX_GIT_IN,
+            "native {name} pack must fit the unchanged bounded fixture input"
+        );
+        let decoded = decode_sha1_pack(
+            &pack,
+            4096,
+            &cancellation,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(decoded.objects().len(), 2, "native {name} object count");
+        let delta = decoded
+            .objects()
+            .iter()
+            .find(|object| object.delta_depth() > 0)
+            .unwrap_or_else(|| panic!("native {name} pack did not contain a delta"));
+        let header =
+            parse_sha1_pack_entry_header(&pack[delta.offset() as usize..], delta.offset(), 4096)
+                .unwrap();
+        let has_expected_delta_kind = matches!(
+            (expect_offset_delta, header.kind()),
+            (true, PackEntryKind::OffsetDelta { .. })
+                | (false, PackEntryKind::ReferenceDelta { .. })
+        );
+        assert!(
+            has_expected_delta_kind,
+            "native {name} pack encoded an unexpected delta kind"
+        );
+
+        for (oid, expected_content) in [
+            (first_id.as_str(), first_content.as_slice()),
+            (second_id.as_str(), second_content.as_slice()),
+        ] {
+            let expected =
+                checked_git(&root, &["-C", &source, "cat-file", "blob", oid], b"").unwrap();
+            let object = decoded
+                .objects()
+                .iter()
+                .find(|object| object.oid() == &hex_oid(oid))
+                .unwrap_or_else(|| panic!("native {name} pack missed fixture blob"));
+            assert_eq!(object.kind(), GitObjectKind::Blob);
+            assert_eq!(object.content(), expected_content);
+            assert_eq!(object.content(), expected);
+        }
+
+        let receiver = create_receiver(&root, &format!("{name}.git")).unwrap();
+        let receiver_arg = receiver_path_arg(&receiver).unwrap();
+        checked_git(
+            &root,
+            &[
+                "--git-dir",
+                receiver_arg,
+                "index-pack",
+                "--strict",
+                "--stdin",
+            ],
+            &pack,
+        )
+        .unwrap();
+        for oid in [&first_id, &second_id] {
+            let stored = checked_git(
+                &root,
+                &["--git-dir", receiver_arg, "cat-file", "blob", oid],
+                b"",
+            )
+            .unwrap();
+            let source_content =
+                checked_git(&root, &["-C", &source, "cat-file", "blob", oid], b"").unwrap();
+            assert_eq!(stored, source_content);
+        }
+    }
+}
+
+fn make_delta_blobs(root: &PrivateRoot) -> (String, String, String, Vec<u8>, Vec<u8>) {
+    let repo = create_receiver(root, "delta-source.git").unwrap();
+    let repo = receiver_path_arg(&repo).unwrap().to_owned();
+    let mut first_content = Vec::with_capacity(384);
+    let mut state = 0x8f31_7a2du32;
+    for _ in 0..384 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        first_content.push(state as u8);
+    }
+    let mut second_content = first_content.clone();
+    second_content[191] ^= 0x5a;
+
+    let first_id = object_id(
+        &checked_git(
+            root,
+            &["-C", &repo, "hash-object", "-w", "--stdin"],
+            &first_content,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let second_id = object_id(
+        &checked_git(
+            root,
+            &["-C", &repo, "hash-object", "-w", "--stdin"],
+            &second_content,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    (repo, first_id, second_id, first_content, second_content)
 }
 
 fn capture_fixture_ref_manifest(root: &PrivateRoot, source_repo: &str) -> RequiredRefManifest {

@@ -670,3 +670,19 @@ is an error. Busy is neither zero usage nor completion. The method does not
 retry, change counters, or suppress observations after cancellation. It provides
 no operating-system scheduling guarantee; callers still own attempt deadlines
 and final accounting.
+
+### Native Git delta encoder interoperability
+
+A separate supervised disposable fixture writes two deterministic 384-byte blobs
+that differ by one byte and invokes the fixed native Git encoder with a cleared
+environment, fixed arguments and one encoding thread. It requires actual offset
+and reference delta entries, decodes both packs, and compares exact kinds, IDs
+and reconstructed bytes independently of pack entry order. Fresh receivers
+import each pack with `index-pack --strict` and return matching `cat-file` bytes.
+The existing 512-byte command-input bound remains unchanged. The full fixture
+runs in an exactly selected child under the existing 30-second supervisor.
+
+This validates two small native encoder outputs on tested platforms. It is not
+proof for arbitrary pack structures, forward or external bases, maximum delta
+depth, full fsck, public/private GitHub authentication, production worker/RSS
+bounds, local preservation or cleanup eligibility.
