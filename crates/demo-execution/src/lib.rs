@@ -2725,6 +2725,129 @@ mod tests {
     }
 
     #[test]
+    fn selective_purge_accepts_nonprefix_and_reordered_receipts_and_preserves_others() {
+        for selected_indexes in [vec![4usize], vec![3, 1]] {
+            let (dir, mut service, mut plan) = fixture_service();
+            let actions: Vec<_> = plan.actions.iter().map(|action| action.id).collect();
+            for action in &actions {
+                plan = service
+                    .plan
+                    .edit(
+                        plan.revision_id,
+                        *action,
+                        disk_steward_review_plan::Decision::Include,
+                    )
+                    .unwrap();
+            }
+            let stage = service.prepare_stage(plan.revision_id).unwrap();
+            service
+                .confirm_and_execute(stage.review_id, |_| true)
+                .unwrap();
+            let before = service.status().unwrap();
+            let targets: Vec<_> = selected_indexes
+                .iter()
+                .map(|index| {
+                    let fixture = before
+                        .fixtures
+                        .iter()
+                        .find(|fixture| fixture.action_id == actions[*index])
+                        .unwrap();
+                    disk_steward_fixture_purge::PurgeTarget {
+                        action_id: fixture.action_id,
+                        receipt_id: fixture.receipt_id.unwrap(),
+                    }
+                })
+                .collect();
+            let review = service
+                .prepare_purge_review(plan.revision_id, targets.clone())
+                .unwrap();
+            let result = service
+                .confirm_purge_execution(review.review_id, |shown| {
+                    assert_eq!(
+                        shown
+                            .targets
+                            .iter()
+                            .map(|target| (target.action_id, target.receipt_id))
+                            .collect::<Vec<_>>(),
+                        targets
+                            .iter()
+                            .map(|target| (target.action_id, target.receipt_id))
+                            .collect::<Vec<_>>()
+                    );
+                    true
+                })
+                .expect("exact non-prefix subset must pass the approval/claim path");
+            assert_eq!(result.state, "finished");
+            assert_eq!(result.items.len(), targets.len());
+            let after = service.status().unwrap();
+            let session_component = wire(&before.session_id.unwrap())
+                .unwrap()
+                .trim_matches('"')
+                .rsplit(':')
+                .next()
+                .unwrap()
+                .to_owned();
+            let holding = dir.path().join(format!(
+                ".disk-steward-fixtures-{session_component}/holding"
+            ));
+            for original in &before.fixtures {
+                let current = after
+                    .fixtures
+                    .iter()
+                    .find(|fixture| fixture.action_id == original.action_id)
+                    .unwrap();
+                let selected = targets
+                    .iter()
+                    .any(|target| target.action_id == original.action_id);
+                assert_eq!(
+                    current.status,
+                    if selected {
+                        FixtureStatus::PermanentlyRemoved
+                    } else {
+                        FixtureStatus::Staged
+                    }
+                );
+                assert_eq!(current.receipt_id, original.receipt_id);
+                let receipt_component = wire(&original.receipt_id.unwrap())
+                    .unwrap()
+                    .trim_matches('"')
+                    .rsplit(':')
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                let held = holding.join(format!("receipt-{receipt_component}"));
+                if selected {
+                    assert!(!held.exists());
+                } else {
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(fs::read(held).unwrap())),
+                        original.sha256
+                    );
+                    assert_eq!(current.identity_sha256, original.identity_sha256);
+                }
+            }
+            let ledger = Connection::open(dir.path().join(LEDGER_DB)).unwrap();
+            let consumed: i64 = ledger
+                .query_row(
+                    "SELECT COUNT(*) FROM approvals WHERE consumed_at_unix_ms IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                consumed, 2,
+                "one stage approval and one exact subset purge approval"
+            );
+            assert_eq!(
+                service
+                    .confirm_purge_execution(review.review_id, |_| true)
+                    .unwrap_err(),
+                DemoError::ReviewReused
+            );
+        }
+    }
+
+    #[test]
     fn purge_through_coordinator_unlinks_and_consumes_the_approval() {
         let (dir, mut service, plan) = fixture_service();
         let plan = include_one(&mut service, &plan);

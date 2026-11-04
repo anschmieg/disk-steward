@@ -297,17 +297,7 @@ impl FixturePurgeService {
             expires_at_ms: created_at_ms + REVIEW_LIFETIME_MS,
             selected_logical_bytes,
             adapter_schema_version: 2,
-            targets: review_targets
-                .iter()
-                .zip(snapshot.fixtures.iter())
-                .map(|(target, fixture)| ManifestTargetV1 {
-                    action_id: target.action_id,
-                    receipt_id: target.receipt_id,
-                    logical_bytes: fixture.bytes,
-                    content_sha256: fixture.sha256.clone(),
-                    identity_sha256: fixture.identity_sha256.clone(),
-                })
-                .collect(),
+            targets: build_manifest_targets(&review_targets, &snapshot)?,
         };
         // Canonical: serde_json of a typed struct is field-order
         // deterministic; the digest covers the complete manifest content.
@@ -381,7 +371,7 @@ impl FixturePurgeService {
             return Err(PurgeError::ConfirmationDeclined);
         }
         let after = (self.now)();
-        if after >= prepared.expires_at_ms {
+        if after < now || after < prepared.created_at_ms || after >= prepared.expires_at_ms {
             return Err(PurgeError::ReviewExpired);
         }
         self.revalidate(lifecycle, plan, &prepared)?;
@@ -729,21 +719,6 @@ fn build_manifest(
     prepared: &PreparedPurgeReview,
     snapshot: &disk_steward_fixture_lifecycle::SessionSnapshot,
 ) -> Result<PurgeManifestV1, PurgeError> {
-    let mut manifest_targets = Vec::with_capacity(prepared.targets.len());
-    for target in &prepared.targets {
-        let fixture = snapshot
-            .fixtures
-            .iter()
-            .find(|f| f.action_id == target.action_id)
-            .ok_or(PurgeError::ChangedTarget)?;
-        manifest_targets.push(ManifestTargetV1 {
-            action_id: target.action_id,
-            receipt_id: target.receipt_id,
-            logical_bytes: fixture.bytes,
-            content_sha256: fixture.sha256.clone(),
-            identity_sha256: fixture.identity_sha256.clone(),
-        });
-    }
     Ok(PurgeManifestV1 {
         schema_version: 1,
         session_id: prepared.session_id,
@@ -754,8 +729,36 @@ fn build_manifest(
         expires_at_ms: prepared.expires_at_ms,
         selected_logical_bytes: prepared.selected_logical_bytes,
         adapter_schema_version: 2,
-        targets: manifest_targets,
+        targets: build_manifest_targets(&prepared.targets, snapshot)?,
     })
+}
+
+fn build_manifest_targets(
+    targets: &[PurgeReviewTarget],
+    snapshot: &disk_steward_fixture_lifecycle::SessionSnapshot,
+) -> Result<Vec<ManifestTargetV1>, PurgeError> {
+    let mut manifest_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        let fixture = snapshot
+            .fixtures
+            .iter()
+            .find(|f| f.action_id == target.action_id)
+            .ok_or(PurgeError::ChangedTarget)?;
+        if fixture.receipt_id.as_ref() != Some(&target.receipt_id)
+            || fixture.status != FixtureStatus::Staged
+            || fixture.bytes != target.logical_bytes
+        {
+            return Err(PurgeError::ChangedTarget);
+        }
+        manifest_targets.push(ManifestTargetV1 {
+            action_id: target.action_id,
+            receipt_id: target.receipt_id,
+            logical_bytes: fixture.bytes,
+            content_sha256: fixture.sha256.clone(),
+            identity_sha256: fixture.identity_sha256.clone(),
+        });
+    }
+    Ok(manifest_targets)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1417,6 +1420,202 @@ mod tests {
     }
 
     #[test]
+    fn subset_and_reordered_targets_bind_each_receipt_to_its_own_fixture() {
+        let (dir, _ids) = demo_root();
+        let now = 1_700_000_000_000_i64;
+        let (mut service, mut lifecycle, plan, all_targets, plan_view) =
+            service_with_staged(dir.path(), 5, fixed_clock(now));
+
+        let only_nonprefix = vec![all_targets[4].clone()];
+        let one = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                only_nonprefix.clone(),
+            )
+            .unwrap();
+        let expected_one = build_manifest(&one, &lifecycle.snapshot().unwrap()).unwrap();
+        assert_eq!(
+            one.manifest_sha256,
+            hex_lower(&Sha256::digest(serde_json::to_vec(&expected_one).unwrap()))
+        );
+        service.revalidate(&lifecycle, &plan, &one).unwrap();
+        let result_one = service
+            .claim_and_execute(&mut lifecycle, &plan, one.review_id, |_| true)
+            .unwrap();
+        assert_eq!(result_one.state, "finished");
+        assert_eq!(
+            result_one
+                .items
+                .iter()
+                .map(|item| match &item.outcome {
+                    PurgeItemOutcome::PermanentlyRemoved { receipt_id, .. } => *receipt_id,
+                    _ => panic!("selected receipt was not removed"),
+                })
+                .collect::<Vec<_>>(),
+            vec![all_targets[4].receipt_id]
+        );
+
+        let reordered = vec![all_targets[3].clone(), all_targets[1].clone()];
+        let two = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                reordered.clone(),
+            )
+            .unwrap();
+        let expected_two = build_manifest(&two, &lifecycle.snapshot().unwrap()).unwrap();
+        assert_eq!(
+            two.manifest_sha256,
+            hex_lower(&Sha256::digest(serde_json::to_vec(&expected_two).unwrap()))
+        );
+        service.revalidate(&lifecycle, &plan, &two).unwrap();
+        let result_two = service
+            .claim_and_execute(&mut lifecycle, &plan, two.review_id, |_| true)
+            .unwrap();
+        assert_eq!(result_two.state, "finished");
+        assert_eq!(
+            result_two
+                .items
+                .iter()
+                .map(|item| match &item.outcome {
+                    PurgeItemOutcome::PermanentlyRemoved { receipt_id, .. } => *receipt_id,
+                    _ => panic!("selected receipt was not removed"),
+                })
+                .collect::<Vec<_>>(),
+            vec![all_targets[3].receipt_id, all_targets[1].receipt_id]
+        );
+
+        let snapshot = lifecycle.snapshot().unwrap();
+        for (index, target) in all_targets.iter().enumerate() {
+            let receipt_wire = serde_json::to_string(&target.receipt_id).unwrap();
+            let held = holding_slot_for(dir.path(), &receipt_wire);
+            if [1usize, 3, 4].contains(&index) {
+                assert_eq!(
+                    snapshot
+                        .fixtures
+                        .iter()
+                        .find(|fixture| fixture.action_id == target.action_id)
+                        .unwrap()
+                        .status,
+                    FixtureStatus::PermanentlyRemoved
+                );
+                assert!(!held.exists());
+            } else {
+                assert_eq!(
+                    snapshot
+                        .fixtures
+                        .iter()
+                        .find(|fixture| fixture.action_id == target.action_id)
+                        .unwrap()
+                        .status,
+                    FixtureStatus::Staged
+                );
+                assert!(held.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_positional_manifest_hash_is_refused_without_rewriting_review() {
+        let (dir, _ids) = demo_root();
+        let now = 1_700_000_000_000_i64;
+        let (mut service, mut lifecycle, plan, all_targets, plan_view) =
+            service_with_staged(dir.path(), 5, fixed_clock(now));
+        let selected = vec![all_targets[4].clone()];
+        let old_review = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                selected.clone(),
+            )
+            .unwrap();
+        let snapshot = lifecycle.snapshot().unwrap();
+        let formerly_zipped_fixture = &snapshot.fixtures[0];
+        let old_manifest = PurgeManifestV1 {
+            schema_version: 1,
+            session_id: old_review.session_id,
+            plan_id: old_review.plan_id,
+            revision_id: old_review.revision_id,
+            operation: old_review.operation,
+            created_at_ms: old_review.created_at_ms,
+            expires_at_ms: old_review.expires_at_ms,
+            selected_logical_bytes: old_review.selected_logical_bytes,
+            adapter_schema_version: 2,
+            targets: vec![ManifestTargetV1 {
+                action_id: old_review.targets[0].action_id,
+                receipt_id: old_review.targets[0].receipt_id,
+                logical_bytes: formerly_zipped_fixture.bytes,
+                content_sha256: formerly_zipped_fixture.sha256.clone(),
+                identity_sha256: formerly_zipped_fixture.identity_sha256.clone(),
+            }],
+        };
+        let old_hash = hex_lower(&Sha256::digest(serde_json::to_vec(&old_manifest).unwrap()));
+        assert_ne!(old_hash, old_review.manifest_sha256);
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        control
+            .execute(
+                "UPDATE purge_reviews SET manifest_sha256=?1 WHERE review_id=?2",
+                rusqlite::params![
+                    old_hash,
+                    serde_json::to_string(&old_review.review_id).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(control);
+
+        let mut confirmation_called = false;
+        let refused =
+            service.claim_and_execute(&mut lifecycle, &plan, old_review.review_id, |_| {
+                confirmation_called = true;
+                true
+            });
+        assert!(matches!(refused, Err(PurgeError::ChangedTarget)));
+        assert!(!confirmation_called);
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let (stored_hash, state): (String, String) = control
+            .query_row(
+                "SELECT manifest_sha256,state FROM purge_reviews WHERE review_id=?1",
+                [serde_json::to_string(&old_review.review_id).unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_hash, old_hash);
+        assert_eq!(state, "prepared");
+        let executions: i64 = control
+            .query_row("SELECT count(*) FROM purge_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(executions, 0);
+        assert!(holding_slot_for(
+            dir.path(),
+            &serde_json::to_string(&selected[0].receipt_id).unwrap()
+        )
+        .exists());
+
+        let fresh = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                selected.clone(),
+            )
+            .unwrap();
+        assert_ne!(fresh.manifest_sha256, old_hash);
+        let result = service
+            .claim_and_execute(&mut lifecycle, &plan, fresh.review_id, |_| true)
+            .unwrap();
+        assert_eq!(result.state, "finished");
+        assert!(
+            matches!(&result.items[0].outcome, PurgeItemOutcome::PermanentlyRemoved { receipt_id, .. } if *receipt_id == selected[0].receipt_id)
+        );
+    }
+
+    #[test]
     fn declined_confirmation_leaves_everything_untouched() {
         let (dir, _ids) = demo_root();
         let (mut service, mut lifecycle, plan, targets, plan_view) =
@@ -1718,5 +1917,66 @@ mod tests {
         assert_eq!(error.code(), "review_expired");
         let receipt_wire = serde_json::to_string(&targets[0].receipt_id).unwrap();
         assert!(holding_slot_for(dir.path(), &receipt_wire).exists());
+    }
+
+    #[test]
+    fn clock_reversal_during_confirmation_is_refused_before_claim_or_unlink() {
+        use std::sync::atomic::Ordering;
+        let (dir, _ids) = demo_root();
+        let created = 2_000_000_000_000_i64;
+        let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(created));
+        let (mut service, mut lifecycle, plan, targets, plan_view) =
+            service_with_staged_and_clock_cell(dir.path(), 2, tick.clone());
+        let review = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                targets.clone(),
+            )
+            .unwrap();
+        tick.store(created + 100, Ordering::SeqCst);
+        let error = service
+            .claim_and_execute(&mut lifecycle, &plan, review.review_id, |_| {
+                // Still inside the review lifetime, but earlier than the
+                // pre-confirmation sample; this rollback must refuse too.
+                tick.store(created + 99, Ordering::SeqCst);
+                true
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "review_expired");
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let state: String = control
+            .query_row(
+                "SELECT state FROM purge_reviews WHERE review_id=?1",
+                [serde_json::to_string(&review.review_id).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "prepared");
+        let executions: i64 = control
+            .query_row("SELECT count(*) FROM purge_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(executions, 0);
+        for target in &targets {
+            assert!(holding_slot_for(
+                dir.path(),
+                &serde_json::to_string(&target.receipt_id).unwrap()
+            )
+            .exists());
+        }
+        for fixture in lifecycle.snapshot().unwrap().fixtures {
+            let expected = if targets
+                .iter()
+                .any(|target| target.action_id == fixture.action_id)
+            {
+                FixtureStatus::Staged
+            } else {
+                FixtureStatus::Available
+            };
+            assert_eq!(fixture.status, expected);
+        }
     }
 }

@@ -1,0 +1,7 @@
+# Selective purge manifest identity binding
+
+Resume from PR138 edda918, main as eventual integration baseline. Fix the existing fixture purge review bug where selected targets are zipped with the full fixture registry by position. Preparation must derive each target's bytes, content hash and identity hash from the matching ActionId and receipt, just as revalidation does. A non-prefix or reordered subset must produce an executable exact review; unselected staged receipts remain intact.
+
+Keep existing schema and manifest versions, native confirmation, single-use approval/claim ordering, expiry, identity/content revalidation and uncertainty gates. Do not rewrite or revive old prepared reviews: mismatching historical hashes continue to refuse and require a fresh review. Tests use only app-created disposable files, include reordered/non-prefix subsets, preserved unselected receipts, mutation refusal, and integrated coordinator approval/claim behavior. Also refuse a clock reversal during the standalone purge service confirmation callback before any claim or mutation. The integrated demo already uses a persisted clock guard.
+
+This fixes a blocking lifecycle behavior needed by the MVP, without broadening file registries, accepting new paths or enabling live user-file cleanup. No recovered-space, native UI, M1C/M3/MVP completion or production adapter validation is inferred. Keep 0.0.17 and no releases. After the actual MVP, final adversarial review/fixes/validation and automation disable-stop remain required.
