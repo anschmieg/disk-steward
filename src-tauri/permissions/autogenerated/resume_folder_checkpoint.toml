@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resume-folder-checkpoint"
+description = "Enables the resume_folder_checkpoint command without any pre-configured scope."
+commands.allow = ["resume_folder_checkpoint"]
+
+[[permission]]
+identifier = "deny-resume-folder-checkpoint"
+description = "Denies the resume_folder_checkpoint command without any pre-configured scope."
+commands.deny = ["resume_folder_checkpoint"]

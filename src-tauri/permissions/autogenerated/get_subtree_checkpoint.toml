@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-subtree-checkpoint"
+description = "Enables the get_subtree_checkpoint command without any pre-configured scope."
+commands.allow = ["get_subtree_checkpoint"]
+
+[[permission]]
+identifier = "deny-get-subtree-checkpoint"
+description = "Denies the get_subtree_checkpoint command without any pre-configured scope."
+commands.deny = ["get_subtree_checkpoint"]

@@ -1,0 +1,112 @@
+.duplicate-comparison {
+  border-top: 1px solid color-mix(in srgb, currentColor 24%, transparent);
+  margin-top: 24px;
+  padding-top: 16px;
+  min-width: 0;
+}
+
+.duplicate-comparison p {
+  line-height: 1.55;
+  max-width: 80ch;
+  overflow-wrap: anywhere;
+}
+
+.duplicate-comparison__selection-summary {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  margin: 12px 0;
+}
+
+.duplicate-comparison__files {
+  border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  list-style: none;
+  margin: 12px 0 18px;
+  max-height: 360px;
+  overflow: auto;
+  padding: 0;
+}
+
+.duplicate-comparison__files li {
+  border-bottom: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  padding: 8px 4px;
+}
+
+.duplicate-comparison__files li:last-child {
+  border-bottom: 0;
+}
+
+.duplicate-comparison__files label {
+  align-items: baseline;
+  display: grid;
+  gap: 8px 12px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  line-height: 1.45;
+}
+
+.duplicate-comparison__files input,
+.duplicate-comparison__consent input {
+  accent-color: Highlight;
+  height: 1.1em;
+  width: 1.1em;
+}
+
+.duplicate-comparison__filename {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.duplicate-comparison__files label > span:last-child {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.duplicate-comparison__files small {
+  display: block;
+  line-height: 1.4;
+  margin: 4px 0 0 32px;
+  overflow-wrap: anywhere;
+}
+
+.duplicate-comparison__consent {
+  align-items: start;
+  display: flex;
+  gap: 10px;
+  line-height: 1.45;
+  margin: 14px 0;
+}
+
+.duplicate-comparison__consent input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.duplicate-comparison .button + .button {
+  margin-left: 8px;
+}
+
+.duplicate-comparison__result {
+  border-left: 3px solid currentColor;
+  margin: 20px 0;
+  padding: 4px 0 4px 14px;
+}
+
+.duplicate-comparison__result h4 {
+  margin-top: 0;
+}
+
+.duplicate-comparison__result ul {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 560px) {
+  .duplicate-comparison__files label {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .duplicate-comparison__files label > span:last-child {
+    grid-column: 2;
+    text-align: left;
+  }
+}
