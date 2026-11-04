@@ -15,6 +15,8 @@ export type FolderInventory = {
     id: string;
     name: string;
     kind: string;
+    availability: "dataless" | "unknown";
+    navigationBlocker: string | null;
     logicalBytes: string | null;
     allocatedBytes: string | null;
     linkCount: string | null;
@@ -333,8 +335,19 @@ export default function FolderInventoryPanel({
                       ) : (
                         entry.name
                       )}
+                      {entry.navigationBlocker && (
+                        <small className="inventory-boundary-reason">
+                          {navigationReasons[entry.navigationBlocker] ??
+                            "Folder traversal is unavailable."}
+                        </small>
+                      )}
                     </th>
-                    <td>{entry.kind}</td>
+                    <td>
+                      {entry.kind}
+                      {entry.availability === "dataless" && (
+                        <small> · dataless object</small>
+                      )}
+                    </td>
                     <td className="inventory-size">
                       <span
                         className="inventory-size-bar"
@@ -394,6 +407,21 @@ export default function FolderInventoryPanel({
               <dl>
                 <dt>Entry kind</dt>
                 <dd>{selected.kind}</dd>
+                <dt>Content availability</dt>
+                <dd>
+                  {selected.availability === "dataless"
+                    ? "Known dataless object; provider and hydration behavior unverified."
+                    : "Unknown; local content availability has not been established."}
+                </dd>
+                <dt>Folder traversal</dt>
+                <dd>
+                  {selected.navigationBlocker
+                    ? (navigationReasons[selected.navigationBlocker] ??
+                      "Folder traversal is unavailable.")
+                    : selected.canOpen
+                      ? "Explicit folder navigation available."
+                      : "Not a navigable folder entry."}
+                </dd>
                 <dt>Logical bytes</dt>
                 <dd>{selected.logicalBytes ?? "Unknown"}</dd>
                 <dt>Reported allocated bytes</dt>
@@ -448,4 +476,14 @@ const coverageReasons: Record<string, string> = {
   root_metadata_changed:
     "The folder changed during inspection; inspect it again.",
   root_metadata_unavailable: "The folder metadata could not be rechecked.",
+};
+
+const navigationReasons: Record<string, string> = {
+  dataless:
+    "Dataless directory: enumeration is blocked to avoid requesting its contents.",
+  cross_device: "Different volume: traversal is blocked.",
+  hidden: "Hidden folder: traversal is blocked by default.",
+  managed_boundary:
+    "Application or managed library boundary: traversal is blocked.",
+  depth_limit: "Navigation depth limit reached.",
 };

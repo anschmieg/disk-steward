@@ -30,6 +30,8 @@ const sample: FolderInventory = {
       id: "1",
       name: "Alpha",
       kind: "file",
+      availability: "unknown",
+      navigationBlocker: null,
       logicalBytes: "7",
       allocatedBytes: "4096",
       linkCount: "2",
@@ -40,6 +42,8 @@ const sample: FolderInventory = {
       id: "2",
       name: "Zeta",
       kind: "file",
+      availability: "unknown",
+      navigationBlocker: null,
       logicalBytes: "9007199254740993",
       allocatedBytes: "0",
       linkCount: "1",
@@ -50,6 +54,8 @@ const sample: FolderInventory = {
       id: "3",
       name: "Nested",
       kind: "folder",
+      availability: "unknown",
+      navigationBlocker: null,
       logicalBytes: null,
       allocatedBytes: null,
       linkCount: null,
@@ -392,4 +398,44 @@ test("failed page continuation closes the UI continuation without discarding the
   expect(screen.getByRole("button", { name: "Choose folder" })).toBeEnabled();
   expect(invoke).toHaveBeenCalledTimes(2);
   expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
+});
+
+test("known dataless folders show a reason and no Open control; absence of the flag remains unknown", async () => {
+  vi.mocked(invoke).mockResolvedValue({
+    ...sample,
+    entries: [
+      {
+        ...sample.entries[2],
+        name: "Remote folder",
+        availability: "dataless",
+        navigationBlocker: "dataless",
+        canOpen: false,
+      },
+      sample.entries[0],
+    ],
+  });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  expect(
+    screen.queryByRole("button", { name: "Open folder Remote folder" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByText(/Dataless directory: enumeration is blocked/),
+  ).toBeVisible();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Inspect Remote folder" }),
+  );
+  let evidence = screen.getByRole("region", { name: "Entry evidence" });
+  expect(within(evidence).getByText(/Known dataless object/)).toBeVisible();
+  expect(within(evidence).getByText(/Cleanup blocked/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Return to entry list" }));
+  fireEvent.click(screen.getByRole("button", { name: "Inspect Alpha" }));
+  evidence = screen.getByRole("region", { name: "Entry evidence" });
+  expect(
+    within(evidence).getByText(
+      /Unknown; local content availability has not been established/,
+    ),
+  ).toBeVisible();
+  expect(invoke).toHaveBeenCalledTimes(1);
 });

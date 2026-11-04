@@ -15,6 +15,10 @@ const MAX_LABEL_CHARS: usize = 120;
 const MAX_NAVIGATION_DEPTH: usize = 16;
 const MAX_PAGES_PER_DIRECTORY: u32 = 128;
 
+#[cfg(target_os = "macos")]
+// macOS SDK sys/stat.h defines SF_DATALESS as 0x40000000 (Xcode 16 SDK).
+const SF_DATALESS: u32 = 0x4000_0000;
+
 #[cfg(unix)]
 // Unix stat reports allocation in 512-byte units, not st_blksize units.
 fn allocated_bytes_from_blocks<T>(blocks: T) -> Option<u64>
@@ -33,8 +37,10 @@ pub struct FolderInventoryEntry {
     pub logical_bytes: Option<String>,
     pub allocated_bytes: Option<String>,
     pub link_count: Option<String>,
+    pub availability: &'static str,
     pub hard_linked: bool,
     pub can_open: bool,
+    pub navigation_blocker: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -174,6 +180,12 @@ impl FolderInventoryState {
                         .to_owned(),
                 });
             }
+            if entry.availability == "dataless" {
+                blockers.push(Blocker {
+                    code: "dataless_placeholder".to_owned(),
+                    reason: "The entry is marked dataless. Provider hydration and content availability are unknown; no contents were opened.".to_owned(),
+                });
+            }
             items.push(InventoryItem {
                 id: entry.id,
                 parent_id: None,
@@ -187,7 +199,8 @@ impl FolderInventoryState {
                 evidence: vec![EvidenceRef {
                     id: disk_steward_core::EvidenceId::new(),
                     summary: format!(
-                        "Observation {observation} at {breadcrumb_text}. Shallow metadata only; no paths or contents retained. Logical bytes: {}; allocated bytes: {}; link count: {}. Allocation is per-entry st_blocks metadata; hard links or shared storage may overlap, so this is not a unique or reclaimable total.",
+                        "Observation {observation} at {breadcrumb_text}. Shallow metadata only; no paths or contents retained. Availability: {}; logical bytes: {}; allocated bytes: {}; link count: {}. Provider and hydration behavior are unverified. Allocation is per-entry st_blocks metadata; hard links or shared storage may overlap, so this is not a unique or reclaimable total.",
+                        entry.availability,
                         entry.logical_bytes.as_deref().unwrap_or("unknown"),
                         entry.allocated_bytes.as_deref().unwrap_or("unknown"),
                         entry.link_count.as_deref().unwrap_or("unknown"),
@@ -361,6 +374,7 @@ fn root_metadata_matches(before: &rustix::fs::Stat, after: &rustix::fs::Stat) ->
         && before.st_mtime_nsec == after.st_mtime_nsec
         && before.st_ctime == after.st_ctime
         && before.st_ctime_nsec == after.st_ctime_nsec
+        && is_dataless(before) == is_dataless(after)
 }
 
 #[cfg(unix)]
@@ -369,6 +383,72 @@ fn identity(stat: &rustix::fs::Stat) -> DirectoryIdentity {
         device: stat.st_dev as u64,
         inode: stat.st_ino,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_dataless(stat: &rustix::fs::Stat) -> bool {
+    stat.st_flags & SF_DATALESS != 0
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_dataless(_: &rustix::fs::Stat) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn availability(stat: &rustix::fs::Stat) -> &'static str {
+    if is_dataless(stat) {
+        "dataless"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(unix)]
+fn refuse_dataless_directory(stat: &rustix::fs::Stat) -> Result<(), &'static str> {
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory
+        && is_dataless(stat)
+    {
+        Err("This folder is marked dataless. Choose another folder to inspect.")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn folder_navigation_blocker(
+    stat: &rustix::fs::Stat,
+    name: &[u8],
+    root_device: u64,
+    depth: usize,
+) -> Option<&'static str> {
+    if is_dataless(stat) {
+        Some("dataless")
+    } else if stat.st_dev as u64 != root_device {
+        Some("cross_device")
+    } else if name.first() == Some(&b'.') {
+        Some("hidden")
+    } else if is_managed_boundary(name) {
+        Some("managed_boundary")
+    } else if depth >= MAX_NAVIGATION_DEPTH {
+        Some("depth_limit")
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn directory_navigation_policy(
+    stat: &rustix::fs::Stat,
+    name: &[u8],
+    root_device: u64,
+    depth: usize,
+) -> (bool, Option<&'static str>) {
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+        return (false, None);
+    }
+    let blocker = folder_navigation_blocker(stat, name, root_device, depth);
+    (blocker.is_none(), blocker)
 }
 
 #[cfg(unix)]
@@ -407,13 +487,16 @@ fn scan_selected_folder_with_limits(
     max_entries: usize,
     duration: Duration,
 ) -> Result<FolderInventorySnapshot, &'static str> {
-    use rustix::fs::{fstat, open, FileType, Mode, OFlags};
+    use rustix::fs::{fstat, open, statat, AtFlags, FileType, Mode, OFlags, CWD};
     use std::os::fd::OwnedFd;
 
     let root_label = path_label(path);
     if path_has_managed_boundary(path) {
         return Err("This managed application or library folder is not traversed.");
     }
+    let selected_stat = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| "The selected folder metadata is unavailable.")?;
+    refuse_dataless_directory(&selected_stat)?;
     let root_fd: OwnedFd = open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -426,6 +509,7 @@ fn scan_selected_folder_with_limits(
     if FileType::from_raw_mode(root_before.st_mode) != FileType::Directory {
         return Err("The selected location is not a directory.");
     }
+    refuse_dataless_directory(&root_before)?;
     let frame = DirectoryFrame {
         fd: root_fd,
         label: root_label.clone(),
@@ -509,6 +593,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     {
         return Err("The selected folder changed. Choose it again to inspect it.");
     }
+    refuse_dataless_directory(&root_before)?;
     let mut pending_cursor = cursor;
     let cursor_baseline = pending_cursor
         .as_ref()
@@ -594,8 +679,10 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
                     logical_bytes: None,
                     allocated_bytes: None,
                     link_count: None,
+                    availability: "unknown",
                     hard_linked: false,
                     can_open: false,
+                    navigation_blocker: None,
                 });
                 snapshot
                     .stop_reason
@@ -605,13 +692,14 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         };
         let file_type = FileType::from_raw_mode(metadata.st_mode);
         let entry_identity = identity(&metadata);
-        let is_directory = file_type == FileType::Directory;
         let (kind, entry_logical_bytes) = if entry_identity.device != root_device {
             if file_type == FileType::Directory {
                 snapshot.directories_not_traversed =
                     snapshot.directories_not_traversed.saturating_add(1);
+                ("folder", None)
+            } else {
+                ("unsupported", None)
             }
-            ("unsupported", None)
         } else {
             match file_type {
                 FileType::RegularFile => {
@@ -636,7 +724,6 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
                 }
             }
         }
-        let hidden = raw_name.first() == Some(&b'.');
         let (allocated_bytes, link_count) = if kind == "file" {
             (
                 allocated_bytes_from_blocks(metadata.st_blocks).map(|bytes| bytes.to_string()),
@@ -645,11 +732,8 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         } else {
             (None, None)
         };
-        let can_open = is_directory
-            && entry_identity.device == root_device
-            && !hidden
-            && !is_managed_boundary(raw_name)
-            && depth < MAX_NAVIGATION_DEPTH;
+        let (can_open, navigation_blocker) =
+            directory_navigation_policy(&metadata, raw_name, root_device, depth);
         snapshot.entries.push(FolderInventoryEntry {
             id,
             name: label,
@@ -657,8 +741,10 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             logical_bytes: entry_logical_bytes.map(|size| size.to_string()),
             allocated_bytes,
             link_count,
+            availability: availability(&metadata),
             hard_linked: kind == "file" && metadata.st_nlink > 1,
             can_open,
+            navigation_blocker,
         });
         observed_entries.push(ObservedEntry {
             id,
@@ -704,6 +790,9 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         Ok(after) => root_metadata_matches(&cursor_baseline, after),
         Err(_) => false,
     };
+    if let Ok(after) = &root_after {
+        refuse_dataless_directory(after)?;
+    }
     match root_after {
         Ok(_) if stable => {}
         Ok(_) => {
@@ -751,9 +840,17 @@ fn selected_root_session(
     use std::os::fd::OwnedFd;
 
     let started = Instant::now();
+    use rustix::fs::{statat, AtFlags, CWD};
     if path_has_managed_boundary(path) {
         return Err("This managed application or library folder is not traversed.");
     }
+    let selected_stat = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW);
+    if started.elapsed() >= duration {
+        return Err("The selected folder metadata could not be read within the inventory limit.");
+    }
+    let selected_stat =
+        selected_stat.map_err(|_| "The selected folder metadata is unavailable.")?;
+    refuse_dataless_directory(&selected_stat)?;
     let root_label = path_label(path);
     let opened = open(
         path,
@@ -772,6 +869,7 @@ fn selected_root_session(
     if FileType::from_raw_mode(root_stat.st_mode) != FileType::Directory {
         return Err("The selected location is not a directory.");
     }
+    refuse_dataless_directory(&root_stat)?;
     let root_identity = identity(&root_stat);
     let frame = DirectoryFrame {
         fd,
@@ -823,6 +921,7 @@ fn validate_session_bindings(
             return Err("Folder observation expired. Inspect the folder again.");
         }
         let stat = stat.map_err(|_| "Folder observation changed. Inspect the folder again.")?;
+        refuse_dataless_directory(&stat)?;
         if identity(&stat) != frame.identity
             || frame.identity.device != session.root_device
             || FileType::from_raw_mode(stat.st_mode) != FileType::Directory
@@ -853,6 +952,7 @@ fn validate_session_bindings(
             return Err("Folder observation expired. Inspect the folder again.");
         }
         let stat = stat.map_err(|_| "Folder observation changed. Inspect the folder again.")?;
+        refuse_dataless_directory(&stat)?;
         if identity(&stat) != frame.identity
             || stat.st_dev as u64 != session.root_device
             || FileType::from_raw_mode(stat.st_mode) != FileType::Directory
@@ -901,6 +1001,7 @@ fn validate_child_binding(
     }
     let named_stat =
         named_stat.map_err(|_| "Folder observation changed. Inspect the folder again.")?;
+    refuse_dataless_directory(&named_stat)?;
     if identity(&named_stat) != child.identity
         || named_stat.st_dev as u64 != root_device
         || FileType::from_raw_mode(named_stat.st_mode) != FileType::Directory
@@ -913,6 +1014,7 @@ fn validate_child_binding(
     }
     let held_stat =
         held_stat.map_err(|_| "Folder observation changed. Inspect the folder again.")?;
+    refuse_dataless_directory(&held_stat)?;
     if identity(&held_stat) != child.identity
         || held_stat.st_dev as u64 != root_device
         || FileType::from_raw_mode(held_stat.st_mode) != FileType::Directory
@@ -1002,6 +1104,7 @@ fn navigate_session(
         return Err("Folder observation expired. Inspect the folder again.");
     }
     let named_stat = named_stat.map_err(|_| "Folder entry changed. Inspect the folder again.")?;
+    refuse_dataless_directory(&named_stat)?;
     if identity(&named_stat) != observed.identity
         || named_stat.st_dev as u64 != session.root_device
         || FileType::from_raw_mode(named_stat.st_mode) != FileType::Directory
@@ -1023,6 +1126,7 @@ fn navigate_session(
         return Err("Folder observation expired. Inspect the folder again.");
     }
     let child_stat = child_stat.map_err(|_| "Folder entry changed. Inspect the folder again.")?;
+    refuse_dataless_directory(&child_stat)?;
     if identity(&child_stat) != observed.identity
         || child_stat.st_dev as u64 != session.root_device
         || FileType::from_raw_mode(child_stat.st_mode) != FileType::Directory
@@ -1317,6 +1421,7 @@ mod tests {
         assert_eq!(snapshot.regular_file_logical_bytes, "7");
         assert_eq!(snapshot.directories_not_traversed, 1);
         let entries = &snapshot.entries;
+        assert!(entries.iter().all(|entry| entry.availability == "unknown"));
         assert!(entries.iter().any(|entry| entry.kind == "folder"));
         assert!(entries.iter().any(|entry| entry.kind == "symlink"));
         assert!(entries
@@ -1342,8 +1447,10 @@ mod tests {
             .unwrap();
         assert_eq!(folder.allocated_bytes, None);
         assert_eq!(folder.link_count, None);
+        assert_eq!(folder.navigation_blocker, None);
         assert_eq!(link.allocated_bytes, None);
         assert_eq!(link.link_count, None);
+        assert_eq!(link.navigation_blocker, None);
 
         let file_json = serde_json::to_value(regular_files[0]).unwrap();
         assert_eq!(
@@ -1375,6 +1482,55 @@ mod tests {
             Some(maximum_blocks * 512)
         );
         assert_eq!(allocated_bytes_from_blocks(maximum_blocks + 1), None);
+    }
+
+    #[test]
+    fn folder_navigation_explanations_match_openability_policy() {
+        use rustix::fs::{statat, AtFlags, CWD};
+
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("normal")).unwrap();
+        let stat = statat(CWD, root.path().join("normal"), AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let root_device = stat.st_dev as u64;
+        assert_eq!(
+            folder_navigation_blocker(&stat, b"normal", root_device, 1),
+            None
+        );
+        assert_eq!(
+            folder_navigation_blocker(&stat, b".hidden", root_device, 1),
+            Some("hidden")
+        );
+        assert_eq!(
+            folder_navigation_blocker(&stat, b"Mock.app", root_device, 1),
+            Some("managed_boundary")
+        );
+        assert_eq!(
+            folder_navigation_blocker(&stat, b"normal", root_device, MAX_NAVIGATION_DEPTH),
+            Some("depth_limit")
+        );
+        assert_eq!(
+            folder_navigation_blocker(&stat, b"normal", root_device ^ 1, 1),
+            Some("cross_device")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dataless_flag_is_exact_and_blocks_directory_enumeration() {
+        use rustix::fs::{statat, AtFlags, CWD};
+
+        let root = tempdir().unwrap();
+        let stat = statat(CWD, root.path(), AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert_eq!(availability(&stat), "unknown");
+        let mut marked = stat;
+        marked.st_flags = SF_DATALESS | 0x1;
+        assert!(is_dataless(&marked));
+        assert_eq!(availability(&marked), "dataless");
+        assert!(refuse_dataless_directory(&marked).is_err());
+        marked.st_flags = 0x1;
+        assert!(!is_dataless(&marked));
+        assert_eq!(availability(&marked), "unknown");
+        assert!(refuse_dataless_directory(&marked).is_ok());
     }
 
     #[test]
@@ -1694,6 +1850,16 @@ mod tests {
                 .unwrap()
                 .can_open
         );
+        assert_eq!(
+            session
+                .snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.name == ".hidden")
+                .unwrap()
+                .navigation_blocker,
+            Some("hidden")
+        );
         assert!(
             !session
                 .entries
@@ -1701,6 +1867,16 @@ mod tests {
                 .find(|entry| safe_label_bytes(&entry.name) == "App.app")
                 .unwrap()
                 .can_open
+        );
+        assert_eq!(
+            session
+                .snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.name == "App.app")
+                .unwrap()
+                .navigation_blocker,
+            Some("managed_boundary")
         );
         let simulated_device = session.root_device.saturating_add(1);
         let normal = session
@@ -1745,6 +1921,12 @@ mod tests {
         }
         assert_eq!(session.frames.len(), MAX_NAVIGATION_DEPTH);
         assert!(session.entries.iter().all(|entry| !entry.can_open));
+        assert!(session
+            .snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "folder")
+            .all(|entry| entry.navigation_blocker == Some("depth_limit")));
     }
 
     #[test]
@@ -1886,6 +2068,42 @@ mod tests {
                 .unwrap_err(),
             "unsafe_observed_size"
         );
+    }
+
+    #[test]
+    fn dataless_file_import_stays_blocked_and_records_unknown_provider_state() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("placeholder"), b"unchanged").unwrap();
+        let (mut session, snapshot) =
+            selected_root_session(root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        let file = session
+            .snapshot
+            .entries
+            .iter_mut()
+            .find(|entry| entry.kind == "file")
+            .unwrap();
+        file.availability = "dataless";
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+        let items = state
+            .blocked_items_for_observation(snapshot.observation_id)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].suggestion.choice,
+            disk_steward_plan_model::Choice::Keep
+        );
+        assert!(items[0]
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "dataless_placeholder"));
+        assert!(items[0].storage_identity.is_none());
+        assert!(items[0].evidence[0]
+            .summary
+            .contains("Availability: dataless"));
+        assert!(items[0].evidence[0]
+            .summary
+            .contains("Provider and hydration behavior are unverified"));
     }
 
     #[test]
@@ -2032,6 +2250,25 @@ mod tests {
         assert!(!session.snapshot.can_continue);
         assert_eq!(session.observation_id, second.observation_id);
         assert_eq!(session.snapshot.entries, second.entries);
+    }
+
+    #[test]
+    fn cross_volume_directories_never_gain_navigation_from_unsupported_display_kind() {
+        use rustix::fs::{statat, AtFlags, CWD};
+        let root = tempdir().unwrap();
+        let stat = statat(CWD, root.path(), AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert_eq!(
+            directory_navigation_policy(&stat, b"normal", identity(&stat).device, 1),
+            (true, None)
+        );
+        assert_eq!(
+            directory_navigation_policy(&stat, b"normal", identity(&stat).device ^ 1, 1),
+            (false, Some("cross_device"))
+        );
+        assert_eq!(
+            directory_navigation_policy(&stat, b".hidden", identity(&stat).device, 1),
+            (false, Some("hidden"))
+        );
     }
 
     fn symlink_for_test(target: &Path, link: &Path) {
