@@ -1,5 +1,6 @@
-//! Persistent, review-only synthetic cleanup plan. This crate never accesses
-//! user files and its frozen review records are not approvals.
+//! Persistent review-only plans with closed synthetic and pytest corpus
+//! profiles. This crate never accesses user files and frozen reviews are not
+//! approvals.
 use std::{path::Path, time::Duration};
 
 use disk_steward_core::{ActionId, EvidenceId, PlanId, ReviewId, RevisionId};
@@ -7,9 +8,11 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const APP_ID: i64 = 0x4453_5250;
+const SYNTHETIC_APP_ID: i64 = 0x4453_5250;
+const PYTEST_APP_ID: i64 = 0x4453_5050;
 const SCHEMA: i64 = 1;
-const KIND: &str = "non_executable_example";
+const SYNTHETIC_KIND: &str = "non_executable_example";
+const PYTEST_KIND: &str = "non_executable_pytest_corpus";
 const MANIFEST_VERSION: u32 = 1;
 const REVIEW_CONTRACT_VERSION: &str = "disk-steward-review-plan-v1";
 const MAX_STORED_JSON_BYTES: usize = 64 * 1024;
@@ -26,6 +29,38 @@ pub enum Decision {
 pub enum Category {
     Build,
     Cache,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewPlanProfile {
+    SyntheticV1,
+    Pytest920V1,
+}
+impl ReviewPlanProfile {
+    const fn application_id(self) -> i64 {
+        match self {
+            Self::SyntheticV1 => SYNTHETIC_APP_ID,
+            Self::Pytest920V1 => PYTEST_APP_ID,
+        }
+    }
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::SyntheticV1 => SYNTHETIC_KIND,
+            Self::Pytest920V1 => PYTEST_KIND,
+        }
+    }
+    const fn evidence_summary(self) -> &'static str {
+        match self {
+            Self::SyntheticV1 => SYNTHETIC_EVIDENCE_SUMMARY,
+            Self::Pytest920V1 => PYTEST_EVIDENCE_SUMMARY,
+        }
+    }
+    const fn fixtures(self) -> &'static [(&'static str, Category, u64)] {
+        match self {
+            Self::SyntheticV1 => &SYNTHETIC_FIXTURES,
+            Self::Pytest920V1 => &PYTEST_FIXTURES,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,9 +152,18 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// SQLite-backed plan store. `path` is supplied by the trusted native owner.
 pub struct ReviewPlanStore {
     connection: Connection,
+    profile: ReviewPlanProfile,
 }
 impl ReviewPlanStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        Self::open_with_profile(path, ReviewPlanProfile::SyntheticV1)
+    }
+
+    pub fn open_pytest_corpus(path: impl AsRef<Path>) -> StoreResult<Self> {
+        Self::open_with_profile(path, ReviewPlanProfile::Pytest920V1)
+    }
+
+    fn open_with_profile(path: impl AsRef<Path>, profile: ReviewPlanProfile) -> StoreResult<Self> {
         let database_path = nofollow_database_path(path.as_ref())?;
         let mut connection = Connection::open_with_flags(
             database_path,
@@ -130,11 +174,18 @@ impl ReviewPlanStore {
         )?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        initialize(&mut connection)?;
-        Ok(Self { connection })
+        initialize(&mut connection, profile)?;
+        Ok(Self {
+            connection,
+            profile,
+        })
+    }
+
+    pub fn profile(&self) -> ReviewPlanProfile {
+        self.profile
     }
     pub fn get_plan(&self) -> StoreResult<PlanView> {
-        read_current(&self.connection)
+        read_current(&self.connection, self.profile)
     }
     pub fn edit(
         &mut self,
@@ -145,7 +196,7 @@ impl ReviewPlanStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let plan = current(&tx)?;
+        let plan = current(&tx, self.profile)?;
         if plan.revision_id != expected_revision {
             return Err(StoreError::StaleRevision);
         }
@@ -178,7 +229,7 @@ impl ReviewPlanStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let plan = current(&tx)?;
+        let plan = current(&tx, self.profile)?;
         if plan.revision_id != expected_revision {
             return Err(StoreError::StaleRevision);
         }
@@ -200,20 +251,20 @@ impl ReviewPlanStore {
             .optional()?
         {
             let review: FrozenReview = parse_bounded(&json)?;
-            verify_review(&review)?;
-            verify_review_binding(&review, &plan)?;
+            verify_review(&review, self.profile)?;
+            verify_review_binding(&review, &plan, self.profile)?;
             if id_string(review.review_id)? != review_id || review.manifest_sha256 != digest {
                 return Err(StoreError::CorruptData);
             }
             return Ok(review);
         }
         let review_id = ReviewId::new();
-        validate_actions(&plan.actions)?;
+        validate_actions(&plan.actions, self.profile)?;
         let hash_input = Manifest {
             review_contract_version: REVIEW_CONTRACT_VERSION,
             manifest_version: MANIFEST_VERSION,
             schema_version: 1,
-            kind: KIND,
+            kind: self.profile.kind(),
             plan_id: plan.plan_id,
             revision_id: plan.revision_id,
             revision_number: plan.revision_number,
@@ -227,7 +278,7 @@ impl ReviewPlanStore {
         let digest = format!("{:x}", Sha256::digest(bytes));
         let review = FrozenReview {
             schema_version: 1,
-            kind: KIND.into(),
+            kind: self.profile.kind().into(),
             review_id,
             plan_id: plan.plan_id,
             revision_id: plan.revision_id,
@@ -262,28 +313,28 @@ struct Manifest<'a> {
     selected_count: u32,
     execution_available: bool,
 }
-fn verify_review(r: &FrozenReview) -> StoreResult<()> {
-    if r.schema_version != 1 || r.kind != KIND || r.execution_available {
+fn verify_review(r: &FrozenReview, profile: ReviewPlanProfile) -> StoreResult<()> {
+    if r.schema_version != 1 || r.kind != profile.kind() || r.execution_available {
         return Err(StoreError::CorruptData);
     }
-    validate_actions(&r.actions)?;
+    validate_actions(&r.actions, profile)?;
     let (total, selected, count) = totals(&r.actions)?;
     if (r.total_bytes, r.selected_bytes, r.selected_count) != (total, selected, count) || count == 0
     {
         return Err(StoreError::CorruptData);
     }
-    if manifest_digest(r) != r.manifest_sha256 {
+    if manifest_digest(r, profile) != r.manifest_sha256 {
         return Err(StoreError::CorruptData);
     }
     Ok(())
 }
 
-fn manifest_digest(r: &FrozenReview) -> String {
+fn manifest_digest(r: &FrozenReview, profile: ReviewPlanProfile) -> String {
     let m = Manifest {
         review_contract_version: REVIEW_CONTRACT_VERSION,
         manifest_version: MANIFEST_VERSION,
         schema_version: r.schema_version,
-        kind: KIND,
+        kind: profile.kind(),
         plan_id: r.plan_id,
         revision_id: r.revision_id,
         revision_number: r.revision_number,
@@ -302,31 +353,38 @@ fn parse_bounded<T: for<'de> Deserialize<'de>>(json: &str) -> StoreResult<T> {
     }
     serde_json::from_str(json).map_err(|_| StoreError::CorruptData)
 }
-fn validate_actions(actions: &[ActionView]) -> StoreResult<()> {
+fn validate_actions(actions: &[ActionView], profile: ReviewPlanProfile) -> StoreResult<()> {
     use std::collections::HashSet;
-    if actions.len() != FIXTURES.len() {
+    let fixtures = profile.fixtures();
+    if actions.len() != fixtures.len() {
         return Err(StoreError::CorruptData);
     }
     let mut action_ids = HashSet::new();
     let mut evidence_ids = HashSet::new();
-    for (a, (label, category, bytes)) in actions.iter().zip(FIXTURES) {
-        if a.label != label
-            || a.category != category
-            || a.bytes != bytes
+    for (a, (label, category, bytes)) in actions.iter().zip(fixtures) {
+        if a.label != *label
+            || a.category != *category
+            || a.bytes != *bytes
             || a.evidence.len() != 1
             || !action_ids.insert(a.id)
         {
             return Err(StoreError::CorruptData);
         }
         let evidence = &a.evidence[0];
-        if evidence.summary != EVIDENCE_SUMMARY || !evidence_ids.insert(evidence.id) {
+        if evidence.summary != profile.evidence_summary() || !evidence_ids.insert(evidence.id) {
             return Err(StoreError::CorruptData);
         }
     }
     Ok(())
 }
-fn verify_review_binding(review: &FrozenReview, plan: &PlanView) -> StoreResult<()> {
-    if review.plan_id != plan.plan_id
+fn verify_review_binding(
+    review: &FrozenReview,
+    plan: &PlanView,
+    profile: ReviewPlanProfile,
+) -> StoreResult<()> {
+    if review.kind != profile.kind()
+        || plan.kind != profile.kind()
+        || review.plan_id != plan.plan_id
         || review.revision_id != plan.revision_id
         || review.revision_number != plan.revision_number
         || review.actions != plan.actions
@@ -365,7 +423,8 @@ fn id_string<T: Serialize>(id: T) -> StoreResult<String> {
 fn from_id<T: std::str::FromStr>(s: String) -> StoreResult<T> {
     s.parse().map_err(|_| StoreError::CorruptData)
 }
-fn current(c: &Connection) -> StoreResult<PlanView> {
+fn current(c: &Connection, profile: ReviewPlanProfile) -> StoreResult<PlanView> {
+    verify_database_profile(c, profile)?;
     let (plan, revision): (String, String) = c.query_row(
         "SELECT plan_id,revision_id FROM plan_state WHERE singleton=1",
         [],
@@ -381,11 +440,11 @@ fn current(c: &Connection) -> StoreResult<PlanView> {
         return Err(StoreError::CorruptData);
     }
     let actions: Vec<ActionView> = parse_bounded(&json)?;
-    validate_actions(&actions)?;
+    validate_actions(&actions, profile)?;
     let (total, selected, count) = totals(&actions)?;
     Ok(PlanView {
         schema_version: 1,
-        kind: KIND.into(),
+        kind: profile.kind().into(),
         plan_id: from_id(plan)?,
         revision_id: from_id(revision)?,
         revision_number: u64::try_from(number).map_err(|_| StoreError::CorruptData)?,
@@ -396,14 +455,14 @@ fn current(c: &Connection) -> StoreResult<PlanView> {
         execution_available: false,
     })
 }
-fn read_current(c: &Connection) -> StoreResult<PlanView> {
-    current(c)
+fn read_current(c: &Connection, profile: ReviewPlanProfile) -> StoreResult<PlanView> {
+    current(c, profile)
 }
 
 const STATE:&str="CREATE TABLE plan_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),plan_id TEXT NOT NULL,revision_id TEXT NOT NULL)";
 const REVS:&str="CREATE TABLE revisions(revision_id TEXT PRIMARY KEY,revision_number INTEGER NOT NULL UNIQUE,actions_json TEXT NOT NULL)";
 const REVIEWS:&str="CREATE TABLE reviews(review_id TEXT PRIMARY KEY,revision_id TEXT NOT NULL UNIQUE,manifest_sha256 TEXT NOT NULL,review_json TEXT NOT NULL,FOREIGN KEY(revision_id) REFERENCES revisions(revision_id))";
-fn initialize(c: &mut Connection) -> StoreResult<()> {
+fn initialize(c: &mut Connection, profile: ReviewPlanProfile) -> StoreResult<()> {
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let c = &tx;
     let app: i64 = c.query_row("PRAGMA application_id", [], |r| r.get(0))?;
@@ -417,7 +476,7 @@ fn initialize(c: &mut Connection) -> StoreResult<()> {
         tx.execute_batch(&format!("{STATE};{REVS};{REVIEWS};"))?;
         let plan = PlanId::new();
         let revision = RevisionId::new();
-        let actions = fixtures();
+        let actions = fixtures(profile);
         let json = serde_json::to_string(&actions).map_err(|_| StoreError::CorruptData)?;
         tx.execute(
             "INSERT INTO revisions VALUES(?1,1,?2)",
@@ -428,12 +487,13 @@ fn initialize(c: &mut Connection) -> StoreResult<()> {
             params![id_string(plan)?, id_string(revision)?],
         )?;
         tx.execute_batch(&format!(
-            "PRAGMA application_id={APP_ID};PRAGMA user_version={SCHEMA};"
+            "PRAGMA application_id={};PRAGMA user_version={SCHEMA};",
+            profile.application_id()
         ))?;
         tx.commit()?;
         return Ok(());
     }
-    if app != APP_ID || ver != SCHEMA {
+    if app != profile.application_id() || ver != SCHEMA {
         return Err(StoreError::UnsupportedSchema);
     }
     let count: i64 = c.query_row(
@@ -464,8 +524,45 @@ fn initialize(c: &mut Connection) -> StoreResult<()> {
     if state != 1 {
         return Err(StoreError::UnsupportedSchema);
     }
-    let _ = current(c)?;
+    let _ = current(c, profile)?;
     tx.commit()?;
+    Ok(())
+}
+
+fn verify_database_profile(c: &Connection, profile: ReviewPlanProfile) -> StoreResult<()> {
+    let app: i64 = c.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+    let ver: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if app != profile.application_id() || ver != SCHEMA {
+        return Err(StoreError::UnsupportedSchema);
+    }
+    let count: i64 = c.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'",
+        [],
+        |r| r.get(0),
+    )?;
+    if count != 3 {
+        return Err(StoreError::UnsupportedSchema);
+    }
+    for (name, sql) in [
+        ("plan_state", STATE),
+        ("revisions", REVS),
+        ("reviews", REVIEWS),
+    ] {
+        let actual: Option<String> = c
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if actual.as_deref().map(normalize) != Some(normalize(sql)) {
+            return Err(StoreError::UnsupportedSchema);
+        }
+    }
+    let state: i64 = c.query_row("SELECT COUNT(*) FROM plan_state", [], |r| r.get(0))?;
+    if state != 1 {
+        return Err(StoreError::UnsupportedSchema);
+    }
     Ok(())
 }
 fn normalize(s: &str) -> String {
@@ -474,26 +571,34 @@ fn normalize(s: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
-const EVIDENCE_SUMMARY: &str = "Disposable synthetic example; not a real detector certification.";
-const FIXTURES: [(&str, Category, u64); 5] = [
+const SYNTHETIC_EVIDENCE_SUMMARY: &str =
+    "Disposable synthetic example; not a real detector certification.";
+const PYTEST_EVIDENCE_SUMMARY: &str =
+    "App-owned copied pytest 9.2.0 corpus; not a live project certification.";
+const SYNTHETIC_FIXTURES: [(&str, Category, u64); 5] = [
     ("Compiler output", Category::Build, 3_145_728u64),
     ("Test cache", Category::Cache, 1_048_576),
     ("Preview cache", Category::Cache, 524_288),
     ("Package index", Category::Cache, 262_144),
     ("Incremental output", Category::Build, 131_072),
 ];
-fn fixtures() -> Vec<ActionView> {
-    FIXTURES
-        .into_iter()
+const PYTEST_FIXTURES: [(&str, Category, u64); 2] = [
+    ("pytest nodeids corpus", Category::Cache, 70),
+    ("pytest lastfailed corpus", Category::Cache, 42),
+];
+fn fixtures(profile: ReviewPlanProfile) -> Vec<ActionView> {
+    profile
+        .fixtures()
+        .iter()
         .map(|(label, category, bytes)| ActionView {
             id: ActionId::new(),
-            label: label.into(),
-            category,
-            bytes,
+            label: (*label).into(),
+            category: *category,
+            bytes: *bytes,
             decision: Decision::Keep,
             evidence: vec![EvidenceView {
                 id: EvidenceId::new(),
-                summary: EVIDENCE_SUMMARY.into(),
+                summary: profile.evidence_summary().into(),
             }],
         })
         .collect()
@@ -539,6 +644,185 @@ mod tests {
         assert_eq!(same.revision_id, plan.revision_id);
         assert_eq!(same.revision_number, 1);
     }
+
+    #[test]
+    fn pytest_profile_seeds_only_the_fixed_copied_corpus_and_is_non_executable() {
+        let (_d, p) = path();
+        let store = ReviewPlanStore::open_pytest_corpus(&p).unwrap();
+        assert_eq!(store.profile(), ReviewPlanProfile::Pytest920V1);
+        let plan = store.get_plan().unwrap();
+        assert_eq!(plan.kind, PYTEST_KIND);
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(plan.actions[0].label, "pytest nodeids corpus");
+        assert_eq!(plan.actions[1].label, "pytest lastfailed corpus");
+        assert_eq!(plan.actions[0].category, Category::Cache);
+        assert_eq!(plan.actions[1].category, Category::Cache);
+        assert_eq!(plan.actions[0].bytes, 70);
+        assert_eq!(plan.actions[1].bytes, 42);
+        assert!(plan
+            .actions
+            .iter()
+            .all(|action| action.decision == Decision::Keep));
+        assert!(plan.actions.iter().all(|action| action.evidence.len() == 1));
+        assert!(plan
+            .actions
+            .iter()
+            .all(|action| action.evidence[0].summary == PYTEST_EVIDENCE_SUMMARY));
+        assert_eq!(plan.total_bytes, 112);
+        assert_eq!(plan.selected_count, 0);
+        assert_eq!(plan.selected_bytes, 0);
+        assert!(!plan.execution_available);
+        let app: i64 = store
+            .connection
+            .query_row("PRAGMA application_id", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(app, PYTEST_APP_ID);
+    }
+
+    #[test]
+    fn pytest_profile_edits_freezes_and_reopens_with_keep_defaults() {
+        let (_d, p) = path();
+        let review;
+        {
+            let mut store = ReviewPlanStore::open_pytest_corpus(&p).unwrap();
+            let original = store.get_plan().unwrap();
+            let changed = store
+                .edit(
+                    original.revision_id,
+                    original.actions[0].id,
+                    Decision::Include,
+                )
+                .unwrap();
+            assert_eq!(changed.selected_count, 1);
+            assert_eq!(changed.selected_bytes, 70);
+            assert!(matches!(
+                store.edit(
+                    original.revision_id,
+                    original.actions[1].id,
+                    Decision::Include
+                ),
+                Err(StoreError::StaleRevision)
+            ));
+            review = store.freeze_review(changed.revision_id).unwrap();
+            assert_eq!(review.kind, PYTEST_KIND);
+            assert_eq!(review.selected_count, 1);
+            assert!(!review.execution_available);
+            verify_review(&review, ReviewPlanProfile::Pytest920V1).unwrap();
+            assert_eq!(store.freeze_review(changed.revision_id).unwrap(), review);
+        }
+        let mut reopened = ReviewPlanStore::open_pytest_corpus(&p).unwrap();
+        assert_eq!(reopened.profile(), ReviewPlanProfile::Pytest920V1);
+        assert_eq!(reopened.get_plan().unwrap().selected_bytes, 70);
+        assert_eq!(reopened.freeze_review(review.revision_id).unwrap(), review);
+    }
+
+    #[test]
+    fn database_profiles_are_distinct_and_wrong_profile_open_never_relabels() {
+        let (_d, synthetic_path) = path();
+        let original_synthetic = ReviewPlanStore::open(&synthetic_path)
+            .unwrap()
+            .get_plan()
+            .unwrap();
+        assert!(matches!(
+            ReviewPlanStore::open_pytest_corpus(&synthetic_path),
+            Err(StoreError::UnsupportedSchema)
+        ));
+        assert_eq!(
+            ReviewPlanStore::open(&synthetic_path)
+                .unwrap()
+                .get_plan()
+                .unwrap(),
+            original_synthetic
+        );
+
+        let (_d, pytest_path) = path();
+        let original_pytest = ReviewPlanStore::open_pytest_corpus(&pytest_path)
+            .unwrap()
+            .get_plan()
+            .unwrap();
+        assert!(matches!(
+            ReviewPlanStore::open(&pytest_path),
+            Err(StoreError::UnsupportedSchema)
+        ));
+        assert_eq!(
+            ReviewPlanStore::open_pytest_corpus(&pytest_path)
+                .unwrap()
+                .get_plan()
+                .unwrap(),
+            original_pytest
+        );
+    }
+
+    #[test]
+    fn profile_application_id_is_rechecked_before_read_edit_and_freeze() {
+        let (_d, p) = path();
+        let mut store = ReviewPlanStore::open_pytest_corpus(&p).unwrap();
+        let plan = store.get_plan().unwrap();
+        let external = Connection::open(&p).unwrap();
+        external
+            .pragma_update(None, "application_id", SYNTHETIC_APP_ID)
+            .unwrap();
+        assert!(matches!(
+            store.get_plan(),
+            Err(StoreError::UnsupportedSchema)
+        ));
+        assert!(matches!(
+            store.edit(plan.revision_id, plan.actions[0].id, Decision::Include),
+            Err(StoreError::UnsupportedSchema)
+        ));
+        assert!(matches!(
+            store.freeze_review(plan.revision_id),
+            Err(StoreError::UnsupportedSchema)
+        ));
+    }
+
+    #[test]
+    fn forged_cross_profile_frozen_review_is_rejected_on_read() {
+        let (_d, p) = path();
+        let mut store = ReviewPlanStore::open_pytest_corpus(&p).unwrap();
+        let plan = store.get_plan().unwrap();
+        let included = store
+            .edit(plan.revision_id, plan.actions[0].id, Decision::Include)
+            .unwrap();
+        let mut review = store.freeze_review(included.revision_id).unwrap();
+        review.kind = SYNTHETIC_KIND.into();
+        review.manifest_sha256 = manifest_digest(&review, ReviewPlanProfile::SyntheticV1);
+        let json = serde_json::to_string(&review).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE reviews SET review_json=?1,manifest_sha256=?2 WHERE revision_id=?3",
+                params![
+                    json,
+                    review.manifest_sha256,
+                    id_string(review.revision_id).unwrap()
+                ],
+            )
+            .unwrap();
+        let forged_before: String = store
+            .connection
+            .query_row(
+                "SELECT review_json FROM reviews WHERE revision_id=?1",
+                [id_string(included.revision_id).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forged_before, json);
+        assert!(matches!(
+            store.freeze_review(included.revision_id),
+            Err(StoreError::CorruptData)
+        ));
+        let forged_after: String = store
+            .connection
+            .query_row(
+                "SELECT review_json FROM reviews WHERE revision_id=?1",
+                [id_string(included.revision_id).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forged_after, forged_before);
+    }
+
     #[test]
     fn edit_stale_unknown_and_wrong_revision_are_rejected() {
         let (_d, p) = path();
@@ -596,7 +880,7 @@ mod tests {
             serde_json::from_str::<FrozenReview>(&raw).unwrap(),
             original
         );
-        verify_review(&original).unwrap();
+        verify_review(&original, ReviewPlanProfile::SyntheticV1).unwrap();
     }
     #[test]
     fn unknown_schema_is_preserved_and_refused() {
@@ -656,11 +940,11 @@ mod tests {
             .edit(plan.revision_id, plan.actions[0].id, Decision::Include)
             .unwrap();
         let review = s.freeze_review(included.revision_id).unwrap();
-        verify_review(&review).unwrap();
+        verify_review(&review, ReviewPlanProfile::SyntheticV1).unwrap();
         let mut altered = review.clone();
         altered.actions[0].bytes += 1;
         assert!(matches!(
-            verify_review(&altered),
+            verify_review(&altered, ReviewPlanProfile::SyntheticV1),
             Err(StoreError::CorruptData)
         ));
     }
@@ -709,7 +993,7 @@ mod tests {
         // the new revision token, then attach it to the current revision row.
         review.revision_id = second.revision_id;
         review.revision_number = second.revision_number;
-        review.manifest_sha256 = manifest_digest(&review);
+        review.manifest_sha256 = manifest_digest(&review, ReviewPlanProfile::SyntheticV1);
         let json = serde_json::to_string(&review).unwrap();
         let c = Connection::open(&p).unwrap();
         c.execute(

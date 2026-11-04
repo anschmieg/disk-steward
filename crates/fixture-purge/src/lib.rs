@@ -14,11 +14,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use disk_steward_core::{PlanId, ReceiptId, ReviewId, RevisionId, SessionId, SupportedOperation};
-use disk_steward_fixture_lifecycle::{FixtureLifecycle, FixtureStatus, PurgeItemOutcome};
-use disk_steward_review_plan::ReviewPlanStore;
+use disk_steward_fixture_lifecycle::{
+    FixtureLifecycle, FixtureProfile, FixtureStatus, PurgeItemOutcome,
+};
+use disk_steward_review_plan::{ReviewPlanProfile, ReviewPlanStore};
 
 const CONTROL_DB: &str = "fixture-purge-control-v1.sqlite3";
 const CONTROL_APPLICATION_ID: i64 = 0x4453_4650;
+const PYTEST_CONTROL_DB: &str = "pytest-corpus-purge-v1.sqlite3";
+const PYTEST_CONTROL_APPLICATION_ID: i64 = 0x4453_5055;
 const CONTROL_SCHEMA_VERSION: i64 = 1;
 const MAX_TARGETS: usize = 5;
 const REVIEW_LIFETIME_MS: i64 = 5 * 60 * 1000;
@@ -191,6 +195,7 @@ struct ManifestTargetV1 {
 
 pub struct FixturePurgeService {
     control: Connection,
+    profile: FixtureProfile,
     now: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
@@ -219,13 +224,34 @@ impl FixturePurgeService {
         app_owned_root: &Path,
         now: Box<dyn Fn() -> i64 + Send + Sync>,
     ) -> Result<Self, PurgeError> {
+        Self::open_profile_with_clock(app_owned_root, now, FixtureProfile::SyntheticV1)
+    }
+
+    /// Backend-only approval adapter for the closed app-owned pytest corpus.
+    /// This does not adopt live project files or share synthetic approvals.
+    pub fn open_pytest_corpus_with_clock(
+        app_owned_root: &Path,
+        now: Box<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Result<Self, PurgeError> {
+        Self::open_profile_with_clock(app_owned_root, now, FixtureProfile::Pytest920V1)
+    }
+
+    fn open_profile_with_clock(
+        app_owned_root: &Path,
+        now: Box<dyn Fn() -> i64 + Send + Sync>,
+        profile: FixtureProfile,
+    ) -> Result<Self, PurgeError> {
         let root = std::fs::canonicalize(app_owned_root)?;
         if !root.is_dir() {
             return Err(PurgeError::StorageFailure);
         }
-        let mut control = open_control_db(&root)?;
+        let mut control = open_control_db(&root, profile)?;
         recover_unfinished_executions(&mut control, (now)())?;
-        Ok(Self { control, now })
+        Ok(Self {
+            control,
+            profile,
+            now,
+        })
     }
 
     /// Freeze an immutable purge review over explicitly selected staged
@@ -238,7 +264,11 @@ impl FixturePurgeService {
         expected_revision: RevisionId,
         targets: Vec<PurgeTarget>,
     ) -> Result<PreparedPurgeReview, PurgeError> {
-        if targets.is_empty() || targets.len() > MAX_TARGETS {
+        require_control_profile(&self.control, self.profile)?;
+        if lifecycle.profile() != self.profile || !plan_matches_profile(plan, self.profile) {
+            return Err(PurgeError::UnsupportedSchema);
+        }
+        if targets.is_empty() || targets.len() > profile_max_targets(self.profile) {
             return Err(PurgeError::InvalidInput);
         }
         let mut seen_actions = std::collections::HashSet::new();
@@ -296,7 +326,7 @@ impl FixturePurgeService {
             created_at_ms,
             expires_at_ms: created_at_ms + REVIEW_LIFETIME_MS,
             selected_logical_bytes,
-            adapter_schema_version: 2,
+            adapter_schema_version: profile_adapter_version(self.profile),
             targets: build_manifest_targets(&review_targets, &snapshot)?,
         };
         // Canonical: serde_json of a typed struct is field-order
@@ -328,7 +358,7 @@ impl FixturePurgeService {
         self.checkpoint()?;
         Ok(PreparedPurgeReview {
             schema_version: 1,
-            kind: "disposable_fixture_purge_review".into(),
+            kind: profile_review_kind(self.profile).into(),
             review_id,
             plan_id: manifest.plan_id,
             revision_id: manifest.revision_id,
@@ -386,83 +416,8 @@ impl FixturePurgeService {
         &self,
         review_id: &ReviewId,
     ) -> Result<PreparedPurgeReview, PurgeError> {
-        let wire = serde_json::to_string(review_id).map_err(|_| PurgeError::StorageFailure)?;
-        let row: Option<StoredReviewRow> =
-            self.control
-                .query_row(
-                    "SELECT plan_id,revision_id,session_id,created_at_ms,expires_at_ms,manifest_sha256,targets_json,selected_logical_bytes,state FROM purge_reviews WHERE review_id=?1",
-                    [&wire],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                            r.get(7)?,
-                            r.get(8)?,
-                        ))
-                    },
-                )
-                .optional()?;
-        let Some(row) = row else {
-            return Err(PurgeError::ReviewReplayed);
-        };
-        // SQL byte limits are checked before any JSON is loaded.
-        if row.0.len() > MAX_ID_WIRE_BYTES
-            || row.1.len() > MAX_ID_WIRE_BYTES
-            || row.2.len() > MAX_ID_WIRE_BYTES
-            || row.6.len() > MAX_TARGETS_JSON_BYTES
-            || row.5.len() != 64
-        {
-            return Err(PurgeError::UnsupportedSchema);
-        }
-        let (
-            plan_id,
-            revision_id,
-            session_id,
-            created_at_ms,
-            expires_at_ms,
-            manifest_sha256,
-            targets_json,
-            selected_logical_bytes,
-            state,
-        ) = row;
-        // The state gate comes first: a claimed or finished review can
-        // never be claimed again, regardless of current plan/fixture state.
-        if state != "prepared" {
-            return Err(PurgeError::ReviewReplayed);
-        }
-        let plan_id: PlanId =
-            serde_json::from_str(&plan_id).map_err(|_| PurgeError::UnsupportedSchema)?;
-        let revision_id: RevisionId =
-            serde_json::from_str(&revision_id).map_err(|_| PurgeError::UnsupportedSchema)?;
-        let session_id: SessionId =
-            serde_json::from_str(&session_id).map_err(|_| PurgeError::UnsupportedSchema)?;
-        let targets: Vec<PurgeReviewTarget> =
-            serde_json::from_str(&targets_json).map_err(|_| PurgeError::UnsupportedSchema)?;
-        if targets.is_empty() || targets.len() > MAX_TARGETS {
-            return Err(PurgeError::UnsupportedSchema);
-        }
-        if manifest_sha256.len() != 64 {
-            return Err(PurgeError::UnsupportedSchema);
-        }
-        Ok(PreparedPurgeReview {
-            schema_version: 1,
-            kind: "disposable_fixture_purge_review".into(),
-            review_id: *review_id,
-            plan_id,
-            revision_id,
-            session_id,
-            operation: SupportedOperation::PermanentlyRemoveStaged,
-            created_at_ms,
-            expires_at_ms,
-            manifest_sha256,
-            targets,
-            selected_logical_bytes: selected_logical_bytes as u64,
-        })
+        require_control_profile(&self.control, self.profile)?;
+        load_stored_review(&self.control, review_id, "prepared")
     }
 
     /// Recompute the manifest over the CURRENT plan and lifecycle state and
@@ -474,6 +429,13 @@ impl FixturePurgeService {
         plan: &ReviewPlanStore,
         prepared: &PreparedPurgeReview,
     ) -> Result<(), PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
+        if lifecycle.profile() != self.profile || !plan_matches_profile(plan, self.profile) {
+            return Err(PurgeError::UnsupportedSchema);
+        }
+        if prepared.kind != profile_review_kind(self.profile) {
+            return Err(PurgeError::UnsupportedSchema);
+        }
         let plan_view = plan.get_plan().map_err(|_| PurgeError::StaleRevision)?;
         if plan_view.plan_id != prepared.plan_id || plan_view.revision_id != prepared.revision_id {
             return Err(PurgeError::StaleRevision);
@@ -520,6 +482,7 @@ impl FixturePurgeService {
     /// uncertain execution, or any pending child attempt. Stage, restore and
     /// purge consults gate on this (contract: both control stores).
     pub fn has_uncertainty(&self) -> Result<bool, PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
         let started: i64 = self.control.query_row(
             "SELECT EXISTS(SELECT 1 FROM purge_executions WHERE state IN ('started','uncertain')) OR EXISTS(SELECT 1 FROM purge_child_attempts WHERE state='pending')",
             [],
@@ -538,20 +501,81 @@ impl FixturePurgeService {
         child_attempts: &[disk_steward_core::AttemptId],
         now: i64,
     ) -> Result<(), PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
         let execution_wire =
             serde_json::to_string(&execution_id).map_err(|_| PurgeError::StorageFailure)?;
         let tx = self
             .control
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE purge_executions SET state='uncertain', finished_at_ms=COALESCE(finished_at_ms, ?1) WHERE execution_id=?2 AND state='started'",
+        if child_attempts.is_empty() || child_attempts.len() > profile_max_targets(self.profile) {
+            return Err(PurgeError::InvalidInput);
+        }
+        let execution: Option<String> = tx
+            .query_row(
+                "SELECT state FROM purge_executions WHERE execution_id=?1",
+                [&execution_wire],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let state = execution.ok_or(PurgeError::ReviewReplayed)?;
+        if !matches!(
+            state.as_str(),
+            "started" | "finished" | "partial" | "uncertain"
+        ) {
+            return Err(PurgeError::ReviewReplayed);
+        }
+        let mut requested = std::collections::HashSet::with_capacity(child_attempts.len());
+        if child_attempts
+            .iter()
+            .any(|attempt| !requested.insert(*attempt))
+        {
+            return Err(PurgeError::InvalidInput);
+        }
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM purge_child_attempts WHERE execution_id=?1",
+            [&execution_wire],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(count).ok() != Some(child_attempts.len()) {
+            return Err(PurgeError::ChangedTarget);
+        }
+        let mut statement =
+            tx.prepare("SELECT attempt_id FROM purge_child_attempts WHERE execution_id=?1")?;
+        let rows = statement.query_map([&execution_wire], |row| row.get::<_, String>(0))?;
+        let mut found = std::collections::HashSet::with_capacity(child_attempts.len());
+        for row in rows {
+            let wire = row?;
+            if wire.len() > MAX_ID_WIRE_BYTES {
+                return Err(PurgeError::UnsupportedSchema);
+            }
+            let attempt: disk_steward_core::AttemptId =
+                serde_json::from_str(&wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+            if !requested.contains(&attempt) || !found.insert(attempt) {
+                return Err(PurgeError::ChangedTarget);
+            }
+        }
+        drop(statement);
+        if found != requested {
+            return Err(PurgeError::ChangedTarget);
+        }
+        let updated = tx.execute(
+            "UPDATE purge_executions SET state='uncertain', finished_at_ms=COALESCE(finished_at_ms, ?1) WHERE execution_id=?2 AND state IN ('started','finished','partial','uncertain')",
             rusqlite::params![now, execution_wire],
         )?;
+        if updated != 1 {
+            return Err(PurgeError::ReviewReplayed);
+        }
         for attempt in child_attempts {
-            tx.execute(
-                "UPDATE purge_child_attempts SET state='uncertain' WHERE attempt_id=?1 AND state='pending'",
-                rusqlite::params![serde_json::to_string(attempt).map_err(|_| PurgeError::StorageFailure)?],
+            let child_changed = tx.execute(
+                "UPDATE purge_child_attempts SET state='uncertain' WHERE execution_id=?1 AND attempt_id=?2 AND state='pending'",
+                rusqlite::params![
+                    execution_wire,
+                    serde_json::to_string(attempt).map_err(|_| PurgeError::StorageFailure)?
+                ],
             )?;
+            if child_changed > 1 {
+                return Err(PurgeError::UncertainOutcome);
+            }
         }
         tx.commit()?;
         self.checkpoint()?;
@@ -571,11 +595,22 @@ impl FixturePurgeService {
         ),
         PurgeError,
     > {
+        require_control_profile(&self.control, self.profile)?;
+        let review_wire =
+            serde_json::to_string(&prepared.review_id).map_err(|_| PurgeError::StorageFailure)?;
+        let tx = self
+            .control
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored = load_stored_review(&tx, &prepared.review_id, "prepared")?;
+        if &stored != prepared {
+            return Err(PurgeError::ChangedTarget);
+        }
+        if prepared.created_at_ms > now || now >= prepared.expires_at_ms {
+            return Err(PurgeError::ReviewExpired);
+        }
         let execution_id = disk_steward_core::ExecutionId::new();
         let execution_wire =
             serde_json::to_string(&execution_id).map_err(|_| PurgeError::StorageFailure)?;
-        let review_wire =
-            serde_json::to_string(&prepared.review_id).map_err(|_| PurgeError::StorageFailure)?;
         let session_wire =
             serde_json::to_string(&prepared.session_id).map_err(|_| PurgeError::StorageFailure)?;
         let child_attempts: Vec<disk_steward_core::AttemptId> = prepared
@@ -583,12 +618,9 @@ impl FixturePurgeService {
             .iter()
             .map(|_| disk_steward_core::AttemptId::new())
             .collect();
-        let tx = self
-            .control
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let claimed = tx.execute(
-            "UPDATE purge_reviews SET state='claimed' WHERE review_id=?1 AND state='prepared'",
-            [&review_wire],
+            "UPDATE purge_reviews SET state='claimed' WHERE review_id=?1 AND state='prepared' AND manifest_sha256=?2",
+            rusqlite::params![review_wire, prepared.manifest_sha256],
         )?;
         if claimed != 1 {
             return Err(PurgeError::ReviewReplayed);
@@ -626,18 +658,38 @@ impl FixturePurgeService {
         prepared: &PreparedPurgeReview,
         child_attempts: Vec<disk_steward_core::AttemptId>,
     ) -> Result<PurgeExecutionResult, PurgeError> {
+        require_control_profile(&self.control, self.profile)?;
+        let execution_now = (self.now)();
+        validate_claimed_execution(
+            &self.control,
+            lifecycle,
+            execution_id,
+            prepared,
+            &child_attempts,
+            execution_now,
+        )?;
         let execution_wire =
             serde_json::to_string(&execution_id).map_err(|_| PurgeError::StorageFailure)?;
         let mut items = Vec::with_capacity(child_attempts.len());
         let mut durably_unlinked_logical_bytes = 0u64;
         let mut final_state = "finished".to_owned();
         let mut stopped = false;
+        let mut last_now = execution_now;
         for (attempt, target) in child_attempts.iter().zip(prepared.targets.iter()) {
             let attempt_wire =
                 serde_json::to_string(attempt).map_err(|_| PurgeError::StorageFailure)?;
-            let child_state = if stopped {
+            let item_now = if stopped { last_now } else { (self.now)() };
+            let clock_valid = item_now >= last_now
+                && item_now >= prepared.created_at_ms
+                && item_now < prepared.expires_at_ms;
+            let child_state = if stopped || !clock_valid {
+                if !stopped {
+                    final_state = "partial".to_owned();
+                    stopped = true;
+                }
                 "not_attempted"
             } else {
+                last_now = item_now;
                 match lifecycle.purge_receipt(target.receipt_id, *attempt) {
                     Ok(PurgeItemOutcome::PermanentlyRemoved { logical_bytes, .. }) => {
                         durably_unlinked_logical_bytes = durably_unlinked_logical_bytes
@@ -676,10 +728,14 @@ impl FixturePurgeService {
                     }
                 }
             };
-            self.control.execute(
-                "UPDATE purge_child_attempts SET state=?1 WHERE attempt_id=?2 AND state='pending'",
-                rusqlite::params![child_state, attempt_wire],
+            let changed = self.control.execute(
+                "UPDATE purge_child_attempts SET state=?1 WHERE execution_id=?2 AND attempt_id=?3 AND state='pending'",
+                rusqlite::params![child_state, execution_wire, attempt_wire],
             )?;
+            if changed != 1 {
+                self.mark_execution_uncertain(execution_id, &child_attempts, (self.now)())?;
+                return Err(PurgeError::UncertainOutcome);
+            }
             let outcome = match child_state {
                 "permanently_removed" => PurgeItemOutcome::PermanentlyRemoved {
                     receipt_id: target.receipt_id,
@@ -697,11 +753,24 @@ impl FixturePurgeService {
                 outcome,
             });
         }
+        let pending_children: i64 = self.control.query_row(
+            "SELECT count(*) FROM purge_child_attempts WHERE execution_id=?1 AND state='pending'",
+            [&execution_wire],
+            |row| row.get(0),
+        )?;
+        if pending_children != 0 {
+            self.mark_execution_uncertain(execution_id, &child_attempts, (self.now)())?;
+            return Err(PurgeError::UncertainOutcome);
+        }
         let finished_at_ms = (self.now)();
-        self.control.execute(
+        let finalized = self.control.execute(
             "UPDATE purge_executions SET state=?1, finished_at_ms=?2 WHERE execution_id=?3 AND state='started'",
             rusqlite::params![final_state, finished_at_ms, execution_wire],
         )?;
+        if finalized != 1 {
+            self.mark_execution_uncertain(execution_id, &child_attempts, finished_at_ms)?;
+            return Err(PurgeError::UncertainOutcome);
+        }
         self.checkpoint()?;
         Ok(PurgeExecutionResult {
             execution_id,
@@ -713,6 +782,232 @@ impl FixturePurgeService {
             volume_observation: None,
         })
     }
+}
+
+fn load_stored_review(
+    connection: &Connection,
+    review_id: &ReviewId,
+    expected_state: &str,
+) -> Result<PreparedPurgeReview, PurgeError> {
+    let profile = control_profile(connection)?;
+    let wire = serde_json::to_string(review_id).map_err(|_| PurgeError::StorageFailure)?;
+    let row: Option<StoredReviewRow> = connection
+        .query_row(
+            "SELECT plan_id,revision_id,session_id,created_at_ms,expires_at_ms,manifest_sha256,targets_json,selected_logical_bytes,state FROM purge_reviews WHERE review_id=?1",
+            [&wire],
+            |r| Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?,
+            )),
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Err(PurgeError::ReviewReplayed);
+    };
+    // Enforce stored field bounds before parsing the JSON payload.
+    if row.0.len() > MAX_ID_WIRE_BYTES
+        || row.1.len() > MAX_ID_WIRE_BYTES
+        || row.2.len() > MAX_ID_WIRE_BYTES
+        || row.6.len() > MAX_TARGETS_JSON_BYTES
+        || row.5.len() != 64
+        || !is_lower_sha256(&row.5)
+    {
+        return Err(PurgeError::UnsupportedSchema);
+    }
+    let (
+        plan_wire,
+        revision_wire,
+        session_wire,
+        created_at_ms,
+        expires_at_ms,
+        manifest_sha256,
+        targets_json,
+        selected_logical_bytes,
+        state,
+    ) = row;
+    if state != expected_state {
+        return Err(PurgeError::ReviewReplayed);
+    }
+    let plan_id: PlanId =
+        serde_json::from_str(&plan_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+    let revision_id: RevisionId =
+        serde_json::from_str(&revision_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+    let session_id: SessionId =
+        serde_json::from_str(&session_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+    let targets: Vec<PurgeReviewTarget> =
+        serde_json::from_str(&targets_json).map_err(|_| PurgeError::UnsupportedSchema)?;
+    let selected_logical_bytes =
+        u64::try_from(selected_logical_bytes).map_err(|_| PurgeError::UnsupportedSchema)?;
+    if targets.is_empty()
+        || targets.len() > profile_max_targets(profile)
+        || created_at_ms < 0
+        || expires_at_ms.checked_sub(created_at_ms) != Some(REVIEW_LIFETIME_MS)
+    {
+        return Err(PurgeError::UnsupportedSchema);
+    }
+    let mut action_ids = std::collections::HashSet::with_capacity(targets.len());
+    let mut receipt_ids = std::collections::HashSet::with_capacity(targets.len());
+    let sum = targets
+        .iter()
+        .try_fold(0u64, |total, target| {
+            if target.status != PurgeReceiptState::Staged
+                || target.logical_bytes == 0
+                || !action_ids.insert(target.action_id)
+                || !receipt_ids.insert(target.receipt_id)
+            {
+                return None;
+            }
+            total.checked_add(target.logical_bytes)
+        })
+        .ok_or(PurgeError::UnsupportedSchema)?;
+    if sum != selected_logical_bytes {
+        return Err(PurgeError::UnsupportedSchema);
+    }
+    Ok(PreparedPurgeReview {
+        schema_version: 1,
+        kind: profile_review_kind(profile).into(),
+        review_id: *review_id,
+        plan_id,
+        revision_id,
+        session_id,
+        operation: SupportedOperation::PermanentlyRemoveStaged,
+        created_at_ms,
+        expires_at_ms,
+        manifest_sha256,
+        targets,
+        selected_logical_bytes,
+    })
+}
+
+fn validate_claimed_execution(
+    connection: &Connection,
+    lifecycle: &FixtureLifecycle,
+    execution_id: disk_steward_core::ExecutionId,
+    prepared: &PreparedPurgeReview,
+    attempts: &[disk_steward_core::AttemptId],
+    now: i64,
+) -> Result<(), PurgeError> {
+    if lifecycle.profile() != control_profile(connection)? {
+        return Err(PurgeError::UnsupportedSchema);
+    }
+    if attempts.is_empty()
+        || attempts.len() > MAX_TARGETS
+        || attempts.len() != prepared.targets.len()
+    {
+        return Err(PurgeError::ChangedTarget);
+    }
+    let stored_review = load_stored_review(connection, &prepared.review_id, "claimed")?;
+    if stored_review != *prepared || lifecycle.session_id() != prepared.session_id {
+        return Err(PurgeError::ChangedTarget);
+    }
+
+    let execution_wire =
+        serde_json::to_string(&execution_id).map_err(|_| PurgeError::StorageFailure)?;
+    let execution: Option<(String, String, String, i64, Option<i64>)> = connection
+        .query_row(
+            "SELECT review_id,session_id,state,started_at_ms,finished_at_ms FROM purge_executions WHERE execution_id=?1",
+            [&execution_wire],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((review_wire, session_wire, state, started_at_ms, finished_at_ms)) = execution else {
+        return Err(PurgeError::ReviewReplayed);
+    };
+    if review_wire.len() > MAX_ID_WIRE_BYTES || session_wire.len() > MAX_ID_WIRE_BYTES {
+        return Err(PurgeError::UnsupportedSchema);
+    }
+    let stored_review_id: ReviewId =
+        serde_json::from_str(&review_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+    let stored_session_id: SessionId =
+        serde_json::from_str(&session_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+    if stored_review_id != prepared.review_id
+        || stored_session_id != prepared.session_id
+        || state != "started"
+        || finished_at_ms.is_some()
+    {
+        return Err(PurgeError::ReviewReplayed);
+    }
+    if prepared.created_at_ms > now
+        || now >= prepared.expires_at_ms
+        || started_at_ms < prepared.created_at_ms
+        || started_at_ms >= prepared.expires_at_ms
+        || now < started_at_ms
+    {
+        return Err(PurgeError::ReviewExpired);
+    }
+
+    let mut requested_attempts = std::collections::HashSet::with_capacity(attempts.len());
+    if attempts
+        .iter()
+        .any(|attempt| !requested_attempts.insert(*attempt))
+    {
+        return Err(PurgeError::ChangedTarget);
+    }
+    let child_count: i64 = connection.query_row(
+        "SELECT count(*) FROM purge_child_attempts WHERE execution_id=?1",
+        [&execution_wire],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(child_count).ok() != Some(attempts.len()) {
+        return Err(PurgeError::ChangedTarget);
+    }
+    let mut statement = connection.prepare(
+        "SELECT attempt_id,action_id,receipt_id,state FROM purge_child_attempts WHERE execution_id=?1",
+    )?;
+    let rows = statement.query_map([&execution_wire], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut stored_children = std::collections::HashMap::with_capacity(attempts.len());
+    for row in rows {
+        let (attempt_wire, action_wire, receipt_wire, child_state) = row?;
+        if attempt_wire.len() > MAX_ID_WIRE_BYTES
+            || action_wire.len() > MAX_ID_WIRE_BYTES
+            || receipt_wire.len() > MAX_ID_WIRE_BYTES
+            || child_state != "pending"
+        {
+            return Err(PurgeError::ChangedTarget);
+        }
+        let stored_attempt: disk_steward_core::AttemptId =
+            serde_json::from_str(&attempt_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+        let stored_action: disk_steward_core::ActionId =
+            serde_json::from_str(&action_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+        let stored_receipt: ReceiptId =
+            serde_json::from_str(&receipt_wire).map_err(|_| PurgeError::UnsupportedSchema)?;
+        if !requested_attempts.contains(&stored_attempt)
+            || stored_children
+                .insert(stored_attempt, (stored_action, stored_receipt))
+                .is_some()
+        {
+            return Err(PurgeError::ChangedTarget);
+        }
+    }
+    for (attempt, target) in attempts.iter().zip(&prepared.targets) {
+        if !matches!(
+            stored_children.get(attempt),
+            Some((action_id, receipt_id)) if *action_id == target.action_id && *receipt_id == target.receipt_id
+        ) {
+            return Err(PurgeError::ChangedTarget);
+        }
+    }
+    drop(statement);
+
+    let snapshot = lifecycle.snapshot()?;
+    if snapshot.session_id != prepared.session_id {
+        return Err(PurgeError::ChangedTarget);
+    }
+    let manifest = build_manifest(prepared, &snapshot)?;
+    let digest = hex_lower(&Sha256::digest(
+        &serde_json::to_vec(&manifest).map_err(|_| PurgeError::StorageFailure)?,
+    ));
+    if digest != prepared.manifest_sha256 {
+        return Err(PurgeError::ChangedTarget);
+    }
+    Ok(())
 }
 
 fn build_manifest(
@@ -728,7 +1023,7 @@ fn build_manifest(
         created_at_ms: prepared.created_at_ms,
         expires_at_ms: prepared.expires_at_ms,
         selected_logical_bytes: prepared.selected_logical_bytes,
-        adapter_schema_version: 2,
+        adapter_schema_version: profile_adapter_version(profile_from_review_kind(&prepared.kind)?),
         targets: build_manifest_targets(&prepared.targets, snapshot)?,
     })
 }
@@ -765,6 +1060,13 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Owner recovery, run once per open: a claimed-but-started execution whose
 /// child outcomes never became durable is resolved to `uncertain`, and its
 /// pending child rows become `uncertain` with it. Recovery reads only exact
@@ -786,6 +1088,70 @@ fn recover_unfinished_executions(db: &mut Connection, now: i64) -> Result<(), Pu
     Ok(())
 }
 
+fn profile_control_db(profile: FixtureProfile) -> &'static str {
+    match profile {
+        FixtureProfile::SyntheticV1 => CONTROL_DB,
+        FixtureProfile::Pytest920V1 => PYTEST_CONTROL_DB,
+    }
+}
+fn profile_application_id(profile: FixtureProfile) -> i64 {
+    match profile {
+        FixtureProfile::SyntheticV1 => CONTROL_APPLICATION_ID,
+        FixtureProfile::Pytest920V1 => PYTEST_CONTROL_APPLICATION_ID,
+    }
+}
+fn profile_review_kind(profile: FixtureProfile) -> &'static str {
+    match profile {
+        FixtureProfile::SyntheticV1 => "disposable_fixture_purge_review",
+        FixtureProfile::Pytest920V1 => "pytest_corpus_purge_review",
+    }
+}
+fn profile_from_review_kind(kind: &str) -> Result<FixtureProfile, PurgeError> {
+    match kind {
+        "disposable_fixture_purge_review" => Ok(FixtureProfile::SyntheticV1),
+        "pytest_corpus_purge_review" => Ok(FixtureProfile::Pytest920V1),
+        _ => Err(PurgeError::UnsupportedSchema),
+    }
+}
+fn profile_max_targets(profile: FixtureProfile) -> usize {
+    match profile {
+        FixtureProfile::SyntheticV1 => MAX_TARGETS,
+        FixtureProfile::Pytest920V1 => 2,
+    }
+}
+fn profile_adapter_version(profile: FixtureProfile) -> i64 {
+    match profile {
+        FixtureProfile::SyntheticV1 => 2,
+        FixtureProfile::Pytest920V1 => 1001,
+    }
+}
+fn control_profile(db: &Connection) -> Result<FixtureProfile, PurgeError> {
+    let app: i64 = db.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != CONTROL_SCHEMA_VERSION {
+        return Err(PurgeError::UnsupportedSchema);
+    }
+    match app {
+        CONTROL_APPLICATION_ID => Ok(FixtureProfile::SyntheticV1),
+        PYTEST_CONTROL_APPLICATION_ID => Ok(FixtureProfile::Pytest920V1),
+        _ => Err(PurgeError::UnsupportedSchema),
+    }
+}
+fn require_control_profile(db: &Connection, expected: FixtureProfile) -> Result<(), PurgeError> {
+    if control_profile(db)? == expected {
+        Ok(())
+    } else {
+        Err(PurgeError::UnsupportedSchema)
+    }
+}
+fn plan_matches_profile(plan: &ReviewPlanStore, profile: FixtureProfile) -> bool {
+    let expected = match profile {
+        FixtureProfile::SyntheticV1 => ReviewPlanProfile::SyntheticV1,
+        FixtureProfile::Pytest920V1 => ReviewPlanProfile::Pytest920V1,
+    };
+    plan.profile() == expected
+}
+
 fn wall_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -794,13 +1160,13 @@ fn wall_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn open_control_db(root: &Path) -> Result<Connection, PurgeError> {
+fn open_control_db(root: &Path, profile: FixtureProfile) -> Result<Connection, PurgeError> {
     let metadata = std::fs::symlink_metadata(root)?;
     if !metadata.file_type().is_dir() {
         return Err(PurgeError::StorageFailure);
     }
     let db = Connection::open_with_flags(
-        root.join(CONTROL_DB),
+        root.join(profile_control_db(profile)),
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -809,7 +1175,7 @@ fn open_control_db(root: &Path) -> Result<Connection, PurgeError> {
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.pragma_update(None, "journal_mode", "WAL")?;
     db.pragma_update(None, "synchronous", "FULL")?;
-    initialize_control(&db)?;
+    initialize_control(&db, profile)?;
     enforce_private_store(&db)?;
     Ok(db)
 }
@@ -850,7 +1216,7 @@ fn enforce_private_store(db: &Connection) -> Result<(), PurgeError> {
     Ok(())
 }
 
-fn initialize_control(db: &Connection) -> Result<(), PurgeError> {
+fn initialize_control(db: &Connection, profile: FixtureProfile) -> Result<(), PurgeError> {
     let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let schema_version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let objects: i64 = db.query_row(
@@ -868,17 +1234,17 @@ fn initialize_control(db: &Connection) -> Result<(), PurgeError> {
         [],
         |r| r.get(0),
     )?;
-    if objects == 0 {
+    if objects == 0 && application_id == 0 && schema_version == 0 {
         // Fresh store: initialize exactly the reviewed schema.
         db.execute_batch(&format!(
             "{REVIEWS_SCHEMA};{EXECUTIONS_SCHEMA};{CHILD_ATTEMPTS_SCHEMA};{EXPIRY_INDEX};"
         ))?;
-        db.pragma_update(None, "application_id", CONTROL_APPLICATION_ID)?;
+        db.pragma_update(None, "application_id", profile_application_id(profile))?;
         db.pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)?;
         return Ok(());
     }
     // Existing store: exact schema, exact objects, known version, no reset.
-    if application_id != CONTROL_APPLICATION_ID
+    if application_id != profile_application_id(profile)
         || schema_version != CONTROL_SCHEMA_VERSION
         || objects != 4
         || known != 3
@@ -1168,6 +1534,187 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_purge_adapter_refuses_pytest_profile_before_claim_or_mutation() {
+        let (dir, _) = demo_root();
+        let now = 1_700_000_000_000;
+        let (mut service, mut synthetic, plan, targets, view) =
+            service_with_staged(dir.path(), 1, fixed_clock(now));
+        let prepared = service
+            .prepare_purge_review(&mut synthetic, &plan, view.revision_id, targets.clone())
+            .unwrap();
+        let ids = [view.actions[0].id, view.actions[1].id];
+        let (mut pytest, before) = FixtureLifecycle::create_pytest_corpus(dir.path(), ids).unwrap();
+        assert!(matches!(
+            service.prepare_purge_review(&mut pytest, &plan, view.revision_id, targets),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let rows: i64 = service
+            .control
+            .query_row("SELECT count(*) FROM purge_reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(matches!(
+            service.revalidate(&pytest, &plan, &prepared),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        assert!(matches!(
+            service.execute_claimed_batch(
+                &mut pytest,
+                disk_steward_core::ExecutionId::new(),
+                &prepared,
+                vec![disk_steward_core::AttemptId::new()]
+            ),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        assert_eq!(
+            service.read_stored_review(&prepared.review_id).unwrap(),
+            prepared
+        );
+        assert_eq!(pytest.snapshot().unwrap(), before);
+        assert!(!service.has_uncertainty().unwrap());
+    }
+
+    #[test]
+    fn pytest_purge_uses_its_exact_plan_profile_and_separate_approval_kind() {
+        let (dir, _) = demo_root();
+        let now = 1_700_000_000_000;
+        let mut plan =
+            ReviewPlanStore::open_pytest_corpus(dir.path().join("pytest-review.sqlite3")).unwrap();
+        let initial = plan.get_plan().unwrap();
+        let ids = [initial.actions[0].id, initial.actions[1].id];
+        let view = plan
+            .edit(
+                initial.revision_id,
+                ids[1],
+                disk_steward_review_plan::Decision::Include,
+            )
+            .unwrap();
+        let (mut lifecycle, _) = FixtureLifecycle::create_pytest_corpus(dir.path(), ids).unwrap();
+        let receipt = lifecycle
+            .stage(ids[1], disk_steward_core::AttemptId::new())
+            .unwrap();
+        let mut service =
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now))
+                .unwrap();
+        let targets = vec![PurgeTarget {
+            action_id: ids[1],
+            receipt_id: receipt,
+        }];
+        let synthetic = ReviewPlanStore::open(dir.path().join("synthetic-review.sqlite3")).unwrap();
+        assert!(matches!(
+            service.prepare_purge_review(
+                &mut lifecycle,
+                &synthetic,
+                view.revision_id,
+                targets.clone()
+            ),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let prepared = service
+            .prepare_purge_review(&mut lifecycle, &plan, view.revision_id, targets)
+            .unwrap();
+        assert_eq!(prepared.kind, "pytest_corpus_purge_review");
+        let manifest = build_manifest(&prepared, &lifecycle.snapshot().unwrap()).unwrap();
+        assert_eq!(manifest.adapter_schema_version, 1001);
+        assert_eq!(prepared.selected_logical_bytes, 42);
+        assert_eq!(prepared.targets[0].label, "pytest lastfailed corpus");
+        let mut tampered = prepared.clone();
+        tampered.kind = "disposable_fixture_purge_review".into();
+        assert!(matches!(
+            service.revalidate(&lifecycle, &plan, &tampered),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        assert!(matches!(
+            service.claim(&tampered, now),
+            Err(PurgeError::ChangedTarget)
+        ));
+        assert!(!service.has_uncertainty().unwrap());
+        let result = service
+            .claim_and_execute(&mut lifecycle, &plan, prepared.review_id, |shown| {
+                assert_eq!(*shown, prepared);
+                true
+            })
+            .unwrap();
+        assert_eq!(result.state, "finished");
+        assert_eq!(result.durably_unlinked_logical_bytes, 42);
+        let snapshot = lifecycle.snapshot().unwrap();
+        assert_eq!(snapshot.fixtures[0].status, FixtureStatus::Available);
+        assert_eq!(
+            snapshot.fixtures[1].status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        drop(service);
+        let reopened =
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now))
+                .unwrap();
+        assert!(!reopened.has_uncertainty().unwrap());
+        assert!(matches!(
+            reopened.read_stored_review(&prepared.review_id),
+            Err(PurgeError::ReviewReplayed)
+        ));
+    }
+
+    #[test]
+    fn empty_foreign_control_is_not_initialized_as_a_corpus_store() {
+        let (dir, _) = demo_root();
+        let db = Connection::open(dir.path().join(PYTEST_CONTROL_DB)).unwrap();
+        db.pragma_update(None, "application_id", CONTROL_APPLICATION_ID)
+            .unwrap();
+        drop(db);
+        assert!(matches!(
+            FixturePurgeService::open_pytest_corpus_with_clock(
+                dir.path(),
+                fixed_clock(1_700_000_000_000)
+            ),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let db = Connection::open(dir.path().join(PYTEST_CONTROL_DB)).unwrap();
+        let tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+        let app: i64 = db
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(app, CONTROL_APPLICATION_ID);
+    }
+
+    #[test]
+    fn pytest_purge_rejects_foreign_control_identity_without_reseed() {
+        let (dir, _) = demo_root();
+        let now = 1_700_000_000_000;
+        let service =
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now))
+                .unwrap();
+        service
+            .control
+            .pragma_update(None, "application_id", CONTROL_APPLICATION_ID)
+            .unwrap();
+        assert!(matches!(
+            service.has_uncertainty(),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        drop(service);
+        assert!(matches!(
+            FixturePurgeService::open_pytest_corpus_with_clock(dir.path(), fixed_clock(now)),
+            Err(PurgeError::UnsupportedSchema)
+        ));
+        let db = Connection::open(dir.path().join(PYTEST_CONTROL_DB)).unwrap();
+        let id: i64 = db
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, CONTROL_APPLICATION_ID);
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM purge_reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
     fn prepare_persists_an_immutable_sanitized_review() {
         let (dir, _ids) = demo_root();
         let now = 1_700_000_000_000_i64;
@@ -1417,6 +1964,452 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn claim_requires_exact_prepared_row_and_valid_time_window() {
+        let (dir, _ids) = demo_root();
+        let now = 1_700_000_000_000_i64;
+        let (mut service, mut lifecycle, plan, targets, plan_view) =
+            service_with_staged(dir.path(), 2, fixed_clock(now));
+        let review = service
+            .prepare_purge_review(&mut lifecycle, &plan, plan_view.revision_id, targets)
+            .unwrap();
+
+        let mut mismatched = review.clone();
+        mismatched.selected_logical_bytes += 1;
+        assert!(matches!(
+            service.claim(&mismatched, now),
+            Err(PurgeError::ChangedTarget)
+        ));
+        let mut mismatched = review.clone();
+        mismatched.manifest_sha256 = "0".repeat(64);
+        assert!(matches!(
+            service.claim(&mismatched, now),
+            Err(PurgeError::ChangedTarget)
+        ));
+        let mut mismatched = review.clone();
+        mismatched.targets.reverse();
+        assert!(matches!(
+            service.claim(&mismatched, now),
+            Err(PurgeError::ChangedTarget)
+        ));
+        let mut mismatched = review.clone();
+        mismatched.created_at_ms += 1;
+        assert!(matches!(
+            service.claim(&mismatched, now),
+            Err(PurgeError::ChangedTarget)
+        ));
+        assert!(matches!(
+            service.claim(&review, review.created_at_ms - 1),
+            Err(PurgeError::ReviewExpired)
+        ));
+        assert!(matches!(
+            service.claim(&review, review.expires_at_ms),
+            Err(PurgeError::ReviewExpired)
+        ));
+
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let state: String = control
+            .query_row(
+                "SELECT state FROM purge_reviews WHERE review_id=?1",
+                [serde_json::to_string(&review.review_id).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "prepared");
+        let executions: i64 = control
+            .query_row("SELECT count(*) FROM purge_executions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(executions, 0);
+
+        let (execution_id, attempts) = service.claim(&review, now).unwrap();
+        assert_eq!(attempts.len(), review.targets.len());
+        service
+            .mark_execution_uncertain(execution_id, &attempts, now + 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn claimed_batch_refuses_mismatched_attempt_vectors_session_and_replay_before_mutation() {
+        let (dir, _ids) = demo_root();
+        let now = 1_700_000_000_000_i64;
+        let (mut service, mut lifecycle, plan, targets, plan_view) =
+            service_with_staged(dir.path(), 2, fixed_clock(now));
+        let review = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                targets.clone(),
+            )
+            .unwrap();
+        let (execution_id, attempts) = service.claim(&review, now).unwrap();
+
+        let mut reversed = attempts.clone();
+        reversed.reverse();
+        let mut foreign = attempts.clone();
+        foreign[0] = disk_steward_core::AttemptId::new();
+        let mut extra = attempts.clone();
+        extra.push(disk_steward_core::AttemptId::new());
+        let variants = vec![Vec::new(), attempts[..1].to_vec(), extra, foreign, reversed];
+        for supplied in variants {
+            assert!(matches!(
+                service.execute_claimed_batch(&mut lifecycle, execution_id, &review, supplied),
+                Err(PurgeError::ChangedTarget)
+            ));
+        }
+        assert!(matches!(
+            service.execute_claimed_batch(
+                &mut lifecycle,
+                disk_steward_core::ExecutionId::new(),
+                &review,
+                attempts.clone()
+            ),
+            Err(PurgeError::ReviewReplayed)
+        ));
+        let mut altered_review = review.clone();
+        altered_review.session_id = SessionId::new();
+        assert!(matches!(
+            service.execute_claimed_batch(
+                &mut lifecycle,
+                execution_id,
+                &altered_review,
+                attempts.clone()
+            ),
+            Err(PurgeError::ChangedTarget)
+        ));
+
+        let (other_dir, other_actions) = demo_root();
+        let (mut wrong_lifecycle, _) =
+            FixtureLifecycle::create(other_dir.path(), other_actions).unwrap();
+        assert!(matches!(
+            service.execute_claimed_batch(
+                &mut wrong_lifecycle,
+                execution_id,
+                &review,
+                attempts.clone()
+            ),
+            Err(PurgeError::ChangedTarget)
+        ));
+
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let review_wire = serde_json::to_string(&review.review_id).unwrap();
+        control
+            .execute(
+                "UPDATE purge_reviews SET manifest_sha256=?1 WHERE review_id=?2",
+                rusqlite::params!["0".repeat(64), review_wire],
+            )
+            .unwrap();
+        assert!(matches!(
+            service.execute_claimed_batch(&mut lifecycle, execution_id, &review, attempts.clone()),
+            Err(PurgeError::ChangedTarget)
+        ));
+        let review_wire = serde_json::to_string(&review.review_id).unwrap();
+        control
+            .execute(
+                "UPDATE purge_reviews SET manifest_sha256=?1 WHERE review_id=?2",
+                rusqlite::params![review.manifest_sha256, review_wire],
+            )
+            .unwrap();
+        drop(control);
+
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let state: String = control
+            .query_row(
+                "SELECT state FROM purge_executions WHERE execution_id=?1",
+                [serde_json::to_string(&execution_id).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "started");
+        let pending: i64 = control.query_row(
+            "SELECT count(*) FROM purge_child_attempts WHERE execution_id=?1 AND state='pending'",
+            [serde_json::to_string(&execution_id).unwrap()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending, 2);
+        for fixture in lifecycle.snapshot().unwrap().fixtures {
+            assert_eq!(
+                fixture.status,
+                if targets
+                    .iter()
+                    .any(|target| target.action_id == fixture.action_id)
+                {
+                    FixtureStatus::Staged
+                } else {
+                    FixtureStatus::Available
+                }
+            );
+        }
+        for target in &targets {
+            assert!(holding_slot_for(
+                dir.path(),
+                &serde_json::to_string(&target.receipt_id).unwrap()
+            )
+            .exists());
+        }
+
+        let result = service
+            .execute_claimed_batch(&mut lifecycle, execution_id, &review, attempts.clone())
+            .unwrap();
+        assert_eq!(result.state, "finished");
+        assert!(matches!(
+            service.execute_claimed_batch(&mut lifecycle, execution_id, &review, attempts),
+            Err(PurgeError::ReviewReplayed)
+        ));
+        for fixture in lifecycle.snapshot().unwrap().fixtures {
+            assert_eq!(
+                fixture.status,
+                if targets
+                    .iter()
+                    .any(|target| target.action_id == fixture.action_id)
+                {
+                    FixtureStatus::PermanentlyRemoved
+                } else {
+                    FixtureStatus::Available
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn claimed_batch_refuses_tampered_child_binding_and_uncertainty_is_execution_scoped() {
+        let (dir, _ids) = demo_root();
+        let now = 1_700_000_000_000_i64;
+        let (mut service, mut lifecycle, plan, targets, plan_view) =
+            service_with_staged(dir.path(), 2, fixed_clock(now));
+        let first_review = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                vec![targets[0].clone()],
+            )
+            .unwrap();
+        let second_review = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                vec![targets[1].clone()],
+            )
+            .unwrap();
+        let (first_execution, first_attempts) = service.claim(&first_review, now).unwrap();
+        let (second_execution, second_attempts) = service.claim(&second_review, now).unwrap();
+
+        assert!(matches!(
+            service.mark_execution_uncertain(first_execution, &second_attempts, now + 1),
+            Err(PurgeError::ChangedTarget)
+        ));
+        let first_receipt = serde_json::to_string(&first_review.targets[0].receipt_id).unwrap();
+        let first_action = serde_json::to_string(&first_review.targets[0].action_id).unwrap();
+        let second_action = serde_json::to_string(&second_review.targets[0].action_id).unwrap();
+        let first_attempt_wire = serde_json::to_string(&first_attempts[0]).unwrap();
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        control.execute(
+            "UPDATE purge_child_attempts SET action_id=?1 WHERE execution_id=?2 AND attempt_id=?3",
+            rusqlite::params![second_action, serde_json::to_string(&first_execution).unwrap(), first_attempt_wire],
+        ).unwrap();
+        drop(control);
+        assert!(matches!(
+            service.execute_claimed_batch(
+                &mut lifecycle,
+                first_execution,
+                &first_review,
+                first_attempts.clone()
+            ),
+            Err(PurgeError::ChangedTarget)
+        ));
+        assert_eq!(
+            lifecycle
+                .snapshot()
+                .unwrap()
+                .fixtures
+                .iter()
+                .filter(|fixture| fixture.status == FixtureStatus::Staged)
+                .count(),
+            2
+        );
+        assert!(holding_slot_for(dir.path(), &first_receipt).exists());
+
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        control.execute(
+            "UPDATE purge_child_attempts SET action_id=?1 WHERE execution_id=?2 AND attempt_id=?3",
+            rusqlite::params![first_action, serde_json::to_string(&first_execution).unwrap(), serde_json::to_string(&first_attempts[0]).unwrap()],
+        ).unwrap();
+        drop(control);
+        service
+            .execute_claimed_batch(
+                &mut lifecycle,
+                first_execution,
+                &first_review,
+                first_attempts.clone(),
+            )
+            .unwrap();
+        service
+            .execute_claimed_batch(
+                &mut lifecycle,
+                second_execution,
+                &second_review,
+                second_attempts.clone(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            service.mark_execution_uncertain(first_execution, &second_attempts, now + 2),
+            Err(PurgeError::ChangedTarget)
+        ));
+        service
+            .mark_execution_uncertain(first_execution, &first_attempts, now + 3)
+            .unwrap();
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let (first_state, second_state): (String, String) = control.query_row(
+            "SELECT (SELECT state FROM purge_executions WHERE execution_id=?1),(SELECT state FROM purge_executions WHERE execution_id=?2)",
+            rusqlite::params![serde_json::to_string(&first_execution).unwrap(), serde_json::to_string(&second_execution).unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(first_state, "uncertain");
+        assert_eq!(second_state, "finished");
+        let (first_child, second_child): (String, String) = control.query_row(
+            "SELECT (SELECT state FROM purge_child_attempts WHERE execution_id=?1),(SELECT state FROM purge_child_attempts WHERE execution_id=?2)",
+            rusqlite::params![serde_json::to_string(&first_execution).unwrap(), serde_json::to_string(&second_execution).unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(first_child, "permanently_removed");
+        assert_eq!(second_child, "permanently_removed");
+    }
+
+    #[test]
+    fn claimed_batch_refuses_expired_or_reversed_clock_before_first_unlink() {
+        use std::sync::atomic::Ordering;
+        let (dir, _ids) = demo_root();
+        let created = 1_700_000_000_000_i64;
+        let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(created));
+        let (mut service, mut lifecycle, plan, targets, plan_view) =
+            service_with_staged_and_clock_cell(dir.path(), 2, tick.clone());
+        let review = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                targets.clone(),
+            )
+            .unwrap();
+        let (execution_id, attempts) = service.claim(&review, created).unwrap();
+
+        tick.store(review.expires_at_ms, Ordering::SeqCst);
+        assert!(matches!(
+            service.execute_claimed_batch(&mut lifecycle, execution_id, &review, attempts.clone()),
+            Err(PurgeError::ReviewExpired)
+        ));
+        tick.store(created - 1, Ordering::SeqCst);
+        assert!(matches!(
+            service.execute_claimed_batch(&mut lifecycle, execution_id, &review, attempts.clone()),
+            Err(PurgeError::ReviewExpired)
+        ));
+        for fixture in lifecycle.snapshot().unwrap().fixtures {
+            assert_eq!(
+                fixture.status,
+                if targets
+                    .iter()
+                    .any(|target| target.action_id == fixture.action_id)
+                {
+                    FixtureStatus::Staged
+                } else {
+                    FixtureStatus::Available
+                }
+            );
+        }
+        for target in &targets {
+            assert!(holding_slot_for(
+                dir.path(),
+                &serde_json::to_string(&target.receipt_id).unwrap()
+            )
+            .exists());
+        }
+        let control = Connection::open(dir.path().join(CONTROL_DB)).unwrap();
+        let pending: i64 = control.query_row(
+            "SELECT count(*) FROM purge_child_attempts WHERE execution_id=?1 AND state='pending'",
+            [serde_json::to_string(&execution_id).unwrap()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending, 2);
+        service
+            .mark_execution_uncertain(execution_id, &attempts, created + REVIEW_LIFETIME_MS + 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn mid_batch_expiry_stops_before_next_receipt_and_reports_partial() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (dir, _ids) = demo_root();
+        let created = 1_700_000_000_000_i64;
+        let expires = created + REVIEW_LIFETIME_MS;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let clock: Box<dyn Fn() -> i64 + Send + Sync> = {
+            let calls = calls.clone();
+            Box::new(move || match calls.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => created,
+                2 => created + 10,
+                3 => created + 20,
+                _ => expires,
+            })
+        };
+        let (mut service, mut lifecycle, plan, targets, plan_view) =
+            service_with_staged(dir.path(), 2, clock);
+        let review = service
+            .prepare_purge_review(
+                &mut lifecycle,
+                &plan,
+                plan_view.revision_id,
+                targets.clone(),
+            )
+            .unwrap();
+        let (execution_id, attempts) = service.claim(&review, created + 10).unwrap();
+        let result = service
+            .execute_claimed_batch(&mut lifecycle, execution_id, &review, attempts)
+            .unwrap();
+        assert_eq!(result.state, "partial");
+        assert!(matches!(
+            &result.items[0].outcome,
+            PurgeItemOutcome::PermanentlyRemoved { .. }
+        ));
+        assert!(matches!(
+            &result.items[1].outcome,
+            PurgeItemOutcome::NotAttempted { .. }
+        ));
+        let snapshot = lifecycle.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.action_id == targets[0].action_id)
+                .unwrap()
+                .status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        assert_eq!(
+            snapshot
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.action_id == targets[1].action_id)
+                .unwrap()
+                .status,
+            FixtureStatus::Staged
+        );
+        assert!(!holding_slot_for(
+            dir.path(),
+            &serde_json::to_string(&targets[0].receipt_id).unwrap()
+        )
+        .exists());
+        assert!(holding_slot_for(
+            dir.path(),
+            &serde_json::to_string(&targets[1].receipt_id).unwrap()
+        )
+        .exists());
     }
 
     #[test]

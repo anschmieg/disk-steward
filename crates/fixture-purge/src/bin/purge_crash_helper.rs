@@ -46,7 +46,17 @@ fn main() {
             let (mut lifecycle, plan) = reopen_stores(&root);
             if mode == "claim-exit" {
                 // Claim only: the journal rows exist, no item has run.
-                let _ = service.claim(&prepared_from(&service, &review_id), 1_700_000_000_123);
+                let prepared = prepared_from(&service, &review_id);
+                let now = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock after epoch")
+                        .as_millis(),
+                )
+                .expect("bounded clock");
+                service
+                    .claim(&prepared, now)
+                    .expect("durable claim before crash boundary");
                 std::process::exit(9);
             }
             let result = service

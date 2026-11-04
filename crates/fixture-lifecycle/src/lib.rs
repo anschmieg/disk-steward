@@ -1,7 +1,7 @@
-//! Backend-only lifecycle for five disposable example-plan files.
+//! Backend-only lifecycle for closed app-owned disposable fixture profiles.
 //!
-//! This deliberately has no path-taking mutation methods, no deletion method,
-//! and no cleanup-on-drop behavior. The caller must be trusted backend code.
+//! Mutations take typed registered identities, never source paths. Receipt purge
+//! requires a separately approved trusted coordinator; no cleanup runs on drop.
 
 use std::{
     ffi::OsStr,
@@ -36,10 +36,24 @@ const FIXTURES: [(&str, u64); 5] = [
     ("package-index", 262_144),
     ("incremental-output", 131_072),
 ];
+const PYTEST_NODEIDS: &[u8] =
+    include_bytes!("../../../probes/generated_cache/fixtures/pytest-9.2.0/nodeids.json");
+const PYTEST_LASTFAILED: &[u8] =
+    include_bytes!("../../../probes/generated_cache/fixtures/pytest-9.2.0/lastfailed.json");
+const PYTEST_FIXTURES: [(&str, &[u8]); 2] = [
+    ("pytest-nodeids.json", PYTEST_NODEIDS),
+    ("pytest-lastfailed.json", PYTEST_LASTFAILED),
+];
+const PYTEST_NODEIDS_SHA256: &str =
+    "b42fa6d4ee3882fd779c38d362aa18b8d75f7404c3f4732a21140e66cf0b7c4c";
+const PYTEST_LASTFAILED_SHA256: &str =
+    "521fb76ae00360422618fb8effa65bd5ce45209180a430cf71dd6060899dbcfa";
 const MAX_FIXTURE_BYTES: u64 = 6 * 1024 * 1024;
 const ROOT_PREFIX: &str = ".disk-steward-fixtures-";
+const PYTEST_ROOT_PREFIX: &str = ".disk-steward-pytest-fixtures-";
 const DB_NAME: &str = "lifecycle.sqlite3";
 const DB_APPLICATION_ID: i64 = 0x4453_464c;
+const PYTEST_DB_APPLICATION_ID: i64 = 0x4453_5059;
 const DB_SCHEMA_VERSION: i64 = 2;
 const LEGACY_SCHEMA_VERSION: i64 = 1;
 const MANIFEST_SCHEMA: &str = "CREATE TABLE manifest(singleton INTEGER PRIMARY KEY CHECK(singleton=1), session_id TEXT NOT NULL, parent_dev INTEGER NOT NULL,parent_ino INTEGER NOT NULL,root_dev INTEGER NOT NULL,root_ino INTEGER NOT NULL,source_dev INTEGER NOT NULL,source_ino INTEGER NOT NULL,holding_dev INTEGER NOT NULL,holding_ino INTEGER NOT NULL) STRICT";
@@ -47,6 +61,8 @@ const FIXTURES_SCHEMA_V1: &str = "CREATE TABLE fixtures(action_id TEXT PRIMARY K
 const ATTEMPTS_SCHEMA_V1: &str = "CREATE TABLE attempts(attempt_id TEXT PRIMARY KEY,action_id TEXT NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('stage','restore')),receipt_id TEXT,outcome TEXT NOT NULL CHECK(outcome IN ('intent','staged','restored','collision','uncertain'))) STRICT";
 const FIXTURES_SCHEMA: &str = "CREATE TABLE fixtures(action_id TEXT PRIMARY KEY,slot TEXT NOT NULL UNIQUE,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,status TEXT NOT NULL CHECK(status IN ('available','staged','restored','uncertain','permanently_removed')),receipt_id TEXT UNIQUE) STRICT";
 const ATTEMPTS_SCHEMA: &str = "CREATE TABLE attempts(attempt_id TEXT PRIMARY KEY,action_id TEXT NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('stage','restore','purge')),receipt_id TEXT,outcome TEXT NOT NULL CHECK(outcome IN ('intent','staged','restored','collision','uncertain','permanently_removed'))) STRICT";
+const PYTEST_MANIFEST_SCHEMA: &str = "CREATE TABLE manifest(singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL CHECK(profile='pytest_920_v1'), session_id TEXT NOT NULL, parent_dev INTEGER NOT NULL,parent_ino INTEGER NOT NULL,root_dev INTEGER NOT NULL,root_ino INTEGER NOT NULL,source_dev INTEGER NOT NULL,source_ino INTEGER NOT NULL,holding_dev INTEGER NOT NULL,holding_ino INTEGER NOT NULL) STRICT";
+const PYTEST_SCHEMA_VERSION: i64 = 1;
 const MAX_ATTEMPTS: i64 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +74,14 @@ pub enum FixtureStatus {
     PermanentlyRemoved,
     Uncertain,
     Changed,
+}
+
+/// Closed lifecycle registry identity. The pytest profile is a separately
+/// versioned app-owned corpus, never inferred from arbitrary fixture rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureProfile {
+    SyntheticV1,
+    Pytest920V1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +157,7 @@ pub enum PurgeItemOutcome {
 /// A process-local handle to one internally created fixture session.
 pub struct FixtureLifecycle {
     id: SessionId,
+    profile: FixtureProfile,
     parent_path: PathBuf,
     root_path: PathBuf,
     // Same gate as the tests module below: this field exists only where the
@@ -193,8 +218,40 @@ impl FixtureLifecycle {
         id: SessionId,
         actions: [ActionId; 5],
     ) -> Result<(Self, SessionSnapshot), LifecycleError> {
+        Self::create_profile(parent, id, &actions, FixtureProfile::SyntheticV1)
+    }
+
+    /// Create a closed two-record pytest 9.2.0 reference corpus beneath a new
+    /// private app-owned session root. This factory accepts action IDs only;
+    /// source names and bytes come from the committed corpus.
+    pub fn create_pytest_corpus(
+        parent: &Path,
+        actions: [ActionId; 2],
+    ) -> Result<(Self, SessionSnapshot), LifecycleError> {
+        Self::create_pytest_corpus_for_session(parent, SessionId::new(), actions)
+    }
+
+    /// Coordinator-bound form of `create_pytest_corpus`.
+    pub fn create_pytest_corpus_for_session(
+        parent: &Path,
+        id: SessionId,
+        actions: [ActionId; 2],
+    ) -> Result<(Self, SessionSnapshot), LifecycleError> {
+        Self::create_profile(parent, id, &actions, FixtureProfile::Pytest920V1)
+    }
+
+    fn create_profile(
+        parent: &Path,
+        id: SessionId,
+        actions: &[ActionId],
+        profile: FixtureProfile,
+    ) -> Result<(Self, SessionSnapshot), LifecycleError> {
         supported()?;
-        if !unique_actions(&actions) {
+        let specs = profile_specs(profile);
+        if actions.len() != specs.len() || !unique_action_ids(actions) {
+            return Err(LifecycleError::InvalidBindings);
+        }
+        if profile == FixtureProfile::Pytest920V1 && !pytest_corpus_matches_profile() {
             return Err(LifecycleError::InvalidBindings);
         }
         let parent_path = fs::canonicalize(parent)?;
@@ -202,8 +259,13 @@ impl FixtureLifecycle {
         if !parent_file.metadata()?.is_dir() {
             return Err(LifecycleError::InvalidSession);
         }
+        if profile == FixtureProfile::Pytest920V1 {
+            check_profile_reserve(&parent_file)?;
+        }
 
-        let root = parent_path.join(format!("{ROOT_PREFIX}{}", typed_component(&id)?));
+        let root_prefix = profile_root_prefix(profile);
+        ensure_other_profile_root_absent(&parent_path, id, profile)?;
+        let root = parent_path.join(format!("{root_prefix}{}", typed_component(&id)?));
         create_private_dir(&root)?;
         let result = (|| {
             let source_path = root.join("source");
@@ -230,47 +292,61 @@ impl FixtureLifecycle {
                     | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )?;
             configure_db(&db, true)?;
-            initialize_schema(&db)?;
+            initialize_schema(&db, profile)?;
             let (parent_dev, parent_ino) = identity(&parent_file)?;
             let (root_dev, root_ino) = identity(&root_dir)?;
             let (source_dev, source_ino) = identity(&source_dir)?;
             let (holding_dev, holding_ino) = identity(&holding_dir)?;
-            db.execute(
-                "INSERT INTO manifest VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    typed_wire(&id)?,
-                    parent_dev,
-                    parent_ino,
-                    root_dev,
-                    root_ino,
-                    source_dev,
-                    source_ino,
-                    holding_dev,
-                    holding_ino
-                ],
-            )?;
+            match profile {
+                FixtureProfile::SyntheticV1 => {
+                    db.execute(
+                        "INSERT INTO manifest VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            typed_wire(&id)?,
+                            parent_dev,
+                            parent_ino,
+                            root_dev,
+                            root_ino,
+                            source_dev,
+                            source_ino,
+                            holding_dev,
+                            holding_ino
+                        ],
+                    )?;
+                }
+                FixtureProfile::Pytest920V1 => {
+                    db.execute(
+                        "INSERT INTO manifest VALUES(1, 'pytest_920_v1', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![typed_wire(&id)?, parent_dev, parent_ino, root_dev, root_ino, source_dev, source_ino, holding_dev, holding_ino],
+                    )?;
+                }
+            }
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for (index, ((slot, bytes), action)) in FIXTURES.iter().zip(actions.iter()).enumerate()
-            {
-                let file_path = source_path.join(slot);
+            for (index, ((slot, bytes, content), action)) in specs.iter().zip(actions).enumerate() {
+                let file_path = source_path.join(*slot);
                 let mut file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&file_path)?;
                 set_private_file(&file)?;
-                let digest = write_fixture(&mut file, index, *bytes)?;
+                let digest = if let Some(content) = content {
+                    write_fixed_content(&mut file, content)?
+                } else {
+                    write_fixture(&mut file, index, *bytes)?
+                };
                 file.sync_all()?;
                 let (dev, ino, nlink) = file_identity(&file)?;
                 if nlink != 1 {
                     return Err(LifecycleError::Changed);
                 }
-                tx.execute("INSERT INTO fixtures(action_id, slot, bytes, sha256, dev, ino, status) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'available')", params![encode_action(action)?, slot, *bytes as i64, digest, dev, ino])?;
+                tx.execute("INSERT INTO fixtures(action_id, slot, bytes, sha256, dev, ino, status) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'available')", params![encode_action(action)?, *slot, *bytes as i64, digest, dev, ino])?;
             }
             tx.commit()?;
             sync_dir(&source_dir)?;
             sync_dir(&root_dir)?;
             Ok(Self {
                 id,
+                profile,
                 parent_path: parent_path.clone(),
                 root_path: root.clone(),
                 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -293,10 +369,32 @@ impl FixtureLifecycle {
     /// Reopen only the unique internally named session corresponding to id.
     /// Existing journal states are reported as stored; no operation is retried.
     pub fn reopen(parent: &Path, id: SessionId) -> Result<(Self, SessionSnapshot), LifecycleError> {
+        Self::reopen_profile(parent, id, FixtureProfile::SyntheticV1)
+    }
+
+    /// Reopen a pytest corpus only at its profile-specific app-owned root and
+    /// only when its persisted schema discriminator validates.
+    pub fn reopen_pytest_corpus(
+        parent: &Path,
+        id: SessionId,
+    ) -> Result<(Self, SessionSnapshot), LifecycleError> {
+        Self::reopen_profile(parent, id, FixtureProfile::Pytest920V1)
+    }
+
+    fn reopen_profile(
+        parent: &Path,
+        id: SessionId,
+        profile: FixtureProfile,
+    ) -> Result<(Self, SessionSnapshot), LifecycleError> {
         supported()?;
         let parent_path = fs::canonicalize(parent)?;
         let parent = open_dir_path(&parent_path)?;
-        let root = parent_path.join(format!("{ROOT_PREFIX}{}", typed_component(&id)?));
+        ensure_other_profile_root_absent(&parent_path, id, profile)?;
+        let root = parent_path.join(format!(
+            "{}{}",
+            profile_root_prefix(profile),
+            typed_component(&id)?
+        ));
         let root_name = root.file_name().ok_or(LifecycleError::InvalidSession)?;
         let root_dir = open_dir_at(&parent, root_name)?;
         let source_dir = open_dir_at(&root_dir, OsStr::new("source"))?;
@@ -308,11 +406,23 @@ impl FixtureLifecycle {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         configure_db(&db, false)?;
-        migrate_legacy_v1(&db, id, &parent, &root_dir, &source_dir, &holding_dir)?;
-        validate_schema(&db)?;
-        validate_manifest(&db, id, &parent, &root_dir, &source_dir, &holding_dir)?;
+        if profile == FixtureProfile::SyntheticV1 {
+            migrate_legacy_v1(&db, id, &parent, &root_dir, &source_dir, &holding_dir)?;
+        }
+        validate_profile_schema(&db, profile)?;
+        validate_profile_manifest(
+            &db,
+            id,
+            &parent,
+            &root_dir,
+            &source_dir,
+            &holding_dir,
+            profile,
+        )?;
+        validate_registry_for_profile(&db, profile)?;
         let lifecycle = Self {
             id,
+            profile,
             parent_path,
             root_path: root.clone(),
             #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -332,6 +442,12 @@ impl FixtureLifecycle {
         self.id
     }
 
+    /// Profile identity established by this factory or by the exact persisted
+    /// schema checked during reopen.
+    pub fn profile(&self) -> FixtureProfile {
+        self.profile
+    }
+
     /// Whether an attempt intent is journaled for this action but its
     /// terminal outcome is not yet durable. The purge coordinator consults
     /// this when mapping errors: an intent-bearing failure is uncertainty,
@@ -347,8 +463,8 @@ impl FixtureLifecycle {
         action: ActionId,
         attempt: AttemptId,
     ) -> Result<ReceiptId, LifecycleError> {
-        validate_schema(&self.db)?;
-        validate_registry(&self.db)?;
+        validate_profile_schema(&self.db, self.profile)?;
+        validate_registry_for_profile(&self.db, self.profile)?;
         let fixture = self
             .lookup_action(action)?
             .ok_or(LifecycleError::UnknownAction)?;
@@ -407,8 +523,8 @@ impl FixtureLifecycle {
         receipt: ReceiptId,
         attempt: AttemptId,
     ) -> Result<(), LifecycleError> {
-        validate_schema(&self.db)?;
-        validate_registry(&self.db)?;
+        validate_profile_schema(&self.db, self.profile)?;
+        validate_registry_for_profile(&self.db, self.profile)?;
         let fixture = self
             .lookup_receipt(receipt)?
             .ok_or(LifecycleError::UnknownReceipt)?;
@@ -481,8 +597,8 @@ impl FixtureLifecycle {
         // instance can exist on unsupported hosts (create/reopen gate on
         // this), but the purge path refuses before anything else regardless.
         supported()?;
-        validate_schema(&self.db)?;
-        validate_registry(&self.db)?;
+        validate_profile_schema(&self.db, self.profile)?;
+        validate_registry_for_profile(&self.db, self.profile)?;
         let fixture = self
             .lookup_receipt(receipt)?
             .ok_or(LifecycleError::UnknownReceipt)?;
@@ -571,8 +687,8 @@ impl FixtureLifecycle {
     }
 
     pub fn snapshot(&self) -> Result<SessionSnapshot, LifecycleError> {
-        validate_schema(&self.db)?;
-        validate_registry(&self.db)?;
+        validate_profile_schema(&self.db, self.profile)?;
+        validate_registry_for_profile(&self.db, self.profile)?;
         self.verify_directories()?;
         let directory_bindings = self.directory_bindings()?;
         let mut stmt = self.db.prepare("SELECT action_id, slot, bytes, sha256, dev, ino, status, receipt_id FROM fixtures ORDER BY rowid")?;
@@ -946,7 +1062,22 @@ fn configure_db(db: &Connection, creating: bool) -> Result<(), rusqlite::Error> 
     }
     Ok(())
 }
-fn initialize_schema(db: &Connection) -> Result<(), rusqlite::Error> {
+fn initialize_schema(db: &Connection, profile: FixtureProfile) -> Result<(), rusqlite::Error> {
+    match profile {
+        FixtureProfile::SyntheticV1 => {
+            initialize_synthetic_schema(db)?;
+        }
+        FixtureProfile::Pytest920V1 => {
+            db.execute_batch(&format!(
+                "{PYTEST_MANIFEST_SCHEMA};{FIXTURES_SCHEMA};{ATTEMPTS_SCHEMA};"
+            ))?;
+            db.pragma_update(None, "application_id", PYTEST_DB_APPLICATION_ID)?;
+            db.pragma_update(None, "user_version", PYTEST_SCHEMA_VERSION)?;
+        }
+    }
+    Ok(())
+}
+fn initialize_synthetic_schema(db: &Connection) -> Result<(), rusqlite::Error> {
     db.execute_batch(&format!(
         "{MANIFEST_SCHEMA};{FIXTURES_SCHEMA};{ATTEMPTS_SCHEMA};"
     ))?;
@@ -955,6 +1086,12 @@ fn initialize_schema(db: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
+    validate_registry_for_profile(db, FixtureProfile::SyntheticV1)
+}
+fn validate_registry_for_profile(
+    db: &Connection,
+    profile: FixtureProfile,
+) -> Result<(), LifecycleError> {
     let mut actions = std::collections::HashSet::new();
     let mut slots = std::collections::HashSet::new();
     let mut fixture_state = std::collections::HashMap::new();
@@ -976,17 +1113,23 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
         {
             return Err(LifecycleError::InvalidSession);
         }
-        let Some((index, (_, expected_bytes))) = FIXTURES
-            .iter()
+        let Some((index, (_, expected_bytes, expected_content))) = profile_specs(profile)
+            .into_iter()
             .enumerate()
-            .find(|(_, (slot, _))| *slot == fixture.slot)
+            .find(|(_, (slot, _, _))| *slot == fixture.slot)
         else {
             return Err(LifecycleError::InvalidSession);
         };
-        if fixture.bytes != *expected_bytes
-            || fixture.bytes > MAX_FIXTURE_BYTES
-            || fixture.sha256 != fixture_digest(index, fixture.bytes)
-        {
+        if fixture.bytes != expected_bytes || fixture.bytes > MAX_FIXTURE_BYTES {
+            return Err(LifecycleError::InvalidSession);
+        }
+        let expected_digest = match expected_content {
+            None => fixture_digest(index, expected_bytes),
+            Some(_) if index == 0 => PYTEST_NODEIDS_SHA256.to_owned(),
+            Some(_) if index == 1 => PYTEST_LASTFAILED_SHA256.to_owned(),
+            Some(_) => return Err(LifecycleError::InvalidSession),
+        };
+        if fixture.sha256 != expected_digest {
             return Err(LifecycleError::InvalidSession);
         }
         match fixture.status.as_str() {
@@ -1009,7 +1152,8 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
         );
         count += 1;
     }
-    if count != FIXTURES.len() || slots.len() != FIXTURES.len() || actions.len() != FIXTURES.len() {
+    let expected_count = profile_specs(profile).len();
+    if count != expected_count || slots.len() != expected_count || actions.len() != expected_count {
         return Err(LifecycleError::InvalidSession);
     }
 
@@ -1175,10 +1319,51 @@ fn validate_registry(db: &Connection) -> Result<(), LifecycleError> {
 fn validate_schema(db: &Connection) -> Result<(), LifecycleError> {
     validate_schema_version(db, DB_SCHEMA_VERSION, false)
 }
+fn validate_profile_schema(db: &Connection, profile: FixtureProfile) -> Result<(), LifecycleError> {
+    match profile {
+        FixtureProfile::SyntheticV1 => validate_schema(db),
+        FixtureProfile::Pytest920V1 => {
+            validate_schema_contract(
+                db,
+                PYTEST_SCHEMA_VERSION,
+                false,
+                PYTEST_DB_APPLICATION_ID,
+                PYTEST_MANIFEST_SCHEMA,
+            )?;
+            let stored_profile: String = db
+                .query_row(
+                    "SELECT profile FROM manifest WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| LifecycleError::InvalidSession)?;
+            if stored_profile == "pytest_920_v1" {
+                Ok(())
+            } else {
+                Err(LifecycleError::InvalidSession)
+            }
+        }
+    }
+}
 fn validate_schema_version(
     db: &Connection,
     expected_version: i64,
     legacy: bool,
+) -> Result<(), LifecycleError> {
+    validate_schema_contract(
+        db,
+        expected_version,
+        legacy,
+        DB_APPLICATION_ID,
+        MANIFEST_SCHEMA,
+    )
+}
+fn validate_schema_contract(
+    db: &Connection,
+    expected_version: i64,
+    legacy: bool,
+    expected_application_id: i64,
+    expected_manifest_schema: &str,
 ) -> Result<(), LifecycleError> {
     let application_id: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let schema_version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -1227,9 +1412,9 @@ fn validate_schema_version(
             }
             .to_owned(),
         ),
-        ("manifest".to_owned(), MANIFEST_SCHEMA.to_owned()),
+        ("manifest".to_owned(), expected_manifest_schema.to_owned()),
     ];
-    if application_id != DB_APPLICATION_ID
+    if application_id != expected_application_id
         || schema_version != expected_version
         || integrity != "ok"
         || !journal_mode.eq_ignore_ascii_case("wal")
@@ -1336,6 +1521,25 @@ fn validate_manifest(
     source: &File,
     holding: &File,
 ) -> Result<(), LifecycleError> {
+    validate_profile_manifest(
+        db,
+        id,
+        parent,
+        root,
+        source,
+        holding,
+        FixtureProfile::SyntheticV1,
+    )
+}
+fn validate_profile_manifest(
+    db: &Connection,
+    id: SessionId,
+    parent: &File,
+    root: &File,
+    source: &File,
+    holding: &File,
+    profile: FixtureProfile,
+) -> Result<(), LifecycleError> {
     let recorded: String = db
         .query_row(
             "SELECT session_id FROM manifest WHERE singleton=1",
@@ -1345,6 +1549,18 @@ fn validate_manifest(
         .map_err(|_| LifecycleError::InvalidSession)?;
     if recorded != typed_wire(&id)? {
         return Err(LifecycleError::InvalidSession);
+    }
+    if profile == FixtureProfile::Pytest920V1 {
+        let stored_profile: String = db
+            .query_row(
+                "SELECT profile FROM manifest WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| LifecycleError::InvalidSession)?;
+        if stored_profile != "pytest_920_v1" {
+            return Err(LifecycleError::InvalidSession);
+        }
     }
     let (_, pdev, pino, rdev, rino, sdev, sino, hdev, hino): (String,i64,i64,i64,i64,i64,i64,i64,i64) = db.query_row("SELECT session_id,parent_dev,parent_ino,root_dev,root_ino,source_dev,source_ino,holding_dev,holding_ino FROM manifest WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))?;
     if (pdev, pino) != identity(parent)?
@@ -1356,11 +1572,78 @@ fn validate_manifest(
     }
     Ok(())
 }
-fn unique_actions(actions: &[ActionId; 5]) -> bool {
+fn unique_action_ids(actions: &[ActionId]) -> bool {
     actions
         .iter()
         .enumerate()
         .all(|(i, a)| !actions[..i].contains(a))
+}
+fn profile_root_prefix(profile: FixtureProfile) -> &'static str {
+    match profile {
+        FixtureProfile::SyntheticV1 => ROOT_PREFIX,
+        FixtureProfile::Pytest920V1 => PYTEST_ROOT_PREFIX,
+    }
+}
+fn ensure_other_profile_root_absent(
+    parent: &Path,
+    id: SessionId,
+    profile: FixtureProfile,
+) -> Result<(), LifecycleError> {
+    let other = match profile {
+        FixtureProfile::SyntheticV1 => FixtureProfile::Pytest920V1,
+        FixtureProfile::Pytest920V1 => FixtureProfile::SyntheticV1,
+    };
+    let other_path = parent.join(format!(
+        "{}{}",
+        profile_root_prefix(other),
+        typed_component(&id)?
+    ));
+    match fs::symlink_metadata(other_path) {
+        Ok(_) => Err(LifecycleError::InvalidSession),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LifecycleError::Io(error)),
+    }
+}
+fn profile_specs(profile: FixtureProfile) -> Vec<(&'static str, u64, Option<&'static [u8]>)> {
+    match profile {
+        FixtureProfile::SyntheticV1 => FIXTURES
+            .iter()
+            .map(|(slot, bytes)| (*slot, *bytes, None))
+            .collect(),
+        FixtureProfile::Pytest920V1 => PYTEST_FIXTURES
+            .iter()
+            .map(|(slot, content)| (*slot, content.len() as u64, Some(*content)))
+            .collect(),
+    }
+}
+fn pytest_corpus_matches_profile() -> bool {
+    format!("{:x}", Sha256::digest(PYTEST_NODEIDS)) == PYTEST_NODEIDS_SHA256
+        && format!("{:x}", Sha256::digest(PYTEST_LASTFAILED)) == PYTEST_LASTFAILED_SHA256
+}
+fn write_fixed_content(file: &mut File, content: &[u8]) -> Result<String, LifecycleError> {
+    if content.len() as u64 > MAX_FIXTURE_BYTES {
+        return Err(LifecycleError::InvalidBindings);
+    }
+    file.write_all(content)?;
+    Ok(format!("{:x}", Sha256::digest(content)))
+}
+const PROFILE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 64 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_profile_reserve(parent: &File) -> Result<(), LifecycleError> {
+    use rustix::fs::fstatvfs;
+    let stats = fstatvfs(parent).map_err(|_| LifecycleError::InvalidSession)?;
+    let available = stats
+        .f_bavail
+        .checked_mul(stats.f_frsize)
+        .ok_or(LifecycleError::InvalidSession)?;
+    if available < PROFILE_RESERVE_BYTES {
+        return Err(LifecycleError::InvalidSession);
+    }
+    Ok(())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn check_profile_reserve(_: &File) -> Result<(), LifecycleError> {
+    Err(LifecycleError::UnsupportedPlatform)
 }
 fn encode_action(id: &ActionId) -> Result<String, LifecycleError> {
     serde_json::to_string(id).map_err(|_| LifecycleError::InvalidBindings)
@@ -1549,7 +1832,9 @@ fn is_fixture_component(value: &str) -> bool {
     {
         return false;
     }
-    if FIXTURES.iter().any(|(slot, _)| *slot == value) {
+    if FIXTURES.iter().any(|(slot, _)| *slot == value)
+        || PYTEST_FIXTURES.iter().any(|(slot, _)| *slot == value)
+    {
         return true;
     }
     let Some(uuid) = value.strip_prefix("receipt-") else {
@@ -1848,6 +2133,244 @@ mod tests {
     }
     fn bindings() -> [ActionId; 5] {
         std::array::from_fn(|_| ActionId::new())
+    }
+    fn pytest_bindings() -> [ActionId; 2] {
+        std::array::from_fn(|_| ActionId::new())
+    }
+
+    #[test]
+    fn pytest_profile_reopens_stages_restores_and_purges_only_selected_record() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = pytest_bindings();
+        let (mut lifecycle, initial) =
+            FixtureLifecycle::create_pytest_corpus(parent.path(), ids).unwrap();
+        assert_eq!(lifecycle.profile(), FixtureProfile::Pytest920V1);
+        assert_eq!(initial.fixtures.len(), 2);
+        assert_eq!(
+            fs::read(lifecycle.root.join("source/pytest-nodeids.json")).unwrap(),
+            PYTEST_NODEIDS
+        );
+        assert_eq!(
+            fs::read(lifecycle.root.join("source/pytest-lastfailed.json")).unwrap(),
+            PYTEST_LASTFAILED
+        );
+        fs::write(
+            lifecycle.root.join("source/valuable-local-notes.txt"),
+            b"keep this note",
+        )
+        .unwrap();
+
+        let first_receipt = lifecycle.stage(ids[0], AttemptId::new()).unwrap();
+        let session = lifecycle.session_id();
+        drop(lifecycle);
+        let (mut lifecycle, staged) =
+            FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).unwrap();
+        assert_eq!(lifecycle.profile(), FixtureProfile::Pytest920V1);
+        assert_eq!(
+            staged
+                .fixtures
+                .iter()
+                .find(|f| f.action_id == ids[0])
+                .unwrap()
+                .status,
+            FixtureStatus::Staged
+        );
+        lifecycle.restore(first_receipt, AttemptId::new()).unwrap();
+
+        let second_receipt = lifecycle.stage(ids[0], AttemptId::new()).unwrap();
+        drop(lifecycle);
+        let (mut lifecycle, staged_again) =
+            FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).unwrap();
+        assert_eq!(
+            staged_again
+                .fixtures
+                .iter()
+                .find(|f| f.action_id == ids[0])
+                .unwrap()
+                .status,
+            FixtureStatus::Staged
+        );
+        let outcome = lifecycle
+            .purge_receipt(second_receipt, AttemptId::new())
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PurgeItemOutcome::PermanentlyRemoved {
+                logical_bytes: 70,
+                ..
+            }
+        ));
+        let final_snapshot = lifecycle.snapshot().unwrap();
+        assert_eq!(
+            final_snapshot
+                .fixtures
+                .iter()
+                .find(|f| f.action_id == ids[0])
+                .unwrap()
+                .status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        assert_eq!(
+            final_snapshot
+                .fixtures
+                .iter()
+                .find(|f| f.action_id == ids[1])
+                .unwrap()
+                .status,
+            FixtureStatus::Available
+        );
+        assert_eq!(
+            fs::read(lifecycle.root.join("source/pytest-lastfailed.json")).unwrap(),
+            PYTEST_LASTFAILED
+        );
+        assert_eq!(
+            fs::read(lifecycle.root.join("source/valuable-local-notes.txt")).unwrap(),
+            b"keep this note"
+        );
+    }
+
+    #[test]
+    fn pytest_profile_rejects_unknown_profile_mixed_rows_and_cross_profile_reuse() {
+        let parent = tempfile::tempdir().unwrap();
+        let synthetic_id = SessionId::new();
+        FixtureLifecycle::create_for_session(parent.path(), synthetic_id, bindings()).unwrap();
+        assert!(FixtureLifecycle::create_pytest_corpus_for_session(
+            parent.path(),
+            synthetic_id,
+            pytest_bindings()
+        )
+        .is_err());
+
+        let (lifecycle, _) =
+            FixtureLifecycle::create_pytest_corpus(parent.path(), pytest_bindings()).unwrap();
+        let session = lifecycle.session_id();
+        assert!(FixtureLifecycle::create_for_session(parent.path(), session, bindings()).is_err());
+        assert!(FixtureLifecycle::reopen(parent.path(), session).is_err());
+        lifecycle.db.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE manifest SET profile='unknown_profile';").unwrap();
+        drop(lifecycle);
+        assert!(FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).is_err());
+
+        let (lifecycle, _) =
+            FixtureLifecycle::create_pytest_corpus(parent.path(), pytest_bindings()).unwrap();
+        let session = lifecycle.session_id();
+        lifecycle.db.execute("UPDATE fixtures SET slot='compiler-output' WHERE rowid=(SELECT min(rowid) FROM fixtures)", []).unwrap();
+        drop(lifecycle);
+        assert!(FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).is_err());
+
+        let (lifecycle, _) =
+            FixtureLifecycle::create_pytest_corpus(parent.path(), pytest_bindings()).unwrap();
+        let session = lifecycle.session_id();
+        lifecycle
+            .db
+            .execute(
+                "UPDATE fixtures SET bytes=?1 WHERE rowid=(SELECT min(rowid) FROM fixtures)",
+                [MAX_FIXTURE_BYTES as i64 + 1],
+            )
+            .unwrap();
+        drop(lifecycle);
+        assert!(FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).is_err());
+    }
+
+    #[test]
+    fn pytest_second_record_terminal_reopen_preserves_first_record() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = pytest_bindings();
+        let (mut lifecycle, initial) =
+            FixtureLifecycle::create_pytest_corpus(parent.path(), ids).unwrap();
+        let session = lifecycle.session_id();
+        let receipt = lifecycle.stage(ids[1], AttemptId::new()).unwrap();
+        drop(lifecycle);
+        let (mut lifecycle, _) =
+            FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).unwrap();
+        lifecycle.restore(receipt, AttemptId::new()).unwrap();
+        let receipt = lifecycle.stage(ids[1], AttemptId::new()).unwrap();
+        lifecycle.purge_receipt(receipt, AttemptId::new()).unwrap();
+        drop(lifecycle);
+        let (mut lifecycle, snapshot) =
+            FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).unwrap();
+        assert_eq!(snapshot.fixtures[0], initial.fixtures[0]);
+        assert_eq!(
+            snapshot.fixtures[1].status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        assert_eq!(
+            fs::read(lifecycle.root.join("source/pytest-nodeids.json")).unwrap(),
+            PYTEST_NODEIDS
+        );
+        assert!(matches!(
+            lifecycle.restore(receipt, AttemptId::new()),
+            Err(LifecycleError::WrongState)
+        ));
+    }
+
+    #[test]
+    fn pytest_changed_content_and_open_handle_profile_tampering_refuse() {
+        let parent = tempfile::tempdir().unwrap();
+        let ids = pytest_bindings();
+        let (mut lifecycle, _) =
+            FixtureLifecycle::create_pytest_corpus(parent.path(), ids).unwrap();
+        let source = lifecycle.root.join("source/pytest-nodeids.json");
+        // Preserve the same length: refusal must depend on content as well as size.
+        let changed = vec![b'x'; PYTEST_NODEIDS.len()];
+        fs::write(&source, &changed).unwrap();
+        assert!(matches!(
+            lifecycle.stage(ids[0], AttemptId::new()),
+            Err(LifecycleError::Changed)
+        ));
+        assert_eq!(fs::read(&source).unwrap(), changed);
+        assert_eq!(
+            fs::read(lifecycle.root.join("source/pytest-lastfailed.json")).unwrap(),
+            PYTEST_LASTFAILED
+        );
+        lifecycle
+            .db
+            .execute_batch(
+                "PRAGMA ignore_check_constraints=ON; UPDATE manifest SET profile='synthetic_v1';",
+            )
+            .unwrap();
+        assert!(lifecycle.snapshot().is_err());
+        assert!(lifecycle.stage(ids[1], AttemptId::new()).is_err());
+        let intents: i64 = lifecycle
+            .db
+            .query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(intents, 0);
+    }
+
+    #[test]
+    fn pytest_pending_intent_reopens_as_uncertain_without_retry() {
+        let parent = tempfile::tempdir().unwrap();
+        let (lifecycle, initial) =
+            FixtureLifecycle::create_pytest_corpus(parent.path(), pytest_bindings()).unwrap();
+        let session = lifecycle.session_id();
+        let action = initial.fixtures[0].action_id;
+        let attempt = AttemptId::new();
+        let receipt = ReceiptId::new();
+        lifecycle.db.execute(
+            "INSERT INTO attempts(attempt_id,action_id,operation,receipt_id,outcome) VALUES(?1,?2,'stage',?3,'intent')",
+            params![typed_wire(&attempt).unwrap(), encode_action(&action).unwrap(), typed_wire(&receipt).unwrap()],
+        ).unwrap();
+        drop(lifecycle);
+        let (mut reopened, snapshot) =
+            FixtureLifecycle::reopen_pytest_corpus(parent.path(), session).unwrap();
+        assert_eq!(
+            snapshot
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.action_id == action)
+                .unwrap()
+                .status,
+            FixtureStatus::Uncertain
+        );
+        assert!(matches!(
+            reopened.stage(action, AttemptId::new()),
+            Err(LifecycleError::Uncertain)
+        ));
+        assert_eq!(
+            fs::read(reopened.root.join("source/pytest-nodeids.json")).unwrap(),
+            PYTEST_NODEIDS,
+            "reopen must not retry or move the fixture"
+        );
     }
     /// Complete contents of one table: every rowid with every column value,
     /// in rowid order. Used to prove migration and rollback preserve data
