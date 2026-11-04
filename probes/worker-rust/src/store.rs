@@ -1,5 +1,7 @@
 //! Private, app-created Git-worker store fixture with bounded live cleanup.
 
+#[path = "store/footprint.rs"]
+mod footprint;
 #[path = "store/handoff.rs"]
 mod handoff;
 #[path = "store/payload.rs"]
@@ -103,6 +105,12 @@ pub(crate) struct WorkerPayloadObservation {
     pub(crate) high_water_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FixtureFootprintObservation {
+    pub(crate) object_count: u8,
+    pub(crate) observed_bytes: u64,
+}
+
 pub(crate) const PARTIAL_PAYLOAD_FIXTURE_BYTES: u64 = payload::PARTIAL_FIXTURE_BYTES;
 pub(crate) const WORKER_PAYLOAD_RESERVATION: u64 = 128 * 1024;
 
@@ -139,6 +147,14 @@ impl OwnedStore {
         receipt: &crate::StopReceipt,
     ) -> Result<WorkerPayloadObservation, StoreError> {
         handoff::inspect_stopped_worker_partial_payload(self, receipt)
+    }
+
+    pub(crate) fn observe_stopped_fixture_footprint(
+        &self,
+        registry: &verification_store_registry::VerificationStoreRegistry,
+        receipt: &crate::StopReceipt,
+    ) -> Result<FixtureFootprintObservation, StoreError> {
+        footprint::observe_stopped_fixture(self, registry, receipt)
     }
 
     pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {

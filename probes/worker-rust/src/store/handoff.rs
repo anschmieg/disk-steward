@@ -105,7 +105,9 @@ pub(super) fn write_stdin_payload() -> Result<super::payload::PayloadReport, Sto
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn write_payload_from_root(root: &File) -> Result<super::payload::PayloadReport, StoreError> {
+pub(super) fn write_payload_from_root(
+    root: &File,
+) -> Result<super::payload::PayloadReport, StoreError> {
     validate_root_descriptor(root)?;
     let binding = capture_bound_journal(root)?;
     super::payload::write_worker_payload(root, binding.reservation, |has_payload, payload_id| {
@@ -433,7 +435,7 @@ fn check_readback_deadline(deadline: Instant) -> Result<(), StoreError> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_and_verify_payload(
+pub(super) fn read_and_verify_payload(
     file: &File,
     deadline: Instant,
     expected_bytes: u64,
@@ -605,7 +607,7 @@ fn validate_named_marker_identity(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_bounded_marker(marker: &mut File) -> Result<Vec<u8>, StoreError> {
+pub(super) fn read_bounded_marker(marker: &mut File) -> Result<Vec<u8>, StoreError> {
     let mut contents = Vec::with_capacity(JOURNAL_LIMIT + 1);
     let mut buffer = [0u8; JOURNAL_LIMIT + 1];
     let mut interruptions = 0u8;

@@ -86,3 +86,10 @@ record needs reconciliation, including reservations for another registered
 store. It does not cancel running jobs, revoke capabilities, inspect data,
 confirm shutdown, reconcile/adopt a store, release capacity, or authorize
 cleanup. The API adds no schema migration or renderer access.
+
+`observe_control_footprint` is a backend-only observation of the registry's own
+validated database and lease files. Its opaque snapshot exposes checked current
+byte totals and identities, with no paths, file handles or SQL access. It
+requires private metadata and stable held/named identities and metadata under a
+cooperative deadline. It grants no admission, store ownership, shutdown or
+cleanup authority, and is not a lifetime peak or durable measured-byte record.

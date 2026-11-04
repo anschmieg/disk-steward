@@ -454,6 +454,19 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     } else {
         None
     };
+    let fixture_footprint = if mode == IndexedWorkerMode::Payload {
+        let observation = store
+            .observe_stopped_fixture_footprint(&registry, &receipt)
+            .map_err(|_| "complete stopped fixture footprint observation refused".to_owned())?;
+        if observation.object_count != 6
+            || observation.observed_bytes > store::WORKER_PAYLOAD_RESERVATION
+        {
+            return Err("fixed fixture footprint exceeds the separate observation bound".into());
+        }
+        Some(observation)
+    } else {
+        None
+    };
     drop(registry);
     drop(store);
     let mut reopened = VerificationStoreRegistry::open(&registry_path)
@@ -499,7 +512,9 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     if let Some(observation) = payload_observation {
         let written = observation.written_bytes;
         let high_water = observation.high_water_bytes;
-        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+        let footprint =
+            fixture_footprint.ok_or("complete payload footprint observation missing")?;
+        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
     } else if descriptor_handoff {
         println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     } else {
