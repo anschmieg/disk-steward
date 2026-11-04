@@ -516,6 +516,7 @@ dependencies = [
  "rustix",
  "rustls",
  "sha1-checked",
+ "sha2",
  "verification-budget",
  "verification-store-registry",
  "webpki-roots",

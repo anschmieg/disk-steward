@@ -127,7 +127,8 @@ fn run_parent(args: &[String]) -> Result<(), String> {
         }
         [flag] if flag == "--run-store-worker" => run_store_worker(),
         [flag] if flag == "--run-store-reinspect" => run_store_reinspect(),
-        [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(),
+        [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(false),
+        [flag] if flag == "--run-indexed-store-handoff" => run_indexed_store_worker(true),
         [flag, confirm] if flag == "--run-store-cleanup" && confirm == "--confirm-own-store-cleanup" => run_store_worker_with_cleanup(true),
         [flag] if flag == "--run-store-cleanup" => Err("refusing store cleanup without --confirm-own-store-cleanup".into()),
         [flag] if flag == "--run" => {
@@ -160,11 +161,11 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, or --run-store-cleanup --confirm-own-store-cleanup".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, --run-indexed-store-handoff, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
 }
 
-fn run_indexed_store_worker() -> Result<(), String> {
+fn run_indexed_store_worker(descriptor_handoff: bool) -> Result<(), String> {
     use verification_store_registry::{
         RegistryError, StoreState as RState, VerificationStoreRegistry,
     };
@@ -190,10 +191,24 @@ fn run_indexed_store_worker() -> Result<(), String> {
         return Err("registry reservation mismatch".into());
     }
     let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
+    let child_stdin = if descriptor_handoff {
+        let root = store
+            .worker_stdin_once()
+            .map_err(|_| "prepare store descriptor handoff refused".to_owned())?;
+        Stdio::from(root)
+    } else {
+        Stdio::null()
+    };
+    let child_mode = if descriptor_handoff {
+        "store-handoff"
+    } else {
+        "stall"
+    };
     let mut child = Command::new(exe)
+        .env_clear()
         .arg("--child")
-        .arg("stall")
-        .stdin(Stdio::null())
+        .arg(child_mode)
+        .stdin(child_stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -296,7 +311,11 @@ fn run_indexed_store_worker() -> Result<(), String> {
         }
         Ok(_) => return Err("reopened reconciliation row unexpectedly became active".into()),
     }
-    println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+    if descriptor_handoff {
+        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+    } else {
+        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+    }
     Ok(())
 }
 
@@ -308,6 +327,7 @@ fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
     let mut store = store::OwnedStore::create().map_err(|e| format!("create owned store: {e}"))?;
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
+        .env_clear()
         .arg("--child")
         .arg("stall")
         .stdin(Stdio::null())
@@ -395,6 +415,10 @@ fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
+    // Fixed probe check for the closed launch boundary; this is not process isolation.
+    if env::var_os("DISK_STEWARD_WORKER_ENV_SENTINEL").is_some() {
+        return Err("child environment sentinel present".into());
+    }
     match args {
         [mode] if mode == "flood" => {
             let mut stdout = io::stdout().lock();
@@ -420,6 +444,17 @@ fn run_child(args: &[String]) -> Result<(), String> {
             thread::sleep(CHILD_HOLD);
             Ok(())
         }
+        [mode] if mode == "store-handoff" => {
+            store::OwnedStore::validate_worker_stdin_handoff()
+                .map_err(|_| "store handoff refused".to_owned())?;
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(b"R")
+                .map_err(|_| "child readiness write failed")?;
+            stdout.flush().map_err(|_| "child readiness flush failed")?;
+            thread::sleep(CHILD_HOLD);
+            Ok(())
+        }
         [mode] if mode == "store-abandon" => run_store_abandon_child(),
         _ => Err("invalid private child mode".into()),
     }
@@ -442,6 +477,7 @@ fn run_store_reinspect() -> Result<(), String> {
     let deadline = start + OUTER_DEADLINE;
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let mut child = Command::new(exe)
+        .env_clear()
         .arg("--child")
         .arg("store-abandon")
         .stdin(Stdio::null())
@@ -559,6 +595,7 @@ fn supervise(case: Case) -> Result<Report, String> {
     let deadline = start + OUTER_DEADLINE;
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
+        .env_clear()
         .arg("--child")
         .arg(case.child_mode())
         .stdin(Stdio::null())
