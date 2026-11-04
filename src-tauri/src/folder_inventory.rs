@@ -13,6 +13,7 @@ const MAX_RAW_ENTRIES: usize = 512;
 const MAX_DURATION: Duration = Duration::from_secs(2);
 const MAX_LABEL_CHARS: usize = 120;
 const MAX_NAVIGATION_DEPTH: usize = 16;
+const MAX_PAGES_PER_DIRECTORY: u32 = 128;
 
 #[cfg(unix)]
 // Unix stat reports allocation in 512-byte units, not st_blksize units.
@@ -49,6 +50,9 @@ pub struct FolderInventorySnapshot {
     pub directories_not_traversed: u32,
     pub regular_file_logical_bytes: String,
     pub can_go_back: bool,
+    pub page_number: u32,
+    pub entries_seen: String,
+    pub can_continue: bool,
 }
 
 fn empty_snapshot(
@@ -68,6 +72,9 @@ fn empty_snapshot(
         directories_not_traversed: 0,
         regular_file_logical_bytes: "0".to_owned(),
         can_go_back,
+        page_number: 1,
+        entries_seen: "0".to_owned(),
+        can_continue: false,
     }
 }
 
@@ -76,6 +83,12 @@ fn empty_snapshot(
 pub struct NavigationRequest {
     expected_observation_id: String,
     entry_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinueInventoryRequest {
+    expected_observation_id: InventoryItemId,
 }
 
 #[derive(Clone, Default)]
@@ -232,6 +245,7 @@ struct Session {
     observation_id: InventoryItemId,
     entries: Vec<ObservedEntry>,
     snapshot: FolderInventorySnapshot,
+    cursor: Option<DirectoryCursor>,
 }
 
 #[cfg(not(unix))]
@@ -241,6 +255,16 @@ struct Session;
 struct ScannedDirectory {
     snapshot: FolderInventorySnapshot,
     entries: Vec<ObservedEntry>,
+    cursor: Option<DirectoryCursor>,
+}
+
+#[cfg(unix)]
+struct DirectoryCursor {
+    directory: rustix::fs::Dir,
+    baseline: rustix::fs::Stat,
+    identity: DirectoryIdentity,
+    page_number: u32,
+    entries_seen: u64,
 }
 
 #[cfg(unix)]
@@ -418,6 +442,9 @@ fn scan_selected_folder_with_limits(
         depth: 1,
         max_entries,
         duration,
+        cursor: None,
+        page_number: 1,
+        entries_seen: 0,
     })?;
     Ok(scanned.snapshot)
 }
@@ -433,6 +460,9 @@ struct ScanRequest<'a> {
     depth: usize,
     max_entries: usize,
     duration: Duration,
+    cursor: Option<DirectoryCursor>,
+    page_number: u32,
+    entries_seen: u64,
 }
 
 #[cfg(unix)]
@@ -447,6 +477,9 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         depth,
         max_entries,
         duration,
+        cursor,
+        page_number,
+        entries_seen,
     } = request;
     use rustix::fs::{fstat, statat, AtFlags, Dir, FileType};
 
@@ -457,12 +490,15 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         breadcrumbs,
         can_go_back,
     );
+    snapshot.page_number = page_number;
+    snapshot.entries_seen = entries_seen.to_string();
     let root_metadata_result = fstat(fd);
     if started.elapsed() >= duration {
         snapshot.stop_reason = Some("time_limit");
         return Ok(ScannedDirectory {
             snapshot,
             entries: Vec::new(),
+            cursor: None,
         });
     }
     let root_before =
@@ -473,17 +509,34 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     {
         return Err("The selected folder changed. Choose it again to inspect it.");
     }
-    let directory_result = Dir::read_from(fd);
+    let mut pending_cursor = cursor;
+    let cursor_baseline = pending_cursor
+        .as_ref()
+        .map(|cursor| cursor.baseline)
+        .unwrap_or(root_before);
+    if let Some(cursor) = pending_cursor.as_ref() {
+        if cursor.identity != expected_identity
+            || !root_metadata_matches(&cursor_baseline, &root_before)
+        {
+            return Err("Folder changed while paging. Choose the folder again.");
+        }
+    }
+    let directory_result = match pending_cursor.take() {
+        Some(cursor) => Ok(cursor.directory),
+        None => Dir::read_from(fd),
+    };
     if started.elapsed() >= duration {
         snapshot.stop_reason = Some("time_limit");
         return Ok(ScannedDirectory {
             snapshot,
             entries: Vec::new(),
+            cursor: None,
         });
     }
     let mut directory =
         directory_result.map_err(|_| "The selected folder could not be read safely.")?;
     let mut raw_entries = 0usize;
+    let mut entries_seen = entries_seen;
     let mut logical_bytes = 0u64;
     let mut observed_entries = Vec::new();
 
@@ -518,6 +571,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             break;
         }
         raw_entries += 1;
+        entries_seen = entries_seen.saturating_add(1);
         if started.elapsed() >= duration {
             snapshot.stop_reason = Some("time_limit");
             break;
@@ -614,18 +668,26 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             can_open,
         });
         if raw_entries == max_entries {
-            snapshot.stop_reason = Some("entry_limit");
+            if snapshot.stop_reason.is_none() {
+                snapshot.stop_reason = Some(if page_number >= MAX_PAGES_PER_DIRECTORY {
+                    "page_limit"
+                } else {
+                    "entry_limit"
+                });
+            }
             break;
         }
     }
 
     snapshot.regular_file_logical_bytes = logical_bytes.to_string();
+    snapshot.entries_seen = entries_seen.to_string();
     if started.elapsed() >= duration {
         snapshot.enumeration_complete = false;
         snapshot.stop_reason.get_or_insert("time_limit");
         return Ok(ScannedDirectory {
             snapshot,
             entries: observed_entries,
+            cursor: None,
         });
     }
     let root_after = fstat(fd);
@@ -635,10 +697,15 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         return Ok(ScannedDirectory {
             snapshot,
             entries: observed_entries,
+            cursor: None,
         });
     }
+    let stable = match &root_after {
+        Ok(after) => root_metadata_matches(&cursor_baseline, after),
+        Err(_) => false,
+    };
     match root_after {
-        Ok(after) if root_metadata_matches(&root_before, &after) => {}
+        Ok(_) if stable => {}
         Ok(_) => {
             snapshot.enumeration_complete = false;
             snapshot.stop_reason = Some("root_metadata_changed");
@@ -651,9 +718,21 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
     if snapshot.stop_reason.is_some() {
         snapshot.enumeration_complete = false;
     }
+    let continue_paging = snapshot.stop_reason == Some("entry_limit")
+        && stable
+        && page_number < MAX_PAGES_PER_DIRECTORY;
+    snapshot.can_continue = continue_paging;
+    let cursor = continue_paging.then_some(DirectoryCursor {
+        directory,
+        baseline: cursor_baseline,
+        identity: expected_identity,
+        page_number,
+        entries_seen,
+    });
     Ok(ScannedDirectory {
         snapshot,
         entries: observed_entries,
+        cursor,
     })
 }
 
@@ -711,6 +790,9 @@ fn selected_root_session(
         depth: 1,
         max_entries,
         duration: remaining,
+        cursor: None,
+        page_number: 1,
+        entries_seen: 0,
     })?;
     let session = Session {
         root_device: root_identity.device,
@@ -718,6 +800,7 @@ fn selected_root_session(
         observation_id: scanned.snapshot.observation_id,
         entries: scanned.entries,
         snapshot: scanned.snapshot.clone(),
+        cursor: scanned.cursor,
     };
     Ok((session, scanned.snapshot))
 }
@@ -878,12 +961,16 @@ fn navigate_session(
             depth: current_index,
             max_entries,
             duration: duration.saturating_sub(started.elapsed()),
+            cursor: None,
+            page_number: 1,
+            entries_seen: 0,
         })?;
         validate_session_bindings(session, started, duration)?;
         session.frames.truncate(current_index);
         session.observation_id = scanned.snapshot.observation_id;
         session.entries = scanned.entries;
         session.snapshot = scanned.snapshot.clone();
+        session.cursor = scanned.cursor;
         return Ok(scanned.snapshot);
     }
 
@@ -965,6 +1052,9 @@ fn navigate_session(
         depth: session.frames.len() + 1,
         max_entries,
         duration: duration.saturating_sub(started.elapsed()),
+        cursor: None,
+        page_number: 1,
+        entries_seen: 0,
     })?;
     validate_session_bindings(session, started, duration)?;
     validate_child_binding(parent, &child, session.root_device, started, duration)?;
@@ -972,6 +1062,76 @@ fn navigate_session(
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
+    session.cursor = scanned.cursor;
+    Ok(scanned.snapshot)
+}
+
+#[cfg(unix)]
+fn continue_session(
+    session: &mut Session,
+    request: ContinueInventoryRequest,
+    max_entries: usize,
+    duration: Duration,
+) -> Result<FolderInventorySnapshot, &'static str> {
+    let started = Instant::now();
+    if request.expected_observation_id != session.observation_id {
+        return Err("Folder observation is stale. Inspect the folder again.");
+    }
+    if let Err(error) = validate_session_bindings(session, started, duration) {
+        session.cursor.take();
+        session.snapshot.can_continue = false;
+        return Err(error);
+    }
+    let cursor = session
+        .cursor
+        .take()
+        .ok_or("This folder page cannot continue. Choose the folder again to inspect it.")?;
+    if !session.snapshot.can_continue
+        || session.snapshot.page_number != cursor.page_number
+        || session.snapshot.entries_seen != cursor.entries_seen.to_string()
+    {
+        session.snapshot.can_continue = false;
+        return Err("Folder paging state changed. Choose the folder again to inspect it.");
+    }
+    let Some(next_page) = cursor.page_number.checked_add(1) else {
+        session.snapshot.can_continue = false;
+        return Err("Folder paging limit reached. Choose the folder again to inspect it.");
+    };
+    let entries_seen = cursor.entries_seen;
+    let frame = session.frames.last().expect("session has a root frame");
+    let scanned = scan_directory_fd(ScanRequest {
+        fd: &frame.fd,
+        expected_identity: cursor.identity,
+        root_device: session.root_device,
+        root_label: &frame.label,
+        breadcrumbs: session
+            .frames
+            .iter()
+            .map(|frame| frame.label.clone())
+            .collect(),
+        can_go_back: session.frames.len() > 1,
+        depth: session.frames.len(),
+        max_entries,
+        duration: duration.saturating_sub(started.elapsed()),
+        cursor: Some(cursor),
+        page_number: next_page,
+        entries_seen,
+    });
+    let scanned = match scanned {
+        Ok(scanned) => scanned,
+        Err(error) => {
+            session.snapshot.can_continue = false;
+            return Err(error);
+        }
+    };
+    if let Err(error) = validate_session_bindings(session, started, duration) {
+        session.snapshot.can_continue = false;
+        return Err(error);
+    }
+    session.observation_id = scanned.snapshot.observation_id;
+    session.entries = scanned.entries;
+    session.snapshot = scanned.snapshot.clone();
+    session.cursor = scanned.cursor;
     Ok(scanned.snapshot)
 }
 
@@ -983,6 +1143,16 @@ fn navigate_session(
     _: Duration,
 ) -> Result<FolderInventorySnapshot, &'static str> {
     Err("Folder navigation is unsupported on this platform.")
+}
+
+#[cfg(not(unix))]
+fn continue_session(
+    _: &mut Session,
+    _: ContinueInventoryRequest,
+    _: usize,
+    _: Duration,
+) -> Result<FolderInventorySnapshot, &'static str> {
+    Err("Folder paging is unsupported on this platform.")
 }
 
 #[cfg(not(unix))]
@@ -1051,6 +1221,27 @@ pub async fn navigate_folder_inventory(
     .map_err(|_| "Folder navigation did not complete.".to_owned())?
 }
 
+#[tauri::command]
+pub async fn continue_folder_inventory(
+    state: tauri::State<'_, FolderInventoryState>,
+    request: ContinueInventoryRequest,
+) -> Result<FolderInventorySnapshot, String> {
+    let guard = crate::NativeCheckGuard::acquire()?;
+    let sessions = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let mut current = sessions
+            .lock()
+            .map_err(|_| "Folder inventory state is unavailable.".to_owned())?;
+        let session = current
+            .as_mut()
+            .ok_or_else(|| "Choose a folder before continuing its inventory.".to_owned())?;
+        continue_session(session, request, MAX_RAW_ENTRIES, MAX_DURATION).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| "Folder page continuation did not complete.".to_owned())?
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1088,6 +1279,21 @@ mod tests {
             entry_id: None,
         };
         navigate_session(session, request, MAX_RAW_ENTRIES, MAX_DURATION)
+    }
+
+    fn continue_current_page(
+        session: &mut Session,
+        max_entries: usize,
+    ) -> Result<FolderInventorySnapshot, &'static str> {
+        let expected_observation_id = session.observation_id;
+        continue_session(
+            session,
+            ContinueInventoryRequest {
+                expected_observation_id,
+            },
+            max_entries,
+            MAX_DURATION,
+        )
     }
 
     #[test]
@@ -1180,6 +1386,162 @@ mod tests {
         unix_fs::symlink(&actual, &link).unwrap();
         assert!(scan_selected_folder(&parent.path().join("missing")).is_err());
         assert!(scan_selected_folder(&link).is_err());
+    }
+
+    #[test]
+    fn continuation_returns_fresh_bounded_pages_and_an_explicit_empty_end_page() {
+        let root = tempdir().unwrap();
+        for index in 0..6 {
+            fs::write(root.path().join(format!("item-{index}")), b"x").unwrap();
+        }
+        let (mut session, first) = selected_root_session(root.path(), 3, MAX_DURATION).unwrap();
+        assert_eq!(first.page_number, 1);
+        assert_eq!(first.entries.len(), 3);
+        assert_eq!(first.entries_seen, "3");
+        assert!(first.can_continue);
+
+        let stale = ContinueInventoryRequest {
+            expected_observation_id: InventoryItemId::new(),
+        };
+        assert!(continue_session(&mut session, stale, 3, MAX_DURATION).is_err());
+        assert!(session.cursor.is_some());
+        assert_eq!(session.snapshot.observation_id, first.observation_id);
+
+        let second = continue_current_page(&mut session, 3).unwrap();
+        assert_eq!(second.page_number, 2);
+        assert_eq!(second.entries.len(), 3);
+        assert_eq!(second.entries_seen, "6");
+        assert!(second.can_continue);
+        assert_ne!(second.observation_id, first.observation_id);
+
+        let end = continue_current_page(&mut session, 3).unwrap();
+        assert_eq!(end.page_number, 3);
+        assert!(end.entries.is_empty());
+        assert_eq!(end.entries_seen, "6");
+        assert!(end.enumeration_complete);
+        assert!(!end.can_continue);
+        assert_ne!(end.observation_id, second.observation_id);
+
+        let mut names = first
+            .entries
+            .iter()
+            .chain(second.entries.iter())
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 6);
+        assert!(names.iter().all(|name| name.starts_with("item-")));
+        assert!(end.entries.len() <= 3);
+    }
+
+    #[test]
+    fn changed_directory_invalidates_cursor_and_navigation_replaces_it() {
+        let root = tempdir().unwrap();
+        for index in 0..4 {
+            fs::write(root.path().join(format!("root-{index}")), b"x").unwrap();
+        }
+        fs::create_dir(root.path().join("child")).unwrap();
+        for index in 0..3 {
+            fs::write(
+                root.path().join("child").join(format!("child-{index}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let (mut session, _) = selected_root_session(root.path(), 512, MAX_DURATION).unwrap();
+        let child_id = session
+            .entries
+            .iter()
+            .find(|entry| entry.name == b"child")
+            .unwrap()
+            .id;
+        let request = NavigationRequest {
+            expected_observation_id: typed_id_string(session.observation_id),
+            entry_id: Some(typed_id_string(child_id)),
+        };
+        let child_page = navigate_session(&mut session, request, 1, MAX_DURATION).unwrap();
+        assert!(child_page.can_continue);
+        assert!(session.cursor.is_some());
+
+        let back = NavigationRequest {
+            expected_observation_id: typed_id_string(session.observation_id),
+            entry_id: None,
+        };
+        let parent = navigate_session(&mut session, back, 512, MAX_DURATION).unwrap();
+        assert!(!parent.can_continue);
+        assert!(session.cursor.is_none());
+
+        let (mut changing, first) = selected_root_session(root.path(), 2, MAX_DURATION).unwrap();
+        assert!(first.can_continue);
+        fs::write(root.path().join("later-entry"), b"x").unwrap();
+        assert!(continue_current_page(&mut changing, 2).is_err());
+        assert!(changing.cursor.is_none());
+        assert!(!changing.snapshot.can_continue);
+
+        let moved_root = tempdir().unwrap();
+        fs::create_dir(moved_root.path().join("child")).unwrap();
+        for index in 0..3 {
+            fs::write(
+                moved_root
+                    .path()
+                    .join("child")
+                    .join(format!("item-{index}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let (mut moved, _) = selected_root_session(moved_root.path(), 512, MAX_DURATION).unwrap();
+        let child_id = moved
+            .entries
+            .iter()
+            .find(|entry| entry.name == b"child")
+            .unwrap()
+            .id;
+        let enter = NavigationRequest {
+            expected_observation_id: typed_id_string(moved.observation_id),
+            entry_id: Some(typed_id_string(child_id)),
+        };
+        let child_page = navigate_session(&mut moved, enter, 1, MAX_DURATION).unwrap();
+        assert!(child_page.can_continue);
+        fs::rename(
+            moved_root.path().join("child"),
+            moved_root.path().join("renamed-child"),
+        )
+        .unwrap();
+        assert!(continue_current_page(&mut moved, 1).is_err());
+        assert!(moved.cursor.is_none());
+        assert!(!moved.snapshot.can_continue);
+    }
+
+    #[test]
+    fn page_limit_closes_cursor_after_128_responses() {
+        let root = tempdir().unwrap();
+        for index in 0..MAX_PAGES_PER_DIRECTORY {
+            fs::write(root.path().join(format!("item-{index:03}")), b"x").unwrap();
+        }
+        let (mut session, mut page) = selected_root_session(root.path(), 1, MAX_DURATION).unwrap();
+        for expected_page in 2..=MAX_PAGES_PER_DIRECTORY {
+            page = continue_current_page(&mut session, 1).unwrap();
+            assert_eq!(page.page_number, expected_page);
+            assert_eq!(page.entries.len(), 1);
+        }
+        assert_eq!(page.entries_seen, MAX_PAGES_PER_DIRECTORY.to_string());
+        assert_eq!(page.stop_reason, Some("page_limit"));
+        assert!(!page.can_continue);
+        assert!(session.cursor.is_none());
+    }
+
+    #[test]
+    fn continuation_request_rejects_unknown_fields() {
+        let id = typed_id_string(InventoryItemId::new());
+        let valid = serde_json::json!({ "expectedObservationId": id });
+        assert!(serde_json::from_value::<ContinueInventoryRequest>(valid).is_ok());
+        let with_path = serde_json::json!({
+            "expectedObservationId": typed_id_string(InventoryItemId::new()),
+            "path": "/tmp"
+        });
+        assert!(serde_json::from_value::<ContinueInventoryRequest>(with_path).is_err());
     }
 
     #[test]
@@ -1626,6 +1988,50 @@ mod tests {
             fs::read(root.path().join("valuable.txt")).unwrap(),
             b"unchanged"
         );
+    }
+
+    #[test]
+    fn continuation_imports_only_the_new_page_and_expiry_invalidates_the_cursor() {
+        let root = tempdir().unwrap();
+        for index in 0..5 {
+            fs::write(root.path().join(format!("item-{index}")), b"x").unwrap();
+        }
+        let (mut session, first) = selected_root_session(root.path(), 2, MAX_DURATION).unwrap();
+        let second = continue_current_page(&mut session, 2).unwrap();
+        let second_ids = second
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+        assert_eq!(
+            state
+                .blocked_items_for_observation(first.observation_id)
+                .unwrap_err(),
+            "stale_observation"
+        );
+        let imported = state
+            .blocked_items_for_observation(second.observation_id)
+            .unwrap();
+        assert_eq!(imported.len(), 2);
+        assert!(imported.iter().all(|item| second_ids.contains(&item.id)));
+        let mut guard = state.0.lock().unwrap();
+        let session = guard.as_mut().unwrap();
+        assert!(session.cursor.is_some());
+        assert!(continue_session(
+            session,
+            ContinueInventoryRequest {
+                expected_observation_id: second.observation_id
+            },
+            2,
+            Duration::ZERO
+        )
+        .is_err());
+        assert!(session.cursor.is_none());
+        assert!(!session.snapshot.can_continue);
+        assert_eq!(session.observation_id, second.observation_id);
+        assert_eq!(session.snapshot.entries, second.entries);
     }
 
     fn symlink_for_test(target: &Path, link: &Path) {

@@ -14,6 +14,9 @@ import { invoke } from "@tauri-apps/api/core";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const sample: FolderInventory = {
   rootLabel: "Chosen folder",
+  pageNumber: 1,
+  entriesSeen: "3",
+  canContinue: true,
   observationId: "observation-1",
   breadcrumbs: ["Chosen folder"],
   canGoBack: false,
@@ -230,7 +233,7 @@ test("explicit plan import uses current observation and live revision without re
     target: { value: "Alpha" },
   });
   fireEvent.click(
-    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+    screen.getByRole("button", { name: "Add this page to your plan" }),
   );
   await screen.findByText(/Added 3 observed entries/);
   expect(invoke).toHaveBeenNthCalledWith(2, "get_general_plan", {
@@ -243,7 +246,7 @@ test("explicit plan import uses current observation and live revision without re
     },
   });
   expect(
-    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+    screen.getByRole("button", { name: "Add this page to your plan" }),
   ).toBeDisabled();
   expect(screen.getByRole("heading", { name: "Chosen folder" })).toBeVisible();
   fireEvent.click(
@@ -261,11 +264,11 @@ test("failed import preserves observed entries and does not automatically retry"
   fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
   await screen.findByRole("heading", { name: "Chosen folder" });
   fireEvent.click(
-    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+    screen.getByRole("button", { name: "Add this page to your plan" }),
   );
   await screen.findByText(/entries could not be added/);
   expect(
-    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+    screen.getByRole("button", { name: "Add this page to your plan" }),
   ).toBeEnabled();
   expect(screen.getByText("Zeta")).toBeVisible();
   expect(invoke).toHaveBeenCalledTimes(3);
@@ -328,4 +331,65 @@ test("filtering does not alter selected evidence and returning falls back to the
   ).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Return to entry list" }));
   expect(screen.getByRole("searchbox")).toHaveFocus();
+});
+
+test("next page uses only the current observation ID, replaces rows, resets filter and keeps page totals explicit", async () => {
+  const next = {
+    ...sample,
+    observationId: "observation-page-2",
+    pageNumber: 2,
+    entriesSeen: "4",
+    canContinue: false,
+    enumerationComplete: true,
+    stopReason: null,
+    regularFileLogicalBytes: "9",
+    entries: [
+      {
+        ...sample.entries[0],
+        id: "page2-file",
+        name: "Later file",
+        logicalBytes: "9",
+      },
+    ],
+  };
+  vi.mocked(invoke).mockResolvedValueOnce(sample).mockResolvedValueOnce(next);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "Alpha" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Inspect Alpha" }));
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  await screen.findByText("Later file");
+  expect(invoke).toHaveBeenNthCalledWith(2, "continue_folder_inventory", {
+    request: { expectedObservationId: "observation-1" },
+  });
+  expect(screen.queryByText("Zeta")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "Entry evidence" }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByRole("searchbox")).toHaveValue("");
+  expect(screen.getByText(/Page 2 · 4 entries observed/)).toBeVisible();
+  expect(screen.getByText(/Reached the end of the directory/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "Next page" })).toBeDisabled();
+  expect(
+    screen.getByText(/Current-page regular-file logical sizes total 9 bytes/),
+  ).toBeVisible();
+});
+
+test("failed page continuation closes the UI continuation without discarding the historical page", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockRejectedValueOnce(new Error("changed directory private/path"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  await screen.findByText(/Enumeration could not continue reliably/);
+  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Next page" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Choose folder" })).toBeEnabled();
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
 });
