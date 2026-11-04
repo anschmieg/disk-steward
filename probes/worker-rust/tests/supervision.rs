@@ -350,6 +350,8 @@ fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() 
         "descriptor_handoff=true",
         "payload_validated=true",
         "payload_written=32768",
+        "parent_budget_incomplete=true",
+        "parent_worker_stopped=true",
         "fixture_objects=6",
         "fixture_snapshot=before_registry_reopen",
         "cleanup=not_authorized",
@@ -363,6 +365,13 @@ fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() 
         .parse::<u64>()
         .unwrap();
     assert!((32768..=131072).contains(&high_water));
+    let accounted = report
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("parent_payload_accounted_bytes="))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(accounted, high_water);
     let fixture_observed = report
         .split_whitespace()
         .find_map(|part| part.strip_prefix("fixture_observed_bytes="))
@@ -417,6 +426,8 @@ fn indexed_partial_payload_fails_before_readiness_and_retains_reservation() {
         "store_stopped=true",
         "partial_payload_validated=true",
         "partial_payload_written=2048",
+        "parent_budget_incomplete=true",
+        "parent_worker_stopped=true",
         "complete_payload_refused=true",
         "reconciliation_latched=true",
         "reopened_reconciliation=true",
@@ -434,6 +445,13 @@ fn indexed_partial_payload_fails_before_readiness_and_retains_reservation() {
         .parse::<u64>()
         .unwrap();
     assert!((2048..=131072).contains(&high_water));
+    let accounted = report
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("parent_payload_accounted_bytes="))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(accounted, high_water);
     assert!(!report.contains("synthetic-partial-payload-parent-only"));
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("synthetic-partial-payload-parent-only")

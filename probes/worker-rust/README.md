@@ -319,3 +319,23 @@ milestone acceptance is added.
 The report labels this as `fixture_snapshot=before_registry_reopen`. Reopening
 and later SQLite writes can change control-file allocation after the snapshot;
 the value is not a final or maximum footprint for the probe lifecycle.
+
+## Parent payload accounting after worker shutdown
+
+The complete and partial indexed payload fixtures charge the validated payload
+allocation observation into the same parent budget job that admitted the worker.
+The supervisor samples free space through the owned directory handle, records the
+payload bytes, then marks verification incomplete and acknowledges the already
+confirmed worker stop. Reports expose `parent_payload_accounted_bytes`,
+`parent_budget_incomplete=true` and `parent_worker_stopped=true`. A numeric budget
+refusal retains the charged bytes and its original failure reason. Repeating the
+settlement refuses before a second charge.
+
+This is a payload-only stopped checkpoint. Directory, journal and registry bytes
+and earlier allocation peaks are outside this parent charge; the separate
+six-object snapshot keeps its existing limits. Descriptor-only and stall modes
+have no payload observation and do not claim this settlement. Neither a complete
+synthetic payload nor a stopped child proves remote verification success. The
+budget retains usage, the registry retains its reservation and reconciliation
+blocker, and no cleanup is confirmed or authorized. Continuous parent monitoring,
+app-wide ownership and production Git verification remain separate work.

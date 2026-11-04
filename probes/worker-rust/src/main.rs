@@ -344,7 +344,6 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             .inspect_stopped_worker_partial_payload(&receipt)
             .map_err(|_| "retained partial payload validation refused".to_owned())?;
         if partial.written_bytes != store::PARTIAL_PAYLOAD_FIXTURE_BYTES
-            || partial.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
             || store.inspect_stopped_worker_payload(&receipt).is_ok()
         {
             return Err("partial payload observation or complete-payload refusal mismatch".into());
@@ -385,6 +384,32 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
                 ))
             }
             Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+        }
+        let free_after = store
+            .sample_free_space_bytes()
+            .map_err(|_| "sample stopped partial payload free space refused".to_owned())?;
+        let accounted = settle_parent_payload_budget(
+            &mut admission_budget,
+            admission.job_id,
+            partial.high_water_bytes,
+            free_after,
+        )
+        .map_err(|_| "parent partial-payload accounting refused".to_owned())?;
+        if accounted != partial.high_water_bytes
+            || partial.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
+            || admission_budget
+                .snapshot(admission.job_id)
+                .map(|job| {
+                    job.usage.stored_bytes != partial.high_water_bytes
+                        || job.state
+                            != (JobState::Failed {
+                                reason: verification_budget::BlockReason::StoreIncomplete,
+                                worker_stopped: true,
+                            })
+                })
+                .unwrap_or(true)
+        {
+            return Err("partial payload accounting or reservation mismatch".into());
         }
         let live_state = store
             .inspect_state()
@@ -431,7 +456,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             }
             Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
         }
-        println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} parent_payload_accounted_bytes={accounted} parent_budget_incomplete=true parent_worker_stopped=true complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
         return Ok(());
     }
     if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
@@ -469,12 +494,41 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         let observation = store
             .inspect_stopped_worker_payload(&receipt)
             .map_err(|_| "stopped worker payload validation refused".to_owned())?;
-        if observation.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
-            || observation.written_bytes != 32 * 1024
-        {
+        if observation.written_bytes != 32 * 1024 {
             return Err("worker payload exceeds fixed admission".into());
         }
         Some(observation)
+    } else {
+        None
+    };
+    let parent_payload_accounted_bytes = if let Some(observation) = payload_observation {
+        let free_after = store
+            .sample_free_space_bytes()
+            .map_err(|_| "sample stopped payload free space refused".to_owned())?;
+        let accounted = settle_parent_payload_budget(
+            &mut admission_budget,
+            admission.job_id,
+            observation.high_water_bytes,
+            free_after,
+        )
+        .map_err(|_| "parent payload accounting refused".to_owned())?;
+        if accounted != observation.high_water_bytes
+            || observation.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
+            || admission_budget
+                .snapshot(admission.job_id)
+                .map(|job| {
+                    job.usage.stored_bytes != observation.high_water_bytes
+                        || job.state
+                            != (JobState::Failed {
+                                reason: verification_budget::BlockReason::StoreIncomplete,
+                                worker_stopped: true,
+                            })
+                })
+                .unwrap_or(true)
+        {
+            return Err("payload accounting or reservation mismatch".into());
+        }
+        Some(accounted)
     } else {
         None
     };
@@ -538,13 +592,53 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         let high_water = observation.high_water_bytes;
         let footprint =
             fixture_footprint.ok_or("complete payload footprint observation missing")?;
-        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+        let accounted =
+            parent_payload_accounted_bytes.ok_or("parent payload accounting missing")?;
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} parent_payload_accounted_bytes={accounted} parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
     } else if descriptor_handoff {
         println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     } else {
         println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     }
     Ok(())
+}
+
+/// Charge one payload-only native high-water observation after the caller has
+/// proved exact worker stop and validated the retained payload readback. This
+/// does not account directories or registry files and grants no cleanup or
+/// completion authority.
+fn settle_parent_payload_budget(
+    budget: &mut verification_budget::BudgetController,
+    job_id: verification_budget::JobId,
+    observed_bytes: u64,
+    free_bytes_after: u64,
+) -> Result<u64, verification_budget::BudgetError> {
+    use verification_budget::{BlockReason, BudgetError, JobState};
+
+    let snapshot = budget.snapshot(job_id)?;
+    if snapshot.state != JobState::Running
+        || snapshot.usage.stored_bytes != 0
+        || observed_bytes == 0
+    {
+        return Err(BudgetError::Blocked(BlockReason::JobNotRunning));
+    }
+
+    if let Err(source) = budget.record_store(job_id, observed_bytes, free_bytes_after) {
+        if matches!(
+            budget.snapshot(job_id).map(|job| job.state),
+            Ok(JobState::Failed {
+                worker_stopped: false,
+                ..
+            })
+        ) {
+            budget.acknowledge_worker_stopped(job_id)?;
+        }
+        return Err(source);
+    }
+
+    budget.fail(job_id, BlockReason::StoreIncomplete)?;
+    budget.acknowledge_worker_stopped(job_id)?;
+    Ok(observed_bytes)
 }
 
 fn run_store_worker() -> Result<(), String> {
@@ -1302,6 +1396,127 @@ mod store_worker_tests {
         second
             .record_stopped(&StopReceipt::confirmed(second.token(), 41))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parent_payload_settlement_tests {
+    use super::settle_parent_payload_budget;
+    use verification_budget::{
+        BlockReason, BudgetController, BudgetError, JobState, Limits, MINIMUM_FREE_RESERVE,
+        PER_REPOSITORY_TEMP_LIMIT,
+    };
+
+    fn controller() -> BudgetController {
+        BudgetController::new(Limits { headroom_bytes: 0 })
+    }
+
+    #[test]
+    fn successful_charge_preserves_ingress_then_marks_incomplete_and_stopped_once() {
+        let mut budget = controller();
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            settle_parent_payload_budget(&mut budget, job, 0, MINIMUM_FREE_RESERVE + 8192,),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(budget.snapshot(job).unwrap().usage.stored_bytes, 0);
+        budget.record_ingress(job, 29).unwrap();
+        assert_eq!(
+            settle_parent_payload_budget(&mut budget, job, 4096, MINIMUM_FREE_RESERVE + 8192,),
+            Ok(4096)
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.ingress_bytes, 29);
+        assert_eq!(snapshot.usage.stored_bytes, 4096);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::StoreIncomplete,
+                worker_stopped: true,
+            }
+        );
+        assert_eq!(
+            settle_parent_payload_budget(&mut budget, job, 4096, MINIMUM_FREE_RESERVE + 8192,),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(budget.snapshot(job).unwrap().usage.stored_bytes, 4096);
+        assert_eq!(budget.aggregate_stored(), Ok(4096));
+        let next = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_ne!(next, job);
+        assert_eq!(budget.aggregate_stored(), Ok(4096));
+        assert_eq!(budget.retained_job_count(), 2);
+    }
+
+    #[test]
+    fn free_space_refusal_keeps_observed_charge_and_original_reason_after_stop() {
+        let mut budget = controller();
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            settle_parent_payload_budget(&mut budget, job, 2048, MINIMUM_FREE_RESERVE - 1),
+            Err(BudgetError::Blocked(BlockReason::FreeSpaceReserve))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, 2048);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::FreeSpaceReserve,
+                worker_stopped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn numeric_storage_overshoot_is_retained_without_large_allocation() {
+        let mut budget = controller();
+        let job = budget
+            .start(MINIMUM_FREE_RESERVE + PER_REPOSITORY_TEMP_LIMIT + 1)
+            .unwrap();
+        let observed = PER_REPOSITORY_TEMP_LIMIT + 1;
+        assert_eq!(
+            settle_parent_payload_budget(
+                &mut budget,
+                job,
+                observed,
+                MINIMUM_FREE_RESERVE + PER_REPOSITORY_TEMP_LIMIT + 1,
+            ),
+            Err(BudgetError::Blocked(BlockReason::RepositoryStorageLimit))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, observed);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::RepositoryStorageLimit,
+                worker_stopped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_or_already_charged_running_jobs_refuse_before_second_charge() {
+        let mut budget = controller();
+        assert_eq!(
+            settle_parent_payload_budget(
+                &mut budget,
+                verification_budget::JobId(99),
+                1024,
+                MINIMUM_FREE_RESERVE + 8192,
+            ),
+            Err(BudgetError::UnknownJob(verification_budget::JobId(99)))
+        );
+
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        budget
+            .record_store(job, 17, MINIMUM_FREE_RESERVE + 8192)
+            .unwrap();
+        assert_eq!(
+            settle_parent_payload_budget(&mut budget, job, 1024, MINIMUM_FREE_RESERVE + 8192,),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, 17);
+        assert_eq!(snapshot.state, JobState::Running);
     }
 }
 
