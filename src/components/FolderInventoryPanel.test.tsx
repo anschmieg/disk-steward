@@ -1147,3 +1147,91 @@ test("subtree coverage exposes distinct boundary reasons without implying comple
   expect(screen.getByText("Incomplete subtree coverage.")).toBeInTheDocument();
   expect(screen.getByRole("table").textContent).toBe(page);
 });
+
+test("name categories filter the linked list while preserving exact totals, evidence selection and whole-page import", async () => {
+  const categorized: FolderInventory = {
+    ...sample,
+    entries: sample.entries.map((entry) => ({
+      ...entry,
+      nameCategory:
+        entry.id === "1" ? "image" : entry.id === "2" ? "archive" : "folder",
+    })),
+    nameCategories: [
+      {
+        category: "image",
+        entryCount: 1,
+        knownLogicalBytes: "7",
+        unknownLogicalSizeCount: 0,
+      },
+      {
+        category: "archive",
+        entryCount: 1,
+        knownLogicalBytes: "9007199254740993",
+        unknownLogicalSizeCount: 0,
+      },
+      {
+        category: "folder",
+        entryCount: 1,
+        knownLogicalBytes: "0",
+        unknownLogicalSizeCount: 1,
+      },
+    ],
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(categorized)
+    .mockRejectedValueOnce(new Error("fixture refusal"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(screen.getByRole("button", { name: "Inspect Zeta" }));
+  const categories = screen.getByRole("region", {
+    name: "Current-page name categories",
+  });
+  const baseline = categories.textContent;
+  fireEvent.click(
+    within(categories).getByRole("button", { name: "Image extensions" }),
+  );
+  const table = screen.getByRole("table");
+  expect(table).toHaveTextContent("Alpha");
+  expect(table).not.toHaveTextContent("Zeta");
+  expect(
+    within(screen.getByRole("region", { name: "Entry evidence" })).getByRole(
+      "heading",
+      { name: "Zeta" },
+    ),
+  ).toBeInTheDocument();
+  expect(categories).toHaveTextContent("9007199254740993 known logical bytes");
+  expect(categories).toHaveTextContent("1 entries with unknown logical size");
+  expect(categories).toHaveTextContent(
+    "Page import still includes the whole page",
+  );
+  expect(categories).toHaveTextContent("not content inspection");
+  fireEvent.change(screen.getByRole("combobox"), { target: { value: "name" } });
+  expect(categories.textContent).toContain(baseline!);
+  fireEvent.change(
+    screen.getByRole("searchbox", { name: "Filter observed names" }),
+    { target: { value: "Zeta" } },
+  );
+  expect(
+    screen.getByText("No observed names match this filter."),
+  ).toBeInTheDocument();
+  fireEvent.change(
+    screen.getByRole("searchbox", { name: "Filter observed names" }),
+    { target: { value: "" } },
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  );
+  await screen.findByText(/could not be refreshed reliably/);
+  expect(
+    within(categories).getByRole("button", { name: "Image extensions" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(table).not.toHaveTextContent("Zeta");
+  fireEvent.click(
+    within(categories).getByRole("button", {
+      name: "Show all name categories",
+    }),
+  );
+  expect(table).toHaveTextContent("Zeta");
+  expect(table).toHaveTextContent("Nested");
+});

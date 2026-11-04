@@ -3,8 +3,38 @@ import "./FolderInventoryPanel.css";
 import { useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+type NameCategory =
+  | "image"
+  | "document"
+  | "archive"
+  | "media"
+  | "code"
+  | "otherFile"
+  | "folder"
+  | "link"
+  | "other"
+  | "unreadable";
+const nameCategoryLabels: Record<NameCategory, string> = {
+  image: "Image extensions",
+  document: "Document extensions",
+  archive: "Archive extensions",
+  media: "Media extensions",
+  code: "Code and data extensions",
+  otherFile: "Other file names",
+  folder: "Folders",
+  link: "Symbolic links",
+  other: "Other entry kinds",
+  unreadable: "Unreadable entries",
+};
+
 export type FolderInventory = {
   rootLabel: string;
+  nameCategories?: Array<{
+    category: NameCategory;
+    entryCount: number;
+    knownLogicalBytes: string;
+    unknownLogicalSizeCount: number;
+  }>;
   pageNumber: number;
   entriesSeen: string;
   canContinue: boolean;
@@ -16,6 +46,7 @@ export type FolderInventory = {
     id: string;
     name: string;
     kind: string;
+    nameCategory?: NameCategory;
     availability: "dataless" | "unknown";
     navigationBlocker: string | null;
     logicalBytes: string | null;
@@ -113,6 +144,7 @@ export default function FolderInventoryPanel({
   const [message, setMessage] = useState("");
   const [imported, setImported] = useState(false);
   const [query, setQuery] = useState("");
+  const [nameCategory, setNameCategory] = useState<NameCategory | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [sort, setSort] = useState<"name" | "size" | "allocated">("size");
   useEffect(() => {
@@ -168,6 +200,7 @@ export default function FolderInventoryPanel({
         setImported(false);
         setSnapshot(next);
         setQuery("");
+        setNameCategory(null);
         if (refreshing)
           setMessage(
             "Folder refreshed. Paging restarted at the first page; saved plan and review metadata are unchanged.",
@@ -261,6 +294,7 @@ export default function FolderInventoryPanel({
             setImported(false);
             setSnapshot(next);
             setQuery("");
+            setNameCategory(null);
             setMessage(
               "Resumed at the page after the saved checkpoint. Save again to advance the checkpoint; saved plan decisions are unchanged.",
             );
@@ -331,6 +365,7 @@ export default function FolderInventoryPanel({
       setSelectedId(null);
       setImported(false);
       setQuery("");
+      setNameCategory(null);
       setMessage(
         "Folder scope cleared. Retained directory handles and enumeration state were released. Saved plan and review metadata remain.",
       );
@@ -484,8 +519,10 @@ export default function FolderInventoryPanel({
   const selected = snapshot?.entries.find((entry) => entry.id === selectedId);
   const total = BigInt(snapshot?.regularFileLogicalBytes ?? "0");
   const entries = [...(snapshot?.entries ?? [])]
-    .filter((entry) =>
-      entry.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
+    .filter(
+      (entry) =>
+        entry.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()) &&
+        (nameCategory === null || entry.nameCategory === nameCategory),
     )
     .sort((a, b) => {
       if (sort !== "name") {
@@ -840,6 +877,55 @@ export default function FolderInventoryPanel({
             name. This is neither occupied disk space nor recoverable space;
             nested contents and shared allocation are unknown.
           </p>
+          {snapshot.nameCategories && snapshot.nameCategories.length > 0 && (
+            <section aria-label="Current-page name categories">
+              <h4>Current-page name categories</h4>
+              <p>
+                File categories use name extensions, not content inspection.
+                Counts and known logical bytes include the whole current page
+                and stay fixed while filtering or sorting. Hard links count per
+                name; unknown sizes are listed separately. Categories do not
+                establish occupied space, savings or safe removal.
+              </p>
+              <button
+                className="button secondary"
+                disabled={busy}
+                aria-pressed={nameCategory === null}
+                onClick={() => setNameCategory(null)}
+              >
+                Show all name categories
+              </button>
+              <dl>
+                {snapshot.nameCategories.map((group) => (
+                  <div key={group.category}>
+                    <dt>
+                      <button
+                        className="button secondary"
+                        disabled={busy}
+                        aria-pressed={nameCategory === group.category}
+                        onClick={() => setNameCategory(group.category)}
+                      >
+                        {nameCategoryLabels[group.category]}
+                      </button>
+                    </dt>
+                    <dd>
+                      {group.entryCount} entries · {group.knownLogicalBytes}{" "}
+                      known logical bytes · {group.unknownLogicalSizeCount}{" "}
+                      entries with unknown logical size
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+              {nameCategory !== null && (
+                <p role="status">
+                  List filtered to {nameCategoryLabels[nameCategory]}. Text
+                  search also applies. Page import still includes the whole
+                  page; category filtering does not change your plan or evidence
+                  selection.
+                </p>
+              )}
+            </section>
+          )}
           <div className="panel-actions">
             <button
               className="button secondary"
@@ -1044,7 +1130,7 @@ export default function FolderInventoryPanel({
               </p>
             </section>
           )}
-          {entries.length === 0 && query && (
+          {entries.length === 0 && (query || nameCategory) && (
             <p>No observed names match this filter.</p>
           )}
           {snapshot.entries.length === 0 && (

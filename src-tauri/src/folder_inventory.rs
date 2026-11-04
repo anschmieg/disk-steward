@@ -83,12 +83,131 @@ where
     u64::try_from(blocks).ok()?.checked_mul(512)
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NameCategory {
+    Image,
+    Document,
+    Archive,
+    Media,
+    Code,
+    OtherFile,
+    Folder,
+    Link,
+    Other,
+    Unreadable,
+}
+
+#[cfg(unix)]
+impl NameCategory {
+    const ORDERED: [Self; 10] = [
+        Self::Image,
+        Self::Document,
+        Self::Archive,
+        Self::Media,
+        Self::Code,
+        Self::OtherFile,
+        Self::Folder,
+        Self::Link,
+        Self::Other,
+        Self::Unreadable,
+    ];
+}
+
+#[cfg(unix)]
+fn name_category_for_native_entry(name: &[u8], kind: rustix::fs::FileType) -> NameCategory {
+    use rustix::fs::FileType;
+
+    match kind {
+        FileType::RegularFile => {
+            let Some(dot) = name.iter().rposition(|byte| *byte == b'.') else {
+                return NameCategory::OtherFile;
+            };
+            let extension = &name[dot + 1..];
+            if extension.is_empty() {
+                return NameCategory::OtherFile;
+            }
+            let matches = |extensions: &[&[u8]]| {
+                extensions
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            };
+            if matches(&[b"png", b"jpg", b"jpeg", b"gif", b"webp", b"heic", b"svg"]) {
+                NameCategory::Image
+            } else if matches(&[b"pdf", b"doc", b"docx", b"odt", b"rtf", b"txt", b"md"]) {
+                NameCategory::Document
+            } else if matches(&[b"zip", b"tar", b"gz", b"bz2", b"xz", b"7z", b"rar"]) {
+                NameCategory::Archive
+            } else if matches(&[b"mp3", b"wav", b"flac", b"mp4", b"mov", b"mkv"]) {
+                NameCategory::Media
+            } else if matches(&[
+                b"rs", b"ts", b"tsx", b"js", b"jsx", b"py", b"go", b"c", b"cpp", b"h", b"java",
+                b"json", b"toml", b"yaml", b"yml",
+            ]) {
+                NameCategory::Code
+            } else {
+                NameCategory::OtherFile
+            }
+        }
+        FileType::Directory => NameCategory::Folder,
+        FileType::Symlink => NameCategory::Link,
+        _ => NameCategory::Other,
+    }
+}
+
+#[cfg(unix)]
+fn aggregate_name_categories(
+    entries: &[FolderInventoryEntry],
+) -> Result<Vec<NameCategoryAggregate>, &'static str> {
+    let mut counts = [0u32; 10];
+    let mut known_bytes = [0u64; 10];
+    let mut unknown_sizes = [0u32; 10];
+    for entry in entries {
+        let index = NameCategory::ORDERED
+            .iter()
+            .position(|category| *category == entry.name_category)
+            .ok_or("An inventory entry category is unavailable.")?;
+        counts[index] = counts[index].saturating_add(1);
+        if let Some(bytes) = entry.logical_bytes.as_deref() {
+            let bytes = bytes
+                .parse::<u64>()
+                .map_err(|_| "An inventory entry size is unavailable.")?;
+            known_bytes[index] = known_bytes[index]
+                .checked_add(bytes)
+                .ok_or("Logical sizes exceeded the supported range.")?;
+        } else {
+            unknown_sizes[index] = unknown_sizes[index].saturating_add(1);
+        }
+    }
+    Ok(NameCategory::ORDERED
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| counts[*index] > 0)
+        .map(|(index, category)| NameCategoryAggregate {
+            category: *category,
+            entry_count: counts[index],
+            known_logical_bytes: known_bytes[index].to_string(),
+            unknown_logical_size_count: unknown_sizes[index],
+        })
+        .collect())
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NameCategoryAggregate {
+    pub category: NameCategory,
+    pub entry_count: u32,
+    pub known_logical_bytes: String,
+    pub unknown_logical_size_count: u32,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderInventoryEntry {
     pub id: InventoryItemId,
     pub name: String,
     pub kind: &'static str,
+    pub name_category: NameCategory,
     pub logical_bytes: Option<String>,
     pub allocated_bytes: Option<String>,
     pub link_count: Option<String>,
@@ -105,6 +224,7 @@ pub struct FolderInventorySnapshot {
     pub root_label: String,
     pub breadcrumbs: Vec<String>,
     pub entries: Vec<FolderInventoryEntry>,
+    pub name_categories: Vec<NameCategoryAggregate>,
     pub enumeration_complete: bool,
     pub unreadable_count: u32,
     pub stop_reason: Option<&'static str>,
@@ -128,6 +248,7 @@ fn empty_snapshot(
         root_label,
         breadcrumbs,
         entries: Vec::new(),
+        name_categories: Vec::new(),
         enumeration_complete: false,
         unreadable_count: 0,
         stop_reason: None,
@@ -819,6 +940,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
                     id,
                     name: label,
                     kind: "unreadable",
+                    name_category: NameCategory::Unreadable,
                     logical_bytes: None,
                     allocated_bytes: None,
                     link_count: None,
@@ -834,6 +956,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             }
         };
         let file_type = FileType::from_raw_mode(metadata.st_mode);
+        let name_category = name_category_for_native_entry(raw_name, file_type);
         let entry_identity = identity(&metadata);
         let (kind, entry_logical_bytes) = if entry_identity.device != root_device {
             if file_type == FileType::Directory {
@@ -881,6 +1004,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             id,
             name: label,
             kind,
+            name_category,
             logical_bytes: entry_logical_bytes.map(|size| size.to_string()),
             allocated_bytes,
             link_count,
@@ -910,6 +1034,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
 
     snapshot.regular_file_logical_bytes = logical_bytes.to_string();
     snapshot.entries_seen = entries_seen.to_string();
+    snapshot.name_categories = aggregate_name_categories(&snapshot.entries)?;
     if started.elapsed() >= duration {
         snapshot.enumeration_complete = false;
         snapshot.stop_reason.get_or_insert("time_limit");
@@ -1831,6 +1956,132 @@ mod tests {
             .unwrap();
         assert!(escaped.name.contains("\\u{000A}"));
         assert!(escaped.name.contains("\\u{202E}"));
+    }
+
+    #[test]
+    fn name_categories_use_native_kinds_and_current_page_name_totals() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(".hidden.JPG"), b"img").unwrap();
+        fs::write(root.path().join("REPORT.PDF"), b"docs").unwrap();
+        fs::write(root.path().join("bundle.TAR"), b"arch!").unwrap();
+        fs::write(root.path().join("song.MP3"), b"media").unwrap();
+        fs::write(root.path().join("main.RS"), b"source").unwrap();
+        fs::write(root.path().join("README"), b"plain").unwrap();
+        fs::write(root.path().join("data.unknown"), b"other").unwrap();
+        // Raw-byte coverage does not claim that APFS accepts these names.
+        assert_eq!(
+            name_category_for_native_entry(b"strange.\xff", rustix::fs::FileType::RegularFile),
+            NameCategory::OtherFile
+        );
+        assert_eq!(
+            name_category_for_native_entry(b"strange\xff.JPG", rustix::fs::FileType::RegularFile),
+            NameCategory::Image
+        );
+        fs::create_dir(root.path().join("folder.jpg")).unwrap();
+        symlink_for_test(
+            &root.path().join("REPORT.PDF"),
+            &root.path().join("link.txt"),
+        );
+        let _socket = UnixListener::bind(root.path().join("socket.png")).unwrap();
+
+        let snapshot = scan_selected_folder(root.path()).unwrap();
+        assert_eq!(snapshot.entries.len(), 10);
+        let category = |name| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .name_category
+        };
+        assert_eq!(category(".hidden.JPG"), NameCategory::Image);
+        assert_eq!(category("REPORT.PDF"), NameCategory::Document);
+        assert_eq!(category("bundle.TAR"), NameCategory::Archive);
+        assert_eq!(category("song.MP3"), NameCategory::Media);
+        assert_eq!(category("main.RS"), NameCategory::Code);
+        assert_eq!(category("README"), NameCategory::OtherFile);
+        assert_eq!(category("folder.jpg"), NameCategory::Folder);
+        assert_eq!(category("link.txt"), NameCategory::Link);
+        assert_eq!(category("socket.png"), NameCategory::Other);
+        let categories = &snapshot.name_categories;
+        assert_eq!(
+            categories
+                .iter()
+                .map(|aggregate| aggregate.category)
+                .collect::<Vec<_>>(),
+            vec![
+                NameCategory::Image,
+                NameCategory::Document,
+                NameCategory::Archive,
+                NameCategory::Media,
+                NameCategory::Code,
+                NameCategory::OtherFile,
+                NameCategory::Folder,
+                NameCategory::Link,
+                NameCategory::Other,
+            ]
+        );
+        let aggregate_for = |category| {
+            categories
+                .iter()
+                .find(|aggregate| aggregate.category == category)
+                .unwrap()
+        };
+        assert_eq!(aggregate_for(NameCategory::Image).entry_count, 1);
+        assert_eq!(aggregate_for(NameCategory::Image).known_logical_bytes, "3");
+        assert_eq!(
+            aggregate_for(NameCategory::Document).known_logical_bytes,
+            "4"
+        );
+        assert_eq!(
+            aggregate_for(NameCategory::Archive).known_logical_bytes,
+            "5"
+        );
+        assert_eq!(aggregate_for(NameCategory::Media).known_logical_bytes, "5");
+        assert_eq!(aggregate_for(NameCategory::Code).known_logical_bytes, "6");
+        assert_eq!(aggregate_for(NameCategory::OtherFile).entry_count, 2);
+        assert_eq!(aggregate_for(NameCategory::Folder).known_logical_bytes, "0");
+        assert_eq!(
+            aggregate_for(NameCategory::Folder).unknown_logical_size_count,
+            1
+        );
+        assert_eq!(
+            aggregate_for(NameCategory::Link).unknown_logical_size_count,
+            1
+        );
+        assert_eq!(
+            aggregate_for(NameCategory::Other).unknown_logical_size_count,
+            1
+        );
+        assert_eq!(
+            categories
+                .iter()
+                .map(|aggregate| aggregate.entry_count)
+                .sum::<u32>(),
+            snapshot.entries.len() as u32
+        );
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["entries"][0]["nameCategory"].is_string());
+        assert_eq!(json["nameCategories"][0]["category"], "image");
+    }
+
+    #[test]
+    fn category_totals_preserve_per_name_hardlinks_and_reject_overflow() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("one.JPG"), b"abc").unwrap();
+        fs::hard_link(root.path().join("one.JPG"), root.path().join("two.png")).unwrap();
+        let mut snapshot = scan_selected_folder(root.path()).unwrap();
+        assert_eq!(snapshot.name_categories.len(), 1);
+        assert_eq!(snapshot.name_categories[0].entry_count, 2);
+        assert_eq!(snapshot.name_categories[0].known_logical_bytes, "6");
+        snapshot.entries[0].logical_bytes = Some(u64::MAX.to_string());
+        assert!(aggregate_name_categories(&snapshot.entries).is_err());
+        snapshot.entries[0].logical_bytes = None;
+        let totals = aggregate_name_categories(&snapshot.entries).unwrap();
+        assert_eq!(totals[0].known_logical_bytes, "3");
+        assert_eq!(totals[0].unknown_logical_size_count, 1);
     }
 
     #[test]
