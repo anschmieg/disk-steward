@@ -27,6 +27,7 @@
   gap: 5px;
 }
 .review-pilot-panel input,
+.review-pilot-panel select,
 .review-pilot-panel textarea {
   border: 1px solid #cbd7cd;
   border-radius: 5px;
