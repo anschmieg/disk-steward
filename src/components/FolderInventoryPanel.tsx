@@ -1,3 +1,7 @@
+import {
+  formatObservationTime,
+  observationClockReversed,
+} from "../observation-window";
 import type { EditorSnapshot } from "../general-plan-contract";
 import "./FolderInventoryPanel.css";
 import { useEffect, useId, useRef, useState } from "react";
@@ -28,6 +32,11 @@ const nameCategoryLabels: Record<NameCategory, string> = {
 };
 
 export type FolderInventory = {
+  observationWindow?: {
+    startedUnixMs: string | null;
+    finishedUnixMs: string | null;
+    elapsedMillis: string;
+  };
   rootLabel: string;
   nameCategories?: Array<{
     category: NameCategory;
@@ -851,6 +860,44 @@ export default function FolderInventoryPanel({
           <h3 ref={headingRef} tabIndex={-1}>
             {snapshot.rootLabel}
           </h3>
+          <section aria-label="Observation timing">
+            <h4>Observation timing</h4>
+            <dl>
+              <dt>Scan started (UTC)</dt>
+              <dd>
+                {formatObservationTime(
+                  snapshot.observationWindow?.startedUnixMs,
+                ) ?? "Unavailable"}
+              </dd>
+              <dt>Scan finished (UTC)</dt>
+              <dd>
+                {formatObservationTime(
+                  snapshot.observationWindow?.finishedUnixMs,
+                ) ?? "Unavailable"}
+              </dd>
+              <dt>Measured page duration</dt>
+              <dd>
+                {snapshot.observationWindow
+                  ? `${snapshot.observationWindow.elapsedMillis} milliseconds`
+                  : "Unavailable"}
+              </dd>
+            </dl>
+            <p>
+              Times use this device’s clock and describe this page only. Clock
+              settings can change; timestamps do not guarantee that evidence is
+              current. Files may change after observation. These times stay
+              fixed while reviewing and accompany imported metadata.
+            </p>
+            {observationClockReversed(
+              snapshot.observationWindow?.startedUnixMs,
+              snapshot.observationWindow?.finishedUnixMs,
+            ) && (
+              <p>
+                The device clock moved backward during observation. Use the
+                measured duration; the recorded clock window is uncertain.
+              </p>
+            )}
+          </section>
           <button
             className="button secondary"
             onClick={() => void inspect(null)}
