@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 mod store;
 
-/// Shutdown evidence can only be issued by this supervisor after wait and
-/// reader join have both completed successfully.
+/// Shutdown evidence can only be issued after process exit and reader
+/// completion have both been confirmed by bounded polling and the reader
+/// has joined successfully.
 pub(crate) struct StopReceipt {
     token: String,
     pid: u32,
@@ -30,6 +31,8 @@ impl StopReceipt {
 
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 const OUTER_DEADLINE: Duration = Duration::from_secs(1);
+const READER_UNCONFIRMED: &str =
+    "stdout reader completion or join unconfirmed; reader handle may be detached";
 const FLOOD_BYTES: usize = 1024 * 1024;
 const CHILD_HOLD: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 8192;
@@ -341,13 +344,13 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
                 Err(error) => return finish_after_error(child, reader, rx, error),
             };
             if let Err(error) = stop_and_reap(&mut child) {
-                let _ = reader.join();
+                let reader_done = bounded_reader_join(reader);
                 return Err(format!(
-                    "partial payload child shutdown unconfirmed: {error}"
+                    "partial payload child shutdown unconfirmed: {error}; reader completion confirmed={reader_done} (false means its handle may be detached)"
                 ));
             }
-            if reader.join().is_err() {
-                return Err("partial payload reader join failed; stop receipt withheld".into());
+            if !bounded_reader_join(reader) {
+                return Err(format!("{READER_UNCONFIRMED}; stop receipt withheld"));
             }
             if status.code() != Some(86) {
                 return Err(
@@ -499,11 +502,11 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             return finish_after_error(child, reader, rx, format!("activate store: {e}"));
         }
         if let Err(e) = stop_and_reap(&mut child) {
-            let _ = reader.join();
-            return Err(format!("child shutdown unconfirmed: {e}"));
+            let reader_done = bounded_reader_join(reader);
+            return Err(format!("child shutdown unconfirmed: {e}; reader completion confirmed={reader_done} (false means its handle may be detached)"));
         }
-        if reader.join().is_err() {
-            return Err("reader join failed; stop receipt withheld".into());
+        if !bounded_reader_join(reader) {
+            return Err(format!("{READER_UNCONFIRMED}; stop receipt withheld"));
         }
         let status = child
             .try_wait()
@@ -1112,12 +1115,12 @@ fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
         return finish_after_error(child, reader, receiver, error);
     }
     if let Err(error) = stop_and_reap(&mut child) {
-        let _ = reader.join();
-        return Err(format!("child shutdown unconfirmed: {error}"));
+        let reader_done = bounded_reader_join(reader);
+        return Err(format!("child shutdown unconfirmed: {error}; reader completion confirmed={reader_done} (false means its handle may be detached)"));
     }
-    let joined = reader.join().is_ok();
+    let joined = bounded_reader_join(reader);
     if !joined {
-        return Err("stdout reader thread panicked; shutdown receipt withheld".into());
+        return Err(format!("{READER_UNCONFIRMED}; shutdown receipt withheld"));
     }
     let status = child
         .try_wait()
@@ -1270,10 +1273,10 @@ fn run_store_reinspect() -> Result<(), String> {
     let record = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let capture_expired = Instant::now() >= deadline;
     let stopped = stop_and_reap(&mut child);
-    let joined = reader.join().is_ok();
+    let joined = bounded_reader_join(reader);
     if stopped.is_err() || !joined {
         return Err(format!(
-            "creator shutdown unconfirmed: {stopped:?}; reader_joined={joined}"
+            "creator shutdown unconfirmed: {stopped:?}; reader_joined={joined} (false means completion/join unconfirmed and handle may be detached)"
         ));
     }
     let waited = child
@@ -1406,9 +1409,12 @@ fn supervise(case: Case) -> Result<Report, String> {
     if let Err(error) = stop_and_reap(&mut child) {
         cleanup_error = Some(error);
     }
-    let reader_joined = reader.join().is_ok();
+    let reader_joined = bounded_reader_join(reader);
     if !reader_joined {
-        cleanup_error = Some("stdout reader thread panicked".to_string());
+        cleanup_error = Some(match cleanup_error {
+            Some(error) => format!("{error}; {READER_UNCONFIRMED}"),
+            None => READER_UNCONFIRMED.to_owned(),
+        });
     }
     if let Some(error) = cleanup_error {
         return Err(format!("{error}; child cleanup was not fully confirmed"));
@@ -1558,22 +1564,84 @@ fn drain_reader_result(receiver: &Receiver<ReaderEvent>) -> Result<(u64, bool), 
 }
 
 fn stop_and_reap(child: &mut Child) -> Result<(), String> {
-    // A status-query failure must not bypass the stop/reap attempt. A kill
-    // error may merely race natural exit; wait is the authority for reaping.
-    let kill_error = if matches!(child.try_wait(), Ok(Some(_))) {
-        None
-    } else {
-        child.kill().err()
+    stop_policy(
+        child,
+        |child| {
+            child
+                .try_wait()
+                .map(|status| status.is_some())
+                .map_err(|error| format!("query child status: {error}"))
+        },
+        |child| {
+            child
+                .kill()
+                .map_err(|error| format!("kill fixed child: {error}"))
+        },
+        |child, deadline| {
+            wait_for_child_exit(child, deadline)
+                .map(|_| ())
+                .map_err(|error| format!("confirm fixed child exit: {error}"))
+        },
+    )
+}
+
+fn stop_policy<T, Q, K, C>(target: &mut T, query: Q, kill: K, confirm: C) -> Result<(), String>
+where
+    Q: FnOnce(&mut T) -> Result<bool, String>,
+    K: FnOnce(&mut T) -> Result<(), String>,
+    C: FnOnce(&mut T, Instant) -> Result<(), String>,
+{
+    let query_error = match query(target) {
+        Ok(true) => return Ok(()),
+        Ok(false) => None,
+        Err(error) => Some(error),
     };
-    child
-        .wait()
-        .map(|_| ())
-        .map_err(|wait_error| match kill_error {
-            Some(kill_error) => {
-                format!("kill fixed child: {kill_error}; wait for fixed child: {wait_error}")
+
+    // Always attempt the fixed-target kill after a running or uncertain query.
+    // A kill failure can race natural exit, so confirmation remains authoritative.
+    let kill_error = kill(target).err();
+    let deadline = Instant::now() + OUTER_DEADLINE;
+    match confirm(target, deadline) {
+        Ok(()) => Ok(()),
+        Err(confirm_error) => {
+            let mut diagnostics = Vec::new();
+            if let Some(error) = query_error {
+                diagnostics.push(error);
             }
-            None => format!("wait for fixed child: {wait_error}"),
-        })
+            match kill_error {
+                Some(error) => diagnostics.push(error),
+                None => diagnostics.push("kill fixed child succeeded".to_owned()),
+            }
+            diagnostics.push(confirm_error);
+            Err(diagnostics.join("; "))
+        }
+    }
+}
+
+fn bounded_reader_join(reader: JoinHandle<()>) -> bool {
+    const MAX_POLLS: usize = 512;
+    bounded_reader_join_until(reader, Instant::now() + OUTER_DEADLINE, MAX_POLLS)
+}
+
+fn bounded_reader_join_until(reader: JoinHandle<()>, deadline: Instant, max_polls: usize) -> bool {
+    const POLL_INTERVAL: Duration = Duration::from_millis(2);
+    for _ in 0..max_polls {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if reader.is_finished() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            return reader.join().is_ok();
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(POLL_INTERVAL));
+    }
+    false
 }
 
 fn wait_for_child_exit(child: &mut Child, deadline: Instant) -> Result<ExitStatus, String> {
@@ -1609,13 +1677,13 @@ fn finish_after_error<T>(
 ) -> Result<T, String> {
     let cleanup = stop_and_reap(&mut child);
     let _ = receiver.try_iter().count();
-    let joined = reader.join().is_ok();
+    let joined = bounded_reader_join(reader);
     match (cleanup, joined) {
         (Ok(()), true) => Err(error),
         (Err(cleanup_error), true) => Err(format!("{error}; cleanup failed: {cleanup_error}")),
-        (Ok(()), false) => Err(format!("{error}; stdout reader thread panicked")),
+        (Ok(()), false) => Err(format!("{error}; reader completion/join unconfirmed (reader handle may be detached); stop receipt withheld")),
         (Err(cleanup_error), false) => Err(format!(
-            "{error}; cleanup failed: {cleanup_error}; stdout reader thread panicked"
+            "{error}; cleanup failed: {cleanup_error}; reader completion/join unconfirmed (reader handle may be detached); stop receipt withheld"
         )),
     }
 }
@@ -2156,5 +2224,194 @@ mod abandon_record_tests {
             );
         }
         assert!(parse_abandoned_record(&vec![b'a'; 1025]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod bounded_shutdown_tests {
+    use super::{bounded_reader_join, bounded_reader_join_until};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn completed_reader_and_panicked_reader_have_distinct_join_results() {
+        assert!(bounded_reader_join(thread::spawn(|| {})));
+        assert!(!bounded_reader_join(thread::spawn(|| panic!(
+            "synthetic reader failure"
+        ))));
+    }
+
+    #[test]
+    fn expired_deadline_and_zero_poll_budget_withhold_join_confirmation() {
+        for max_polls in [0, 512] {
+            let reader = thread::spawn(|| {});
+            let completion_deadline = Instant::now() + Duration::from_secs(1);
+            while !reader.is_finished() && Instant::now() < completion_deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(reader.is_finished(), "test reader did not finish");
+            let deadline = if max_polls == 0 {
+                Instant::now() + Duration::from_secs(1)
+            } else {
+                Instant::now()
+            };
+            // Even a known-finished thread cannot bypass the stage deadline
+            // or poll budget to produce shutdown evidence.
+            assert!(!bounded_reader_join_until(reader, deadline, max_polls));
+        }
+    }
+
+    #[test]
+    fn timed_out_reader_is_detached_but_released_and_observed_finished() {
+        let (release, wait) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread_finished = Arc::clone(&finished);
+        let reader = thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+            thread_finished.store(true, Ordering::Release);
+        });
+        let joined = bounded_reader_join(reader);
+        release.send(()).expect("release controlled test reader");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            finished.load(Ordering::Acquire),
+            "test reader did not finish"
+        );
+        assert!(!joined, "blocked reader unexpectedly joined before release");
+    }
+}
+
+#[cfg(test)]
+mod stop_policy_tests {
+    use super::{stop_policy, OUTER_DEADLINE};
+    use std::time::Instant;
+
+    #[test]
+    fn confirmed_reaped_child_skips_kill_and_confirmation() {
+        let mut calls = Vec::new();
+        let result = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Ok(true)
+            },
+            |calls| {
+                calls.push("kill");
+                Err("unexpected kill".into())
+            },
+            |calls, _| {
+                calls.push("confirm");
+                Err("unexpected confirm".into())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, ["query"]);
+    }
+
+    #[test]
+    fn query_failure_still_attempts_kill_and_bounded_confirmation() {
+        let mut calls = Vec::new();
+        let started = Instant::now();
+        let result = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Err("query failed".into())
+            },
+            |calls| {
+                calls.push("kill");
+                Ok(())
+            },
+            |calls, deadline| {
+                calls.push("confirm");
+                assert!(deadline >= started + OUTER_DEADLINE);
+                assert!(deadline <= Instant::now() + OUTER_DEADLINE);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, ["query", "kill", "confirm"]);
+    }
+
+    #[test]
+    fn kill_error_racing_natural_exit_succeeds_only_after_confirmation() {
+        let mut calls = Vec::new();
+        let result = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Ok(false)
+            },
+            |calls| {
+                calls.push("kill");
+                Err("already exited".into())
+            },
+            |calls, _| {
+                calls.push("confirm");
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, ["query", "kill", "confirm"]);
+    }
+
+    #[test]
+    fn query_kill_and_confirmation_failures_retain_every_diagnostic() {
+        let mut calls = Vec::new();
+        let error = stop_policy(
+            &mut calls,
+            |calls| {
+                calls.push("query");
+                Err("query failed".into())
+            },
+            |calls| {
+                calls.push("kill");
+                Err("kill failed".into())
+            },
+            |calls, _| {
+                calls.push("confirm");
+                Err("exit unconfirmed".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, ["query", "kill", "confirm"]);
+        for diagnostic in ["query failed", "kill failed", "exit unconfirmed"] {
+            assert!(error.contains(diagnostic), "missing {diagnostic}: {error}");
+        }
+    }
+
+    #[test]
+    fn independent_exit_confirmation_resolves_both_query_and_kill_errors() {
+        let mut confirmed = false;
+        let result = stop_policy(
+            &mut confirmed,
+            |_| Err("query unavailable".into()),
+            |_| Err("kill raced exit".into()),
+            |confirmed, _| {
+                *confirmed = true;
+                Ok(())
+            },
+        );
+        assert!(confirmed);
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn kill_success_without_confirmed_exit_does_not_claim_stop() {
+        let error = stop_policy(
+            &mut (),
+            |_| Ok(false),
+            |_| Ok(()),
+            |_, _| Err("exit unknown".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("kill fixed child succeeded"));
+        assert!(error.contains("exit unknown"));
     }
 }
