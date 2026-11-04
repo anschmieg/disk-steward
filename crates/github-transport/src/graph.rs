@@ -50,6 +50,45 @@ pub fn check_pack_graph_closure(
     cancellation: &CancellationHandle,
     deadline: Instant,
 ) -> io::Result<PackGraphReport> {
+    check_pack_graph(pack, roots, &[], cancellation, deadline)
+}
+
+/// Check that each required object is present with its declared type and is
+/// reachable from `roots`. Caller-supplied required claims are not local
+/// inventory, provenance, or cleanup proof.
+pub(crate) fn check_pack_graph_coverage(
+    pack: &DecodedPack,
+    roots: &[([u8; 20], GitObjectKind)],
+    required: &[([u8; 20], GitObjectKind)],
+    cancellation: &CancellationHandle,
+    deadline: Instant,
+) -> io::Result<PackGraphReport> {
+    check_attempt(cancellation, deadline)?;
+    if required.is_empty() || required.len() > 1024 {
+        return Err(safe_error(
+            io::ErrorKind::InvalidInput,
+            "required object count invalid",
+        ));
+    }
+    for (oid, _) in required {
+        check_attempt(cancellation, deadline)?;
+        if oid.iter().all(|byte| *byte == 0) {
+            return Err(safe_error(
+                io::ErrorKind::InvalidInput,
+                "required object ID invalid",
+            ));
+        }
+    }
+    check_pack_graph(pack, roots, required, cancellation, deadline)
+}
+
+fn check_pack_graph(
+    pack: &DecodedPack,
+    roots: &[([u8; 20], GitObjectKind)],
+    required: &[([u8; 20], GitObjectKind)],
+    cancellation: &CancellationHandle,
+    deadline: Instant,
+) -> io::Result<PackGraphReport> {
     check_attempt(cancellation, deadline)?;
     if roots.is_empty() || roots.len() > MAX_ROOTS {
         return Err(safe_error(
@@ -57,7 +96,6 @@ pub fn check_pack_graph_closure(
             "graph root count invalid",
         ));
     }
-
     let objects = pack.objects();
     check_attempt(cancellation, deadline)?;
     let mut by_oid: HashMap<[u8; 20], usize> = HashMap::new();
@@ -189,6 +227,18 @@ pub fn check_pack_graph_closure(
                     deadline,
                 )?;
             }
+        }
+        check_attempt(cancellation, deadline)?;
+    }
+
+    for (oid, expected_kind) in required {
+        check_attempt(cancellation, deadline)?;
+        let index = resolve(&by_oid, objects, oid, *expected_kind)?;
+        if !visited[index] {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "required object is not reachable from graph roots",
+            ));
         }
         check_attempt(cancellation, deadline)?;
     }

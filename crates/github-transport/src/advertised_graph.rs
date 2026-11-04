@@ -25,9 +25,53 @@ pub struct AdvertisedPackReport {
     decoded: DecodedPack,
     graph: PackGraphReport,
     advertised_ref_count: usize,
+    roots: Vec<([u8; 20], GitObjectKind)>,
+}
+
+/// Bounded presence/type reachability for a caller-supplied required object set.
+/// Counts do not capture or attest a local repository inventory or ref identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequiredObjectCoverageReport {
+    required_object_count: usize,
+    graph: PackGraphReport,
+}
+impl RequiredObjectCoverageReport {
+    /// Number of supplied requests, including duplicates.
+    pub fn required_object_count(&self) -> usize {
+        self.required_object_count
+    }
+    pub fn graph(&self) -> PackGraphReport {
+        self.graph
+    }
 }
 
 impl AdvertisedPackReport {
+    /// Require each supplied typed object to be reachable from this report's
+    /// advertised roots. Mere presence elsewhere in the pack is insufficient.
+    ///
+    /// The set must contain 1..=1024 nonzero IDs. Duplicate requests count toward
+    /// the limit and each expected kind is checked. This re-runs bounded graph
+    /// traversal with cooperative controls. It does not inventory local work,
+    /// preserve ref names, prove receipt freshness or authorize cleanup.
+    pub fn check_required_objects(
+        &self,
+        required: &[([u8; 20], GitObjectKind)],
+        cancellation: &CancellationHandle,
+        deadline: Instant,
+    ) -> io::Result<RequiredObjectCoverageReport> {
+        let graph = crate::graph::check_pack_graph_coverage(
+            &self.decoded,
+            &self.roots,
+            required,
+            cancellation,
+            deadline,
+        )?;
+        Ok(RequiredObjectCoverageReport {
+            required_object_count: required.len(),
+            graph,
+        })
+    }
+
     pub fn decoded(&self) -> &DecodedPack {
         &self.decoded
     }
@@ -123,6 +167,7 @@ pub fn decode_advertised_pack(
         decoded,
         graph,
         advertised_ref_count: refs.len(),
+        roots,
     })
 }
 

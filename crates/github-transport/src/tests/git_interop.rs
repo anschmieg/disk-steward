@@ -558,6 +558,21 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
         fetch_report.advertised_refs().unwrap().len()
     );
 
+    let coverage = advertised_closure
+        .check_required_objects(
+            &[
+                (hex_oid(&commit), GitObjectKind::Commit),
+                (hex_oid(&tree), GitObjectKind::Tree),
+                (hex_oid(&blob), GitObjectKind::Blob),
+                (hex_oid(&tag_object), GitObjectKind::Tag),
+            ],
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(coverage.required_object_count(), 4);
+    assert_eq!(coverage.graph().reachable_objects(), 4);
+
     let closure = check_pack_graph_closure(
         &decoded_pack,
         &[
