@@ -3,6 +3,8 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "foundation_status",
             "check_selected_folder_access",
+            "compare_observed_files",
+            "cancel_duplicate_comparison",
             "inspect_selected_folder_entries",
             "navigate_folder_inventory",
             "continue_folder_inventory",
