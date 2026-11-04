@@ -1,0 +1,11 @@
+{
+  "pytestVersion": "9.0.2",
+  "pythonVersion": "3.14.10",
+  "expectedExitCode": 1,
+  "records": {
+    "nodeids.json": "b42fa6d4ee3882fd779c38d362aa18b8d75f7404c3f4732a21140e66cf0b7c4c",
+    "lastfailed.json": "521fb76ae00360422618fb8effa65bd5ce45209180a430cf71dd6060899dbcfa"
+  },
+  "cleanupEligibility": false,
+  "lifecycleValidated": false
+}
