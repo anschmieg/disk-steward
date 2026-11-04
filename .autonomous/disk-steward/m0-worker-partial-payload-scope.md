@@ -1,0 +1,9 @@
+# M0: partial payload failure before worker readiness
+
+Extend the descriptor payload probe with a separate closed, synthetic partial-write failure case. The fixed child uses the existing accounting core to write exactly the first 2 KiB of the deterministic payload, then injects an error. It must exit with a distinct fixed nonzero status without emitting readiness. No caller path, payload, byte limit, credential, endpoint, environment switch or cleanup argument is accepted.
+
+The parent commits the existing 128 KiB identity-bound reservation before launch, passes the validated directory capability, and binds the actual child PID. It requires bounded zero-byte stdout completion and the expected failure status, confirms exact child stop/reap and reader join, then issues the matching stop receipt. A separate fixed partial inspector shares identity-bound held-descriptor readback with the complete inspector; the complete inspector must reject the prefix. The partial observation is failure evidence, never a verification-success receipt.
+
+The registry must not become Active from this failed readiness attempt. Reopening must preserve identities and reservation and require reconciliation with prior Registered state. Retry, reservation growth and cleanup remain blocked. The partial file is retained. No user data is touched.
+
+This contributes to M0 cancellation/failure resource evidence under design.md R5.8 and tasks 0.1/0.3. It does not prove a real disk-full fault, arbitrary interruption timing, production Git worker integration, durable byte receipts, global store accounting, OS sandbox/process-tree containment, power-loss recovery, hard system-call latency/RSS limits, private authentication, preservation or milestone completion. Main remains the eventual integration baseline; this branch builds on PR90 while its stack integrates. Versions remain 0.0.x and no release is published.
