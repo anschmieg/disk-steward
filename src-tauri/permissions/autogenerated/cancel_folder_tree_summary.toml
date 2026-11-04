@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cancel-folder-tree-summary"
+description = "Enables the cancel_folder_tree_summary command without any pre-configured scope."
+commands.allow = ["cancel_folder_tree_summary"]
+
+[[permission]]
+identifier = "deny-cancel-folder-tree-summary"
+description = "Denies the cancel_folder_tree_summary command without any pre-configured scope."
+commands.deny = ["cancel_folder_tree_summary"]

@@ -511,7 +511,10 @@ test("subtree summary is explicit, keeps exact totals and leaves page and import
     name: "Subtree metadata summary",
   });
   expect(invoke).toHaveBeenNthCalledWith(2, "inspect_folder_tree_summary", {
-    request: { expectedObservationId: "observation-1" },
+    request: {
+      expectedObservationId: "observation-1",
+      attemptId: expect.stringMatching(/^disk-steward:summary-attempt:v1:/),
+    },
   });
   expect(summary).toHaveTextContent("90071992547409930");
   expect(summary).toHaveTextContent("Incomplete subtree coverage");
@@ -547,4 +550,142 @@ test("failed subtree summary sanitizes errors and preserves the current page", a
   expect(
     screen.getByRole("button", { name: "Summarize subtree metadata" }),
   ).toBeEnabled();
+});
+
+test("cancel binds the exact running attempt and keeps ownership until native completion", async () => {
+  let rejectSummary: (error: Error) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectSummary = reject;
+        }),
+    )
+    .mockResolvedValueOnce(undefined);
+  const busy = vi.fn();
+  render(<FolderInventoryPanel native onBusyChange={busy} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  const startRequest = vi.mocked(invoke).mock.calls[1][1] as {
+    request: { expectedObservationId: string; attemptId: string };
+  };
+  fireEvent.click(
+    screen.getByRole("button", { name: "Cancel subtree summary" }),
+  );
+  await screen.findByRole("button", { name: "Cancellation requested" });
+  expect(invoke).toHaveBeenNthCalledWith(
+    3,
+    "cancel_folder_tree_summary",
+    startRequest,
+  );
+  expect(
+    screen.getByRole("button", { name: "Cancellation requested" }),
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  ).toBeDisabled();
+  expect(busy.mock.calls).toEqual([[true], [false], [true]]);
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+  rejectSummary(new Error("canceled /private/path"));
+  await screen.findByText(
+    /ended without a reliable result after cancellation was requested/,
+  );
+  expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Cancellation requested" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  ).toBeEnabled();
+  expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
+});
+
+test("unconfirmed cancellation does not pretend the summary stopped", async () => {
+  let rejectSummary: (error: Error) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectSummary = reject;
+        }),
+    )
+    .mockRejectedValueOnce(new Error("stale /private/path"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Cancel subtree summary" }),
+  );
+  await screen.findByText(/Cancellation could not be confirmed/);
+  expect(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "Cancel subtree summary" }),
+  ).toBeEnabled();
+  rejectSummary(new Error("failed"));
+  await screen.findByText(/subtree summary could not be completed reliably/);
+});
+
+test("a late cancellation response cannot change a later summary attempt", async () => {
+  let rejectFirst: (error: Error) => void = () => {};
+  let rejectSecond: (error: Error) => void = () => {};
+  let acknowledgeCancel: () => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectFirst = reject;
+        }),
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          acknowledgeCancel = resolve;
+        }),
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectSecond = reject;
+        }),
+    );
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Cancel subtree summary" }),
+  );
+  rejectFirst(new Error("finished"));
+  await screen.findByText(/subtree summary could not be completed reliably/);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Summarize subtree metadata" }),
+  );
+  const requests = vi
+    .mocked(invoke)
+    .mock.calls.filter(([name]) => name === "inspect_folder_tree_summary");
+  expect(requests[0][1]).not.toEqual(requests[1][1]);
+  acknowledgeCancel();
+  await waitFor(() =>
+    expect(
+      screen.queryByText(/Cancellation requested\. Waiting/),
+    ).not.toBeInTheDocument(),
+  );
+  expect(
+    screen.getByRole("button", { name: "Cancel subtree summary" }),
+  ).toBeEnabled();
+  rejectSecond(new Error("finished"));
+  await screen.findByText(/subtree summary could not be completed reliably/);
 });

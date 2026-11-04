@@ -61,6 +61,16 @@ export default function FolderInventoryPanel({
   const titleId = useId();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const activeRequest = useRef(false);
+  const summaryJobRef = useRef<{
+    attemptId: string;
+    observationId: string;
+    cancelRequested: boolean;
+  } | null>(null);
+  const cancelInFlight = useRef(false);
+  const [summaryRunning, setSummaryRunning] = useState(false);
+  const [cancelPhase, setCancelPhase] = useState<
+    "ready" | "sending" | "requested"
+  >("ready");
   const evidenceHeadingRef = useRef<HTMLHeadingElement>(null);
   const inspectorReturnRef = useRef<HTMLButtonElement | null>(null);
   const queryRef = useRef<HTMLInputElement>(null);
@@ -206,27 +216,86 @@ export default function FolderInventoryPanel({
   };
   const summarizeTree = async () => {
     if (!native || !snapshot || activeRequest.current) return;
+    let attemptId: string;
+    try {
+      attemptId = `disk-steward:summary-attempt:v1:${crypto.randomUUID()}`;
+    } catch {
+      setMessage(
+        "The summary could not be started reliably. The folder page is unchanged.",
+      );
+      return;
+    }
+    const job = {
+      attemptId,
+      observationId: snapshot.observationId,
+      cancelRequested: false,
+    };
     activeRequest.current = true;
     setBusy(true);
     onBusyChange(true);
     setMessage("");
     setTreeSummary(null);
+    summaryJobRef.current = job;
+    setSummaryRunning(true);
+    setCancelPhase("ready");
     try {
       const result = await invoke<FolderTreeSummary>(
         "inspect_folder_tree_summary",
-        { request: { expectedObservationId: snapshot.observationId } },
+        {
+          request: {
+            expectedObservationId: snapshot.observationId,
+            attemptId: job.attemptId,
+          },
+        },
       );
       if (result.observationId !== snapshot.observationId)
         throw new Error("Observation mismatch");
       setTreeSummary(result);
+      if (job.cancelRequested)
+        setMessage("The summary completed before cancellation took effect.");
     } catch {
       setMessage(
-        "The subtree summary could not be completed reliably. The folder page is unchanged. Review remembered exclusions or choose the folder again to refresh its scope.",
+        job.cancelRequested
+          ? "The summary ended without a reliable result after cancellation was requested. The folder page is unchanged."
+          : "The subtree summary could not be completed reliably. The folder page is unchanged. Review remembered exclusions or choose the folder again to refresh its scope.",
       );
     } finally {
+      summaryJobRef.current = null;
+      setSummaryRunning(false);
       activeRequest.current = false;
       setBusy(false);
       onBusyChange(false);
+    }
+  };
+  const cancelSummary = async () => {
+    const job = summaryJobRef.current;
+    if (!native || !job || cancelInFlight.current || job.cancelRequested)
+      return;
+    cancelInFlight.current = true;
+    setCancelPhase("sending");
+    try {
+      await invoke("cancel_folder_tree_summary", {
+        request: {
+          expectedObservationId: job.observationId,
+          attemptId: job.attemptId,
+        },
+      });
+      if (summaryJobRef.current === job) {
+        job.cancelRequested = true;
+        setCancelPhase("requested");
+        setMessage(
+          "Cancellation requested. Waiting for the native summary to stop; an in-flight filesystem call may still finish.",
+        );
+      }
+    } catch {
+      if (summaryJobRef.current === job) {
+        setCancelPhase("ready");
+        setMessage(
+          "Cancellation could not be confirmed. Waiting for the summary result; the folder page is unchanged.",
+        );
+      }
+    } finally {
+      cancelInFlight.current = false;
     }
   };
   const selected = snapshot?.entries.find((entry) => entry.id === selectedId);
@@ -288,6 +357,23 @@ export default function FolderInventoryPanel({
           >
             Summarize subtree metadata
           </button>
+          {summaryRunning && (
+            <button
+              className="button secondary"
+              disabled={cancelPhase !== "ready"}
+              onClick={() => void cancelSummary()}
+            >
+              {cancelPhase === "requested"
+                ? "Cancellation requested"
+                : cancelPhase === "sending"
+                  ? "Requesting cancellation…"
+                  : "Cancel subtree summary"}
+            </button>
+          )}
+          <p>
+            Cancellation is cooperative; the page remains busy until the native
+            summary finishes. It cannot interrupt an in-flight filesystem call.
+          </p>
           <p>
             Explicit read-only summary: up to 4,096 entries, 16 levels and
             cooperative two-second checks. File contents are not read. Links and
