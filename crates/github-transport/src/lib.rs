@@ -5,6 +5,7 @@
 //! deadline. See the crate README for the current scope and limits.
 
 mod advertised_graph;
+mod attempt_context;
 pub use advertised_graph::{
     decode_advertised_pack, AdvertisedPackReport, RequiredObjectCoverageReport,
 };
@@ -45,7 +46,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use gix_error::{ErrorExt, ExnMessageResult, ExnResult};
@@ -447,6 +448,13 @@ fn assemble(
     let framing = http.framing.clone();
     let cancellation = http.cancellation.clone();
     let deadline = http.deadline;
+    let started_wall = http.started_wall;
+    let started_at = deadline.checked_sub(http.limits.timeout).ok_or_else(|| {
+        safe_error(
+            io::ErrorKind::InvalidData,
+            "verification clock context invalid",
+        )
+    })?;
     let retained = http.retained.clone();
     let url = gix_url::parse(repository.base())
         .map_err(|_| safe_error(io::ErrorKind::InvalidInput, "invalid repository URL"))?;
@@ -471,6 +479,7 @@ fn assemble(
             })?;
     }
     Ok(GitHubTransport {
+        context: attempt_context::AttemptContext::new(repository, started_at, started_wall),
         inner,
         budget,
         framing,
@@ -482,6 +491,7 @@ fn assemble(
 
 /// gix's blocking HTTP transport, ready for an explicit handshake.
 pub struct GitHubTransport {
+    context: attempt_context::AttemptContext,
     inner: gix_transport::client::blocking_io::http::Transport<RawHttp>,
     budget: Budget,
     framing: ResponseLedger,
@@ -539,6 +549,7 @@ impl GitHubTransport {
     /// ingress budget, deadline, and cancellation signal.
     pub fn finalize_http_framing(self) -> io::Result<HttpFinalizationReport> {
         let Self {
+            context: _,
             inner,
             budget,
             framing,
@@ -1077,6 +1088,7 @@ impl<R: Read> Read for Body<R> {
 }
 
 struct RawHttp {
+    started_wall: SystemTime,
     repository: RepositoryUrl,
     limits: AttemptLimits,
     deadline: Instant,
@@ -1101,10 +1113,13 @@ impl RawHttp {
         cancellation: CancellationHandle,
         #[cfg(test)] fixture: Option<(SocketAddr, Arc<str>)>,
     ) -> Self {
+        let started_at = Instant::now();
+        let started_wall = SystemTime::now();
         Self {
+            started_wall,
             repository,
             limits,
-            deadline: Instant::now() + limits.timeout,
+            deadline: started_at + limits.timeout,
             budget: Budget {
                 max: limits.ingress_bytes,
                 used: Arc::new(Mutex::new(0)),
@@ -1632,6 +1647,7 @@ impl Http for RawHttp {
             let state = Arc::new(Mutex::new(PostState {
                 receiver: rx,
                 http: RawHttp {
+                    started_wall: self.started_wall,
                     repository: self.repository.clone(),
                     limits: self.limits,
                     deadline: self.deadline,

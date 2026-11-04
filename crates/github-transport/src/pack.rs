@@ -28,6 +28,7 @@ const MAX_INTERRUPTED_WRITES: usize = 16;
 /// integrity, object completeness, reachability, or removal eligibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackTransferReport {
+    context: crate::attempt_context::AttemptContext,
     bytes_written: u64,
     operation_error_kind: Option<io::ErrorKind>,
     finalization: HttpFinalizationReport,
@@ -36,6 +37,29 @@ pub struct PackTransferReport {
 }
 
 impl PackTransferReport {
+    /// Exact validated URL used to construct this attempt. No alias rewriting.
+    pub fn repository(&self) -> &crate::RepositoryUrl {
+        self.context.repository()
+    }
+
+    /// Require a complete transfer, the expected exact repository, and an age
+    /// below fifteen minutes on both monotonic and wall clocks from transport
+    /// construction in this process.
+    /// Clock expiry/invalidity remains terminal across clones of this attempt.
+    /// This is not a durable receipt, retention promise or cleanup authorization.
+    pub fn check_context(&self, expected: &crate::RepositoryUrl) -> io::Result<()> {
+        if !self.is_complete_transfer() {
+            return Err(safe_error(
+                io::ErrorKind::InvalidData,
+                "pack transfer incomplete",
+            ));
+        }
+        self.context.check(expected)
+    }
+    pub(crate) fn context(&self) -> &crate::attempt_context::AttemptContext {
+        &self.context
+    }
+
     /// Bytes the sink reported accepting, including any partial write before
     /// a later sink or protocol failure.
     pub fn bytes_written(&self) -> u64 {
@@ -92,6 +116,7 @@ pub(super) fn download_advertised_pack(
     mut transport: GitHubTransport,
     sink: &mut impl Write,
 ) -> io::Result<PackTransferReport> {
+    let context = transport.context.clone();
     let cancellation = transport.cancellation_handle();
     let deadline = transport.deadline;
     let mut bytes_written = 0;
@@ -122,6 +147,7 @@ pub(super) fn download_advertised_pack(
         _ => (None, None),
     };
     Ok(PackTransferReport {
+        context,
         bytes_written,
         operation_error_kind,
         finalization,

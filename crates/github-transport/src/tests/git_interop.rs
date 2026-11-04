@@ -577,6 +577,7 @@ fn run_real_git_verification() {
 
     let coverage = advertised_closure
         .check_required_objects(
+            &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
             &[
                 (hex_oid(&commit), GitObjectKind::Commit),
                 (hex_oid(&tree), GitObjectKind::Tree),

@@ -315,6 +315,7 @@ fn advertised_decode_fixture(refs: Vec<u8>, bytes: &[u8]) -> PackTransferReport 
 fn decode_report(report: &PackTransferReport, bytes: &[u8]) -> io::Result<AdvertisedPackReport> {
     decode_advertised_pack(
         report,
+        &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
         bytes,
         16 * 1024 * 1024,
         &CancellationHandle::new(),
@@ -358,6 +359,7 @@ fn advertised_pack_closure_binds_all_tip_claims_and_peeled_targets() {
     assert_eq!(
         decode_advertised_pack(
             &report,
+            &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
             &bytes,
             4096,
             &cancel,
@@ -370,6 +372,7 @@ fn advertised_pack_closure_binds_all_tip_claims_and_peeled_targets() {
     assert_eq!(
         decode_advertised_pack(
             &report,
+            &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
             &bytes,
             4096,
             &CancellationHandle::new(),
@@ -557,22 +560,42 @@ fn advertised_report_retains_roots_for_required_object_coverage() {
     let cancel = CancellationHandle::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     let coverage = checked
-        .check_required_objects(&[(id, K::Blob), (commit_id, K::Commit)], &cancel, deadline)
+        .check_required_objects(
+            &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
+            &[(id, K::Blob), (commit_id, K::Commit)],
+            &cancel,
+            deadline,
+        )
         .unwrap();
     assert_eq!(coverage.required_object_count(), 2);
     assert_eq!(coverage.graph().reachable_objects(), 3);
     assert_eq!(
         checked
-            .check_required_objects(&[(stray_id, K::Blob)], &cancel, deadline)
+            .check_required_objects(
+                &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
+                &[(stray_id, K::Blob)],
+                &cancel,
+                deadline
+            )
             .unwrap_err()
             .kind(),
         io::ErrorKind::InvalidData
     );
     assert!(checked
-        .check_required_objects(&[], &cancel, deadline)
+        .check_required_objects(
+            &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
+            &[],
+            &cancel,
+            deadline
+        )
         .is_err());
     assert!(checked
-        .check_required_objects(&[(id, K::Tree)], &cancel, deadline)
+        .check_required_objects(
+            &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
+            &[(id, K::Tree)],
+            &cancel,
+            deadline
+        )
         .is_err());
 }
 
@@ -649,4 +672,57 @@ fn decoder_rejects_same_length_valid_pack_substitution_with_same_roots() {
     let error = decode_report(&report, &substituted).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert_eq!(error.to_string(), "pack bytes do not match transfer digest");
+}
+
+#[test]
+fn transfer_decode_and_coverage_require_the_expected_repository_context() {
+    use super::graph_tests::{hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let payload = b"x".to_vec();
+    let id = oid(K::Blob, &payload);
+    let bytes = pack_bytes(&[(K::Blob, payload)]);
+    let report = advertised_decode_fixture(
+        format!("{} refs/tags/blob\n", hex(&id)).into_bytes(),
+        &bytes,
+    );
+    let expected = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    assert_eq!(report.repository(), &expected);
+    report.check_context(&expected).unwrap();
+    let checked = decode_report(&report, &bytes).unwrap();
+    assert_eq!(checked.repository(), &expected);
+    checked.check_context(&expected).unwrap();
+    let wrong = RepositoryUrl::parse("https://github.com/other/repo.git").unwrap();
+    assert_eq!(
+        report.check_context(&wrong).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        decode_advertised_pack(
+            &report,
+            &wrong,
+            &bytes,
+            4096,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        checked.check_context(&wrong).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        checked
+            .check_required_objects(
+                &wrong,
+                &[(id, K::Blob)],
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
 }

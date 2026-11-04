@@ -548,3 +548,31 @@ This remains test-only and detects observable changes, not an atomic snapshot or
 all races. Later mutation still requires revalidation. Sync success is not a
 power-loss guarantee; production worker, crash/reconciliation, persistence and
 cleanup acceptance remain open.
+
+### Repository context and in-process expiry
+
+Pack transfer and decoded reports retain the exact validated repository URL used
+to construct the transport and its original monotonic and wall-clock start times.
+`decode_advertised_pack` and `check_required_objects` require an explicit expected
+repository; both check context before and after their work. URL aliases, case or
+`.git` suffix differences are refused rather than normalized. Cloning or decoding
+an old report does not renew its lifetime.
+
+Context checks refuse at 15 minutes on either clock, invalid/backward readings,
+or a repository mismatch. An observed expiry or invalid-clock result is terminal
+for that attempt and shared by existing and future clones; a later clock correction
+cannot revive it. The first terminal clock failure is retained under concurrent
+checks. A wrong expected repository is a per-call mismatch and does not invalidate
+the correctly bound attempt. `is_complete_transfer` still describes historical
+transfer completion; it does not mean evidence is currently usable. Counts-only
+coverage results likewise do not replace a fresh context check at later use.
+The original attempt begins at transport construction, conservatively before ref
+observation, rather than at decoding completion.
+
+This is an in-process guard, not a serialized receipt or a full platform-clock
+acceptance result. Rust does not guarantee consistent suspend accounting for
+`Instant`; the wall-clock guard adds conservative elapsed-time checking but is
+not a clock-tampering guarantee. Persisted receipts, local manifest revalidation,
+ref-name preservation, authentication, remote retention, worker/store lifecycle
+and cleanup eligibility remain separate gates. Tests exercise clock boundaries
+without sleeps and require the expected endpoint through the private TLS flow.
