@@ -277,3 +277,93 @@ fn symbolic_targets_share_the_aggregate_byte_budget() {
     }])
     .is_err());
 }
+
+#[test]
+fn present_symbolic_links_require_matching_identity_and_acyclic_claims() {
+    let link = |name, target| Input {
+        symref_target: Some(target),
+        ..entry(name, 1, K::Blob)
+    };
+    let a = b"refs/tags/a".as_slice();
+    let b = b"refs/tags/b".as_slice();
+    let c = b"refs/tags/c".as_slice();
+    assert!(capture(&[link(a, b), link(b, c), entry(c, 1, K::Blob)]).is_ok());
+    assert!(capture(&[link(a, b), link(b, c)]).is_ok());
+    for inputs in [
+        vec![link(a, b), link(b, a)],
+        vec![link(a, b), link(b, c), link(c, a)],
+        vec![link(a, b), entry(b, 2, K::Blob)],
+        vec![link(a, b), entry(b, 1, K::Tag)],
+    ] {
+        assert_eq!(capture(&inputs).unwrap_err().kind(), ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn maximum_symbolic_chain_terminates_and_cycle_is_refused() {
+    let names = (0..1024)
+        .map(|i| format!("refs/tags/{i:04}").into_bytes())
+        .collect::<Vec<_>>();
+    let mut inputs = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Input {
+            symref_target: names.get(i + 1).map(Vec::as_slice),
+            ..entry(name, 1, K::Blob)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(capture(&inputs).unwrap().entries().len(), 1024);
+    inputs[1023].symref_target = Some(&names[0]);
+    assert_eq!(capture(&inputs).unwrap_err().kind(), ErrorKind::InvalidData);
+}
+
+#[test]
+fn symbolic_graphs_match_independent_repeated_walk_oracle() {
+    // Each of four entries is direct, points outside the manifest, or points
+    // to one of the four entries. Enumerate all 6^4 graphs, including merges
+    // into completed paths and tails entering cycles away from their start.
+    let names = [
+        b"refs/tags/a".as_slice(),
+        b"refs/tags/b",
+        b"refs/tags/c",
+        b"refs/tags/d",
+    ];
+    for encoded in 0usize..6usize.pow(4) {
+        let mut choices = [0usize; 4];
+        let mut value = encoded;
+        for choice in &mut choices {
+            *choice = value % 6;
+            value /= 6;
+        }
+        let mut acyclic = true;
+        for start in 0..4 {
+            let mut seen = [false; 4];
+            let mut current = start;
+            loop {
+                if seen[current] {
+                    acyclic = false;
+                    break;
+                }
+                seen[current] = true;
+                let next = choices[current];
+                if next < 2 {
+                    break;
+                }
+                current = next - 2;
+            }
+        }
+        let inputs = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Input {
+                symref_target: match choices[i] {
+                    0 => None,
+                    1 => Some(b"refs/tags/external"),
+                    index => Some(names[index - 2]),
+                },
+                ..entry(name, 1, K::Blob)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(capture(&inputs).is_ok(), acyclic, "graph {choices:?}");
+    }
+}

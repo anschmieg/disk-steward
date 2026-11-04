@@ -619,3 +619,11 @@ and do not establish a comprehensive user-repository inventory.
 The disposable Git fixture also captures HEAD explicitly and detects switching its
 symbolic branch or detaching it at the same commit ID. This does not prove native
 capture completeness, atomicity, unborn-HEAD handling or absence of symref cycles.
+
+Manifest capture also checks links whose targets are present in the same snapshot.
+Their object IDs and kinds must agree, and a bounded walk rejects cycles. Missing
+targets remain external caller claims. This uses fixed state/path arrays (9 KiB on 64-bit targets) without heap graph
+allocation. Each of at most 1,024 entries and present links is processed once,
+with binary target lookup and cancellation/deadline checks during traversal
+and completion.
+It cannot establish consistency of refs omitted by the caller or native atomicity.

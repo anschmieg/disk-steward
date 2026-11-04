@@ -1,7 +1,7 @@
 //! Immutable, bounded manifest of caller-supplied required references.
 //!
 //! Entries are raw claims supplied by the caller, not native reference
-//! capture or cycle proof. They do not establish HEAD completeness, preservation,
+//! capture or proof about omitted refs. They do not establish HEAD completeness, preservation,
 //! backup, retention, signature, or cleanup authorization. The entry caps are
 //! experimental and are not product scope.
 
@@ -133,6 +133,8 @@ impl RequiredRefManifest {
             }
         }
         check_attempt(cancel, deadline)?;
+        validate_present_symrefs(&entries, cancel, deadline)?;
+        check_attempt(cancel, deadline)?;
         let digest = hash_entries(&entries, cancel, deadline)?;
         check_attempt(cancel, deadline)?;
         Ok(Self { entries, digest })
@@ -159,6 +161,63 @@ impl RequiredRefManifest {
         check_attempt(cancel, deadline)?;
         Ok(())
     }
+}
+
+fn validate_present_symrefs(
+    entries: &[RequiredRefEntry],
+    cancel: &CancellationHandle,
+    deadline: Instant,
+) -> io::Result<()> {
+    const UNSEEN: u8 = 0;
+    const VISITING: u8 = 1;
+    const DONE: u8 = 2;
+
+    // Each node has at most one outgoing edge. These arrays bound traversal
+    // state without allocating a second graph representation.
+    let mut states = [UNSEEN; MAX_ENTRIES];
+    let mut path = [0usize; MAX_ENTRIES];
+    for start in 0..entries.len() {
+        check_attempt(cancel, deadline)?;
+        if states[start] == DONE {
+            continue;
+        }
+        let mut current = start;
+        let mut path_len = 0usize;
+        loop {
+            check_attempt(cancel, deadline)?;
+            match states[current] {
+                VISITING => return Err(invalid("required symbolic reference cycle")),
+                DONE => break,
+                UNSEEN => {}
+                _ => return Err(invalid("invalid required symbolic reference state")),
+            }
+
+            states[current] = VISITING;
+            path[path_len] = current;
+            path_len += 1;
+            let entry = &entries[current];
+            let Some(target_name) = entry.symref_target.as_deref() else {
+                break;
+            };
+            let Ok(target_index) =
+                entries.binary_search_by(|candidate| candidate.name.as_slice().cmp(target_name))
+            else {
+                break;
+            };
+            let target = &entries[target_index];
+            if entry.oid != target.oid || entry.kind != target.kind {
+                return Err(invalid("required symbolic reference claim mismatch"));
+            }
+            current = target_index;
+        }
+
+        while path_len > 0 {
+            check_attempt(cancel, deadline)?;
+            path_len -= 1;
+            states[path[path_len]] = DONE;
+        }
+    }
+    check_attempt(cancel, deadline)
 }
 
 fn validate_claim(input: &RequiredRefInput<'_>) -> io::Result<()> {
