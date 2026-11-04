@@ -73,3 +73,16 @@ stdout reader before checking evidence. Reopen must retain admission and require
 reconciliation; the payload must remain absent or retain exactly those bytes.
 These are local process-death tests, not power-loss, kill-latency, global-budget,
 production-worker or cleanup-authorization evidence.
+
+A trusted live owner can call `require_reconciliation(id, expected_state)` when
+an attempt becomes incomplete. It compares the exact nonterminal state under
+the existing lease and immediate transaction, records it as `prior_state`, and
+preserves every identity and reservation byte. Stale, missing, already
+reconciling and completed records cannot be changed through this operation.
+Reopening preserves the original prior state.
+
+This immediately activates the existing refusal of new reservations while any
+record needs reconciliation, including reservations for another registered
+store. It does not cancel running jobs, revoke capabilities, inspect data,
+confirm shutdown, reconcile/adopt a store, release capacity, or authorize
+cleanup. The API adds no schema migration or renderer access.
