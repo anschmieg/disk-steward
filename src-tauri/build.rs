@@ -3,6 +3,8 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "foundation_status",
             "check_selected_folder_access",
+            "inspect_selected_folder_entries",
+            "navigate_folder_inventory",
             "preview_native_review",
             "get_example_plan",
             "edit_example_plan",
@@ -24,6 +26,7 @@ fn main() {
             "list_general_reviews",
             "add_selected_general_item",
             "add_selected_general_folder",
+            "import_observed_review_items",
             "get_exclusion_registry",
             "add_global_exclusion",
             "remove_global_exclusion",

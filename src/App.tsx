@@ -1,3 +1,4 @@
+import FolderInventoryPanel from "./components/FolderInventoryPanel";
 import GeneralPlanWorkspace, {
   type GeneralPlanSummary,
 } from "./components/GeneralPlanWorkspace";
@@ -156,14 +157,15 @@ export default function App() {
   const [error, setError] = useState("");
   const [needsRefresh, setNeedsRefresh] = useState(false);
   const [nativePreviewMessage, setNativePreviewMessage] = useState("");
-  const [page, setPage] = useState<"edit" | "review" | "demo" | "advanced">(
-    native ? "advanced" : "edit",
-  );
+  const [page, setPage] = useState<
+    "edit" | "review" | "demo" | "advanced" | "explore"
+  >(native ? "explore" : "edit");
   const [demoBusy, setDemoBusy] = useState(false);
   const [generalBusy, setGeneralBusy] = useState(false);
   const [generalSummary, setGeneralSummary] =
     useState<GeneralPlanSummary | null>(null);
-  const workspaceBusy = demoBusy || generalBusy;
+  const [inventoryBusy, setInventoryBusy] = useState(false);
+  const workspaceBusy = demoBusy || generalBusy || inventoryBusy;
   const actionRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const refresh = useCallback(
@@ -289,7 +291,7 @@ export default function App() {
   };
   const reviewActions = useMemo(() => review?.actions ?? [], [review]);
 
-  if (!plan)
+  if (!plan && page !== "explore" && page !== "advanced")
     return (
       <div className="loading-shell">
         <HardDrive />
@@ -309,6 +311,7 @@ export default function App() {
       </div>
     );
 
+  const displayedExample = plan ?? browserPlan;
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -323,7 +326,13 @@ export default function App() {
           className={`example-chip ${page === "demo" ? "demo-chip-active" : ""}`}
         >
           <i />
-          {page === "demo" ? "Disposable file demo" : "Non-executable example"}
+          {page === "explore"
+            ? "Read-only folder observation"
+            : page === "advanced"
+              ? "Metadata review plan"
+              : page === "demo"
+                ? "Disposable file demo"
+                : "Non-executable example"}
         </span>
       </header>
       <aside className="sidebar">
@@ -350,52 +359,66 @@ export default function App() {
           onClick={() => setPage("advanced")}
         >
           <Archive size={16} />
-          Grouped editor
+          Review plan
+        </button>
+        <button
+          className={`nav-item ${page === "explore" ? "active" : ""}`}
+          disabled={workspaceBusy}
+          onClick={() => setPage("explore")}
+        >
+          <HardDrive size={16} />
+          Explore folder
         </button>
         <div className="side-rule" />
-        <div className="side-metric">
-          <span>
-            {page === "advanced" ? "Known logical size" : "Plan size"}
-          </span>
-          <b>
-            {page === "advanced"
-              ? generalSummary
-                ? fmt(generalSummary.bytes)
-                : "Loading…"
-              : fmt(plan.totalBytes)}
-          </b>
-          <small>
-            {page === "advanced"
-              ? `${generalSummary?.count ?? "—"} review entries`
-              : "5 synthetic actions"}
-          </small>
-        </div>
-        <div className="side-metric selected-metric">
-          <span>Included</span>
-          <b>
-            {page === "advanced"
-              ? generalSummary
-                ? fmt(generalSummary.selectedBytes)
-                : "—"
-              : fmt(plan.selectedBytes)}
-          </b>
-          <small>
-            {page === "advanced"
-              ? (generalSummary?.selectedCount ?? "—")
-              : plan.selectedCount}{" "}
-            {page === "advanced"
-              ? "items"
-              : plan.selectedCount === 1
-                ? "action"
-                : "actions"}
-          </small>
-        </div>
+        {page !== "explore" && (
+          <>
+            <div className="side-metric">
+              <span>
+                {page === "advanced" ? "Known logical size" : "Plan size"}
+              </span>
+              <b>
+                {page === "advanced"
+                  ? generalSummary
+                    ? fmt(generalSummary.bytes)
+                    : "Loading…"
+                  : fmt(displayedExample.totalBytes)}
+              </b>
+              <small>
+                {page === "advanced"
+                  ? `${generalSummary?.count ?? "—"} review entries`
+                  : "5 synthetic actions"}
+              </small>
+            </div>
+            <div className="side-metric selected-metric">
+              <span>Included</span>
+              <b>
+                {page === "advanced"
+                  ? generalSummary
+                    ? fmt(generalSummary.selectedBytes)
+                    : "—"
+                  : fmt(displayedExample.selectedBytes)}
+              </b>
+              <small>
+                {page === "advanced"
+                  ? (generalSummary?.selectedCount ?? "—")
+                  : displayedExample.selectedCount}{" "}
+                {page === "advanced"
+                  ? "items"
+                  : displayedExample.selectedCount === 1
+                    ? "action"
+                    : "actions"}
+              </small>
+            </div>
+          </>
+        )}
         <div className="side-note">
           <ShieldCheck size={15} />
           <span>
-            {page === "demo"
-              ? "Only app-created demo fixtures can be staged, restored, or permanently removed."
-              : "This plan is metadata only and cannot authorize file operations."}
+            {page === "explore"
+              ? "Read-only metadata. No file operation authority is created."
+              : page === "demo"
+                ? "Only app-created demo fixtures can be staged, restored, or permanently removed."
+                : "This plan is metadata only and cannot authorize file operations."}
           </span>
         </div>
       </aside>
@@ -403,38 +426,47 @@ export default function App() {
         <div className="main-head">
           <div>
             <div className="crumb">
-              EXAMPLE WORKSPACE <ChevronRight size={12} />{" "}
-              {page === "advanced"
-                ? "GROUPED EDITOR"
-                : page === "demo"
-                  ? "FIXTURE DEMO"
-                  : page === "edit"
-                    ? "PLAN EDITOR"
-                    : native
-                      ? "SAVED REVIEW"
-                      : "PREVIEW"}
+              {page === "explore" || page === "advanced"
+                ? "LOCAL WORKSPACE"
+                : "EXAMPLE WORKSPACE"}{" "}
+              <ChevronRight size={12} />{" "}
+              {page === "explore"
+                ? "FOLDER EXPLORER"
+                : page === "advanced"
+                  ? "GROUPED EDITOR"
+                  : page === "demo"
+                    ? "FIXTURE DEMO"
+                    : page === "edit"
+                      ? "PLAN EDITOR"
+                      : native
+                        ? "SAVED REVIEW"
+                        : "PREVIEW"}
             </div>
             <h1>
-              {page === "advanced"
-                ? "Make the plan yours."
-                : page === "demo"
-                  ? "Test with disposable files."
-                  : page === "edit"
-                    ? "Review each action."
-                    : native
-                      ? "Review saved."
-                      : "Preview decisions."}
+              {page === "explore"
+                ? "See what is in a folder."
+                : page === "advanced"
+                  ? "Make the plan yours."
+                  : page === "demo"
+                    ? "Test with disposable files."
+                    : page === "edit"
+                      ? "Review each action."
+                      : native
+                        ? "Review saved."
+                        : "Preview decisions."}
             </h1>
             <p>
-              {page === "advanced"
-                ? "Review groups and exceptions, keep what matters, and inspect the evidence before saving a snapshot."
-                : page === "demo"
-                  ? "Review, restore, or permanently remove files created only for this demo. Each operation needs its own native confirmation."
-                  : page === "edit"
-                    ? "Choose what to include. The plan totals update from the current revision."
-                    : native
-                      ? "This immutable snapshot records the decisions you reviewed."
-                      : "This unsaved preview shows how the current decisions fit together."}
+              {page === "explore"
+                ? "Inspect immediate entries and their logical sizes before planning any changes."
+                : page === "advanced"
+                  ? "Review groups and exceptions, keep what matters, and inspect the evidence before saving a snapshot."
+                  : page === "demo"
+                    ? "Review, restore, or permanently remove files created only for this demo. Each operation needs its own native confirmation."
+                    : page === "edit"
+                      ? "Choose what to include. The plan totals update from the current revision."
+                      : native
+                        ? "This immutable snapshot records the decisions you reviewed."
+                        : "This unsaved preview shows how the current decisions fit together."}
             </p>
           </div>
           {page === "review" && (
@@ -454,7 +486,7 @@ export default function App() {
             disappear when this page reloads
           </div>
         )}
-        {error && (
+        {error && page !== "explore" && page !== "advanced" && (
           <div className="error-banner" role="alert">
             <CircleAlert size={16} />
             <span>{error}</span>
@@ -467,8 +499,15 @@ export default function App() {
             </button>
           </div>
         )}
-        {page === "advanced" ? (
+        {page === "explore" ? (
+          <FolderInventoryPanel
+            onOpenPlan={() => setPage("advanced")}
+            native={native}
+            onBusyChange={setInventoryBusy}
+          />
+        ) : page === "advanced" ? (
           <GeneralPlanWorkspace
+            initialProfile="live"
             native={native}
             onBusyChange={setGeneralBusy}
             onSummaryChange={setGeneralSummary}
@@ -476,16 +515,18 @@ export default function App() {
         ) : page === "demo" ? (
           <DemoLifecyclePanel
             plan={{
-              revisionId: plan.revisionId,
-              actions: plan.actions.map(({ id, label, bytes, decision }) => ({
-                id,
-                label,
-                bytes,
-                decision,
-              })),
-              selectedCount: plan.selectedCount,
-              selectedBytes: plan.selectedBytes,
-              totalBytes: plan.totalBytes,
+              revisionId: displayedExample.revisionId,
+              actions: displayedExample.actions.map(
+                ({ id, label, bytes, decision }) => ({
+                  id,
+                  label,
+                  bytes,
+                  decision,
+                }),
+              ),
+              selectedCount: displayedExample.selectedCount,
+              selectedBytes: displayedExample.selectedBytes,
+              totalBytes: displayedExample.totalBytes,
             }}
             native={native}
             planBusy={pending}
@@ -501,8 +542,8 @@ export default function App() {
                 <div>
                   <h2>Cleanup actions</h2>
                   <p>
-                    {plan.actions.length} actions · Revision{" "}
-                    {plan.revisionNumber}
+                    {displayedExample.actions.length} actions · Revision{" "}
+                    {displayedExample.revisionNumber}
                   </p>
                 </div>
                 <span
@@ -517,7 +558,7 @@ export default function App() {
                 aria-label="Actions"
                 onKeyDown={keySelect}
               >
-                {plan.actions.map((action, index) => (
+                {displayedExample.actions.map((action, index) => (
                   <button
                     key={action.id}
                     ref={(node) => {
@@ -562,10 +603,11 @@ export default function App() {
               <div className="totals-row" role="status" aria-live="polite">
                 <div>
                   <small>Included in example</small>
-                  <strong>{fmt(plan.selectedBytes)}</strong>
+                  <strong>{fmt(displayedExample.selectedBytes)}</strong>
                 </div>
                 <span>
-                  {plan.selectedCount} of {plan.actions.length} actions
+                  {displayedExample.selectedCount} of{" "}
+                  {displayedExample.actions.length} actions
                 </span>
               </div>
               <div className="panel-actions">
@@ -584,7 +626,7 @@ export default function App() {
                     pending ||
                     workspaceBusy ||
                     needsRefresh ||
-                    plan.selectedCount === 0
+                    displayedExample.selectedCount === 0
                   }
                 >
                   {native ? "Save review" : "Preview review"}
@@ -597,7 +639,7 @@ export default function App() {
                   review.
                 </p>
               )}
-              {plan.selectedCount === 0 && (
+              {displayedExample.selectedCount === 0 && (
                 <p className="inline-help">
                   Include at least one action to save a review.
                 </p>
@@ -758,9 +800,11 @@ export default function App() {
           )
         )}
         <footer className="footnote">
-          {page === "demo"
-            ? "Only app-created demo fixtures · permanent removal requires separate review and native confirmation"
-            : "Metadata review only · this plan cannot authorize staging or cleanup"}
+          {page === "explore"
+            ? "Read-only immediate folder entries · nested contents and recoverable space remain unknown"
+            : page === "demo"
+              ? "Only app-created demo fixtures · permanent removal requires separate review and native confirmation"
+              : "Metadata review only · this plan cannot authorize staging or cleanup"}
         </footer>
       </main>
     </div>
@@ -790,7 +834,10 @@ function previewReview(plan: Plan): Review {
     revisionId: plan.revisionId,
     revisionNumber: plan.revisionNumber,
     manifestSha256: "0".repeat(64),
-    actions: plan.actions.map((a) => ({ ...a, evidence: [...a.evidence] })),
+    actions: plan.actions.map((a) => ({
+      ...a,
+      evidence: [...a.evidence],
+    })),
     totalBytes: plan.totalBytes,
     selectedBytes: plan.selectedBytes,
     selectedCount: plan.selectedCount,
