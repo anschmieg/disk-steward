@@ -15,7 +15,7 @@ const MAX_GIT_OUT: usize = 65_536;
 const MAX_PACK: usize = 512;
 // Setup and receiver verification run outside the HTTP attempt. Shared CI can
 // take longer to start a cold system Git; keep RPC supervision at three seconds.
-const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(10);
+const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(30);
 const GIT_RPC_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 
@@ -432,6 +432,7 @@ fn git_upload_pack(root: &PrivateRoot, args: &[&str], input: &[u8]) -> io::Resul
 }
 
 const VERIFICATION_COMPLETE: &[u8] = b"DISK_STEWARD_GIT_VERIFICATION_COMPLETE\n";
+const NATIVE_DELTA_COMPLETE: &[u8] = b"DISK_STEWARD_NATIVE_DELTA_COMPLETE\n";
 
 #[test]
 fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
@@ -452,6 +453,161 @@ fn real_git_verification_child() {
     let mut stdout = io::stdout();
     stdout.write_all(VERIFICATION_COMPLETE).unwrap();
     stdout.flush().unwrap();
+}
+
+#[test]
+fn native_git_delta_pack_decode_is_supervised() {
+    let receipt = super::completion_supervision::supervise(
+        "tests::git_interop::native_git_delta_decode_child",
+        NATIVE_DELTA_COMPLETE,
+        Duration::from_secs(30),
+    )
+    .expect("bounded native-Git delta verification child must complete");
+    assert!(receipt.reader_joined);
+    assert!(receipt.bytes > NATIVE_DELTA_COMPLETE.len() && receipt.bytes <= 1024);
+}
+
+#[test]
+#[ignore = "selected only by the exact native-Git delta verification supervisor"]
+fn native_git_delta_decode_child() {
+    run_native_git_delta_decode();
+    let mut stdout = io::stdout();
+    stdout.write_all(NATIVE_DELTA_COMPLETE).unwrap();
+    stdout.flush().unwrap();
+}
+
+fn run_native_git_delta_decode() {
+    let root = PrivateRoot::create().unwrap();
+    let (source, first_id, second_id, first_content, second_content) = make_delta_blobs(&root);
+    let object_ids = format!("{first_id}\n{second_id}\n").into_bytes();
+    assert!(object_ids.len() <= MAX_GIT_IN);
+    let cancellation = CancellationHandle::new();
+
+    for (name, extra_args, expect_offset_delta) in [
+        ("offset-delta", vec!["--delta-base-offset"], true),
+        ("reference-delta", vec![], false),
+    ] {
+        let mut args = vec![
+            "-C",
+            &source,
+            "pack-objects",
+            "--stdout",
+            "--window=10",
+            "--depth=10",
+            "--no-reuse-delta",
+            "--no-reuse-object",
+            "--compression=0",
+            "--threads=1",
+        ];
+        args.extend(extra_args);
+        let pack = checked_git(&root, &args, &object_ids).unwrap();
+        assert!(
+            !pack.is_empty() && pack.len() <= MAX_PACK && pack.len() <= MAX_GIT_IN,
+            "native {name} pack must fit the unchanged bounded fixture input"
+        );
+        let decoded = decode_sha1_pack(
+            &pack,
+            4096,
+            &cancellation,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(decoded.objects().len(), 2, "native {name} object count");
+        let delta = decoded
+            .objects()
+            .iter()
+            .find(|object| object.delta_depth() > 0)
+            .unwrap_or_else(|| panic!("native {name} pack did not contain a delta"));
+        let header =
+            parse_sha1_pack_entry_header(&pack[delta.offset() as usize..], delta.offset(), 4096)
+                .unwrap();
+        let has_expected_delta_kind = matches!(
+            (expect_offset_delta, header.kind()),
+            (true, PackEntryKind::OffsetDelta { .. })
+                | (false, PackEntryKind::ReferenceDelta { .. })
+        );
+        assert!(
+            has_expected_delta_kind,
+            "native {name} pack encoded an unexpected delta kind"
+        );
+
+        for (oid, expected_content) in [
+            (first_id.as_str(), first_content.as_slice()),
+            (second_id.as_str(), second_content.as_slice()),
+        ] {
+            let expected =
+                checked_git(&root, &["-C", &source, "cat-file", "blob", oid], b"").unwrap();
+            let object = decoded
+                .objects()
+                .iter()
+                .find(|object| object.oid() == &hex_oid(oid))
+                .unwrap_or_else(|| panic!("native {name} pack missed fixture blob"));
+            assert_eq!(object.kind(), GitObjectKind::Blob);
+            assert_eq!(object.content(), expected_content);
+            assert_eq!(object.content(), expected);
+        }
+
+        let receiver = create_receiver(&root, &format!("{name}.git")).unwrap();
+        let receiver_arg = receiver_path_arg(&receiver).unwrap();
+        checked_git(
+            &root,
+            &[
+                "--git-dir",
+                receiver_arg,
+                "index-pack",
+                "--strict",
+                "--stdin",
+            ],
+            &pack,
+        )
+        .unwrap();
+        for oid in [&first_id, &second_id] {
+            let stored = checked_git(
+                &root,
+                &["--git-dir", receiver_arg, "cat-file", "blob", oid],
+                b"",
+            )
+            .unwrap();
+            let source_content =
+                checked_git(&root, &["-C", &source, "cat-file", "blob", oid], b"").unwrap();
+            assert_eq!(stored, source_content);
+        }
+    }
+}
+
+fn make_delta_blobs(root: &PrivateRoot) -> (String, String, String, Vec<u8>, Vec<u8>) {
+    let repo = create_receiver(root, "delta-source.git").unwrap();
+    let repo = receiver_path_arg(&repo).unwrap().to_owned();
+    let mut first_content = Vec::with_capacity(384);
+    let mut state = 0x8f31_7a2du32;
+    for _ in 0..384 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        first_content.push(state as u8);
+    }
+    let mut second_content = first_content.clone();
+    second_content[191] ^= 0x5a;
+
+    let first_id = object_id(
+        &checked_git(
+            root,
+            &["-C", &repo, "hash-object", "-w", "--stdin"],
+            &first_content,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let second_id = object_id(
+        &checked_git(
+            root,
+            &["-C", &repo, "hash-object", "-w", "--stdin"],
+            &second_content,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    (repo, first_id, second_id, first_content, second_content)
 }
 
 fn capture_fixture_ref_manifest(root: &PrivateRoot, source_repo: &str) -> RequiredRefManifest {
@@ -534,7 +690,7 @@ fn run_real_git_verification() {
     let server_tls = tls.server.clone();
     let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let fetch_transport = candidate_transport(fetch_repository, &tls, address);
-    let mut pack_sink = BudgetFileSink::new(&root, fetch_transport.cancellation_handle()).unwrap();
+    let mut pack_sink = BudgetFileSink::new_for_transport(&root, &fetch_transport).unwrap();
     let inspection_repo = repo.clone();
     let expected_commit = commit.clone();
     let expected_tag = tag_object.clone();
@@ -612,6 +768,10 @@ fn run_real_git_verification() {
     let advertised_closure = pack_sink
         .decode_download(&fetch_report, 4096, Instant::now() + Duration::from_secs(5))
         .unwrap();
+    assert_eq!(
+        pack_sink.ingress_bytes_charged(),
+        fetch_report.finalization().observed_ingress_bytes()
+    );
     let pack = pack_sink.contents().unwrap();
     let checksum = check_sha1_pack_checksum(
         &mut std::io::Cursor::new(&pack),
@@ -1136,20 +1296,77 @@ fn hex_oid(value: &str) -> [u8; 20] {
 }
 
 #[test]
+fn live_ingress_busy_refuses_pack_write_without_charging_or_writing() {
+    let root = PrivateRoot::create().unwrap();
+    let (transport, server) =
+        super::pack_tests::pack_fixture(super::pack_tests::pack_body(b"PACKbusy-counter-fixture"));
+    let counter = transport.budget.used.clone();
+    let signal = transport.cancellation_handle();
+    let mut sink = BudgetFileSink::new_for_transport(&root, &transport).unwrap();
+
+    // Complete and join the local transport fixture before holding the shared
+    // counter lock, so a failed assertion cannot strand network cleanup.
+    let report = transport.download_advertised_pack(&mut Vec::new()).unwrap();
+    server.join().unwrap();
+    let observed = report.finalization().observed_ingress_bytes();
+    assert!(observed > 0);
+
+    let held = counter.lock().unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let result = sink.write(b"PACKmust-not-be-written");
+        let charged_storage = sink.bytes_charged();
+        let charged_ingress = sink.ingress_bytes_charged();
+        let contents = sink.contents().unwrap();
+        let _ = finished_tx.send(());
+        (result, charged_storage, charged_ingress, contents, sink)
+    });
+    let completed_before_unlock = finished_rx.recv_timeout(Duration::from_secs(1));
+    // Always release the counter before joining/asserting, including if a
+    // regression makes the sink block in the observer.
+    drop(held);
+    let (write_result, charged_storage, charged_ingress, contents, mut sink) =
+        writer.join().unwrap();
+
+    assert!(completed_before_unlock.is_ok());
+    let error = write_result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(error.to_string(), "transport ingress observation busy");
+    assert_eq!(charged_storage, 0);
+    assert_eq!(charged_ingress, 0);
+    assert!(contents.is_empty());
+    assert!(signal.is_cancelled());
+    // Contention refusal must not hide already observed bytes at finalization.
+    sink.reconcile_transfer_ingress(&report).unwrap();
+    assert_eq!(sink.ingress_bytes_charged(), observed);
+    assert!(signal.is_cancelled());
+    assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+    drop(sink);
+    assert_durable_reservation_blocks_reopen(&root);
+}
+
+#[test]
 fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
     let root = PrivateRoot::create().unwrap();
     let mut body = super::ref_packet(b"packfile\n");
     body.extend(super::ref_packet(b"\x01PACKfixture"));
     body.extend_from_slice(b"0000");
     let (transport, server) = super::pack_tests::pack_fixture(body);
-    let mut sink =
-        BudgetFileSink::new_with_limit(&root, transport.cancellation_handle(), 5).unwrap();
+    let mut sink = BudgetFileSink::new_with_limit_for_transport(&root, &transport, 5).unwrap();
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
     assert!(report.advertised_refs().is_none());
     assert_eq!(sink.contents().unwrap(), b"PACKf");
     assert_eq!(report.bytes_written(), 5);
+    assert!(sink
+        .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+        .is_err());
+    assert_eq!(
+        sink.ingress_bytes_charged(),
+        report.finalization().observed_ingress_bytes()
+    );
+    assert!(sink.ingress_bytes_charged() > report.bytes_written());
     let partial_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
     assert!(
         sink.bytes_charged()
