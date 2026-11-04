@@ -1,0 +1,5 @@
+# M0 bounded SHA-1 commit links
+
+Inactive structural parser: tree ID, ordered parent IDs, required author/committer header presence, optional header and continuation framing, and message boundary. Hard16MiB input/64KiB header/8192byte line/2048physical header lines/1024parents; caller may lower parent count. Canonical lowercase40hex nonzero IDs, duplicate/misplaced core-header refusal, NUL/CR header refusal, fallible bounded parent allocation and cooperative controls. Optional signature/mergetag fields remain uninterpreted; message is opaque and unscanned after separator.
+
+No commit identity/type binding, author/timestamp/signature validation, full fsck, referenced-object presence/type, tag parsing, graph completeness or cleanup authority. Strict experimental subset can reject historical/noncanonical objects. No paths/network/renderer/execution interfaces. Luna new commit.rs/root API/source review/adversarial tests/real Git root+merge correspondence. Branch atop6741326dc/main baselinec5997b2, preserve local notes/watches/0.0.x/no releases/no overlapping builds. Primary Git Objects and gitformat-signature documentation.
