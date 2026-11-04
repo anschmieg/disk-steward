@@ -1,0 +1,9 @@
+# Record advisory page observation windows
+
+From PR1294d62447 with main as eventual integration baseline. Advance R2.1 evidence freshness by capturing a device-clock start/finish window and monotonic elapsed milliseconds for each bounded folder page, including paging, refresh and resumed checkpoint pages. Serialize checked Unix milliseconds as optional decimal strings; clock values before the Unix epoch or outside u64 are unknown rather than zero. These fields never establish freshness, eligibility or approval authority.
+
+Display UTC timestamps and exact measured duration. Unknown/unrenderable clock values are unavailable; a backward device-clock window is explicitly uncertain while monotonic duration remains independent. No automatic age timer or stale-state transition is inferred from advisory clocks. Failed refresh keeps the previous observation and timing; successful observation replacement gets a new window. Preserve the recorded window in imported frozen metadata evidence without changing the saved-plan or checkpoint schema. Do not retroactively timestamp old observations.
+
+No new source access, contents, renderer paths, provider credentials, source writes, cleanup eligibility or releases. Timing spans cooperative native page work, not an atomic filesystem snapshot or a guarantee that data stayed unchanged afterward. Subtree timing, detector-specific expiry, trusted time, native clock adjustment behavior and full MVP acceptance are outside this slice.
+
+Validate conversion/serialization/elapsed behavior, imported timing retention, unknown/backward/out-of-display-range handling and failed-refresh UI preservation; run native suite/strict Clippy/formatting and frontend tests/types/build. Durable recursive recovery, detector lifecycle, native usability/accessibility, performance and release gates remain open. Actual MVP delivery still requires final adversarial review/fixes/validation and automation disable/stop.
