@@ -68,7 +68,7 @@ enum StopReason {
     ReaderError,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReaderEvent {
     Ready,
     Finished { bytes: u64, failed: bool },
@@ -909,6 +909,7 @@ fn read_bounded<R: Read>(mut reader: R, sender: SyncSender<ReaderEvent>) {
     let mut bytes = 0_u64;
     let mut signaled_ready = false;
     let mut failed = false;
+    let mut interruptions = 0_u8;
     let mut buffer = [0_u8; READ_CHUNK];
     while bytes <= OUTPUT_LIMIT {
         let remaining = OUTPUT_LIMIT.saturating_add(1).saturating_sub(bytes) as usize;
@@ -918,13 +919,23 @@ fn read_bounded<R: Read>(mut reader: R, sender: SyncSender<ReaderEvent>) {
             Ok(count) => {
                 bytes = bytes.saturating_add(count as u64);
                 if !signaled_ready {
+                    if buffer[0] != b'R' {
+                        failed = true;
+                        break;
+                    }
                     if sender.send(ReaderEvent::Ready).is_err() {
                         return;
                     }
                     signaled_ready = true;
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                interruptions = interruptions.saturating_add(1);
+                if interruptions > 16 {
+                    failed = true;
+                    break;
+                }
+            }
             Err(_) => {
                 failed = true;
                 break;
@@ -1004,6 +1015,167 @@ fn finish_after_error<T>(
         (Err(cleanup_error), false) => Err(format!(
             "{error}; cleanup failed: {cleanup_error}; stdout reader thread panicked"
         )),
+    }
+}
+
+#[cfg(test)]
+mod bounded_reader_tests {
+    use super::{await_readiness, read_bounded, ReaderEvent, OUTPUT_LIMIT};
+    use std::collections::VecDeque;
+    use std::io::{self, Read};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    enum Action {
+        Bytes(Vec<u8>),
+        Interrupted,
+        Eof,
+    }
+
+    struct ScriptedReader(VecDeque<Action>);
+
+    impl ScriptedReader {
+        fn new(actions: impl IntoIterator<Item = Action>) -> Self {
+            Self(actions.into_iter().collect())
+        }
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front().unwrap_or(Action::Eof) {
+                Action::Bytes(mut bytes) => {
+                    let count = bytes.len().min(buffer.len());
+                    buffer[..count].copy_from_slice(&bytes[..count]);
+                    if count < bytes.len() {
+                        bytes.drain(..count);
+                        self.0.push_front(Action::Bytes(bytes));
+                    }
+                    Ok(count)
+                }
+                Action::Interrupted => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Action::Eof => Ok(0),
+            }
+        }
+    }
+
+    fn collect(actions: impl IntoIterator<Item = Action>) -> Vec<ReaderEvent> {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        read_bounded(ScriptedReader::new(actions), sender);
+        receiver.try_iter().collect()
+    }
+
+    #[test]
+    fn readiness_requires_exact_first_r_and_counts_rejected_bytes() {
+        let events = collect([Action::Bytes(vec![b'X', b'R']), Action::Eof]);
+        assert_eq!(
+            events,
+            [ReaderEvent::Finished {
+                bytes: 2,
+                failed: true
+            }]
+        );
+        let (sender, receiver) = mpsc::sync_channel(2);
+        read_bounded(
+            ScriptedReader::new([Action::Bytes(vec![b'X']), Action::Eof]),
+            sender,
+        );
+        assert!(await_readiness(&receiver, Instant::now() + Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn readiness_accepts_empty_eof_only_as_completion_and_exact_r() {
+        assert_eq!(
+            collect([Action::Eof]),
+            [ReaderEvent::Finished {
+                bytes: 0,
+                failed: false
+            }]
+        );
+        assert_eq!(
+            collect([Action::Bytes(vec![b'R']), Action::Eof]),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 1,
+                    failed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_accepts_split_r_then_data_and_counts_all_bytes() {
+        assert_eq!(
+            collect([
+                Action::Bytes(vec![b'R']),
+                Action::Bytes(b"data".to_vec()),
+                Action::Eof,
+            ]),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 5,
+                    failed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_reads_have_a_cumulative_sixteen_retry_bound() {
+        let mut permitted = vec![Action::Interrupted; 16];
+        permitted.extend([Action::Bytes(vec![b'R']), Action::Eof]);
+        assert_eq!(
+            collect(permitted),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 1,
+                    failed: false
+                }
+            ]
+        );
+
+        let mut refused = vec![Action::Interrupted; 17];
+        refused.extend([Action::Bytes(vec![b'R']), Action::Eof]);
+        assert_eq!(
+            collect(refused),
+            [ReaderEvent::Finished {
+                bytes: 0,
+                failed: true
+            }]
+        );
+    }
+
+    #[test]
+    fn interruptions_after_readiness_remain_cumulative_and_output_cap_is_exact() {
+        let mut actions = vec![Action::Interrupted; 8];
+        actions.push(Action::Bytes(vec![b'R', b'x']));
+        actions.extend(vec![Action::Interrupted; 9]);
+        assert_eq!(
+            collect(actions),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 2,
+                    failed: true
+                }
+            ]
+        );
+
+        let mut allowed = vec![Action::Interrupted; 16];
+        allowed.push(Action::Bytes(vec![b'R'; OUTPUT_LIMIT as usize + 1]));
+        assert_eq!(
+            collect(allowed),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: OUTPUT_LIMIT + 1,
+                    failed: false
+                }
+            ]
+        );
     }
 }
 

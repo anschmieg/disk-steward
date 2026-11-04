@@ -14,6 +14,13 @@ reading after 64 KiB plus one byte, and applies a one-second monotonic deadline.
 On either limit it kills the child, waits for its exit, and joins the reader
 before reporting success.
 
+The shared stdout reader accepts readiness only when the first byte is exactly
+`R`. Other first bytes fail the reader without emitting readiness. Empty EOF
+remains a zero-byte completion for the fixed partial-write failure case.
+Interrupted reads have a cumulative allowance of sixteen; the seventeenth
+fails, and successful reads do not reset the allowance. These checks bound
+protocol handling, not the duration of a blocking OS read or arbitrary peers.
+
 The executable path comes only from `current_exe()`. The stdout parent cases accept none or `--run`; the private child dispatcher accepts only the two
 fixed modes. These stdout cases have no data-file, network, credential, shell, or renderer
 operations, and their children create no descendants.
