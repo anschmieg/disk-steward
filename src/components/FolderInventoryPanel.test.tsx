@@ -817,7 +817,11 @@ test("resume loads only the typed checkpoint and updates scope only after native
     request: { expectedCheckpointId: "checkpoint-1" },
   });
   expect(screen.getByRole("table")).toHaveTextContent("Alpha");
-  expect(screen.getByRole("heading", { name: "Chosen folder" })).toHaveFocus();
+  await waitFor(() => {
+    expect(
+      screen.getByRole("heading", { name: "Chosen folder" }),
+    ).toHaveFocus();
+  });
 });
 
 test("canceled resume and failed checkpoint operations preserve historical page and saved checkpoint", async () => {
