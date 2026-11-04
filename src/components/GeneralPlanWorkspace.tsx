@@ -19,19 +19,21 @@ export type GeneralPlanSummary = {
   selectedBytes: number;
   selectedCount: number;
 };
-type Profile = "pilot" | "stress";
+type Profile = "live" | "pilot" | "stress";
 type Props = {
   native: boolean;
+  initialProfile?: Profile;
   onBusyChange: (busy: boolean) => void;
   onSummaryChange: (summary: GeneralPlanSummary | null) => void;
 };
 
 export default function GeneralPlanWorkspace({
   native,
+  initialProfile = "pilot",
   onBusyChange,
   onSummaryChange,
 }: Props) {
-  const [profile, setProfile] = useState<Profile>("pilot");
+  const [profile, setProfile] = useState<Profile>(initialProfile);
   const [snapshot, setSnapshot] = useState<EditorSnapshot | null>(null);
   const [savedReview, setSavedReview] = useState<EditorFrozenReview | null>(
     null,
@@ -267,7 +269,7 @@ export default function GeneralPlanWorkspace({
     >
       <div className="general-toolbar">
         <label>
-          Example workspace{" "}
+          Review workspace{" "}
           <select
             value={profile}
             disabled={busy || showReview || recorder.phase === "recording"}
@@ -282,12 +284,15 @@ export default function GeneralPlanWorkspace({
               setProfile(event.target.value as Profile);
             }}
           >
+            <option value="live">Your plan · observed metadata</option>
             <option value="pilot">1,000 findings · 25 groups</option>
             <option value="stress">10,000 findings · 25 groups</option>
           </select>
         </label>
         <span>
-          Example inventory · optional selected-item metadata · no content reads
+          {profile === "live"
+            ? "Your observed metadata · all imported entries blocked from cleanup"
+            : "Example inventory · optional selected-item metadata · no content reads"}
         </span>
         <button
           className="ap-button quiet"
@@ -362,6 +367,13 @@ export default function GeneralPlanWorkspace({
           {notice}
         </p>
       )}
+      {profile === "live" && (
+        <p className="general-notice">
+          {snapshot?.items.length === 0
+            ? "Your plan is empty. Explore a folder and explicitly add observed entries to begin."
+            : "This plan contains historical observed metadata. Repeated observations may describe the same files; totals count review entries, not occupied or recoverable space. All imported entries remain blocked from cleanup."}
+        </p>
+      )}
       {display && <ExclusionsPanel busy={busy} run={request} />}
       {display ? (
         <AdvancedPlanPanel
@@ -388,13 +400,13 @@ export default function GeneralPlanWorkspace({
         />
       ) : (
         <div className="general-loading" role={error ? "alert" : "status"}>
-          <p>{error || "Loading the example editor…"}</p>
+          <p>{error || "Loading the review editor…"}</p>
           <button
             className="ap-button quiet"
             disabled={busy}
             onClick={() => void refresh()}
           >
-            Refresh example
+            Refresh plan
           </button>
         </div>
       )}
@@ -440,5 +452,5 @@ function messageFor(error: unknown): string {
     typeof error.message === "string"
   )
     return error.message;
-  return "The saved state could not be confirmed. Refresh the example before continuing.";
+  return "The saved state could not be confirmed. Refresh the plan before continuing.";
 }
