@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-folder-tree-summary"
+description = "Enables the inspect_folder_tree_summary command without any pre-configured scope."
+commands.allow = ["inspect_folder_tree_summary"]
+
+[[permission]]
+identifier = "deny-inspect-folder-tree-summary"
+description = "Denies the inspect_folder_tree_summary command without any pre-configured scope."
+commands.deny = ["inspect_folder_tree_summary"]
