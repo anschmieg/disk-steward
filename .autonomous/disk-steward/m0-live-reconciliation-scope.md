@@ -1,0 +1,11 @@
+# M0: persist incomplete store state before restart
+
+Add a trusted backend registry operation to classify a live incomplete attempt as NeedsReconciliation without waiting for the owner to drop and reopen the database. Under the existing exclusive lease and immediate validated transaction, require an exact expected nonterminal state (Registered, Active, Stopped or CleanupPending), then record NeedsReconciliation with that state as prior_state. Preserve the store ID, parent/root identities and entire reservation. Reject stale, missing, invalid, already-reconciling and completed cases without mutation.
+
+This is a one-way refusal operation, not reconciliation, adoption, retry, reservation release, removal or proof that a worker stopped. Existing lifecycle transitions remain unchanged. The existing global admission check must immediately reject reservations while any row needs reconciliation, including reservations for a different registered row. Reopening must preserve the original prior_state and reservation. No schema change or renderer command is added; unsupported platforms retain refusal stubs.
+
+Integrate the fixed partial-payload supervisor only after exact child stop/reap/reader join, matching stop receipt and retained prefix readback. Persist the incomplete registry classification and check it before drop/reopen. Require immediate reservation-growth and retry refusal; reopening must retain the same identities, prior Registered state and 128 KiB reservation. Complete-payload and descriptor-only modes keep their existing behavior. The partial file remains retained and cleanup remains unauthorized.
+
+This contributes to tasks0.1/0.3 and R5.5/R5.8. It establishes live failure bookkeeping and conservative admission blocking, not whole-store measurements, durable observed-byte accounting, production Git integration, OS containment, power-loss recovery, authentication, preservation or milestone completion. Main remains eventual integration baseline; branch builds on PR93. Versions remain0.0.x/no release.
+
+The global refusal applies to new reservation admissions through this registry. It does not cancel already-running jobs or revoke directory capabilities, and registry state alone is never shutdown or cleanup evidence.
