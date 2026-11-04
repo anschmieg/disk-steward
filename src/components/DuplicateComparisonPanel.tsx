@@ -1,5 +1,6 @@
 import { useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { EditorSnapshot } from "../general-plan-contract";
 import type { FolderInventory } from "./FolderInventoryPanel";
 import "./DuplicateComparisonPanel.css";
 
@@ -140,15 +141,18 @@ export default function DuplicateComparisonPanel({
   native,
   busy,
   onBusyChange,
+  onOpenPlan,
 }: {
   snapshot: FolderInventory;
   native: boolean;
   busy: boolean;
   onBusyChange: (busy: boolean) => void;
+  onOpenPlan?: () => void;
 }) {
   const headingId = useId();
   const consentId = useId();
   const activeAttempt = useRef<ActiveAttempt | null>(null);
+  const importPendingRef = useRef(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [contentConsent, setContentConsent] = useState(false);
   const [running, setRunning] = useState(false);
@@ -158,6 +162,10 @@ export default function DuplicateComparisonPanel({
   const [result, setResult] = useState<ComparisonResult | null>(null);
   const [resultSelection, setResultSelection] = useState<string[]>([]);
   const [resultHistorical, setResultHistorical] = useState(false);
+  const [importPending, setImportPending] = useState(false);
+  const [importedComparisonId, setImportedComparisonId] = useState<
+    string | null
+  >(null);
   const [message, setMessage] = useState("");
   const regularFiles = snapshot.entries.filter(
     (entry) => entry.kind === "file",
@@ -178,7 +186,8 @@ export default function DuplicateComparisonPanel({
       resultSelection.some((id) => !selectedIds.includes(id)));
 
   const toggleSelection = (id: string, checked: boolean) => {
-    if (running || busy || activeAttempt.current) return;
+    if (running || busy || activeAttempt.current || importPendingRef.current)
+      return;
     const next = checked
       ? [...selectedIds, id]
       : selectedIds.filter((selected) => selected !== id);
@@ -192,6 +201,7 @@ export default function DuplicateComparisonPanel({
     if (
       !native ||
       activeAttempt.current !== null ||
+      importPendingRef.current ||
       busy ||
       running ||
       !contentConsent ||
@@ -210,6 +220,7 @@ export default function DuplicateComparisonPanel({
     setMessage("");
     setContentConsent(false);
     if (result) setResultHistorical(true);
+    setImportedComparisonId(null);
     onBusyChange(true);
     const ids = [...selectedIds];
     try {
@@ -225,6 +236,7 @@ export default function DuplicateComparisonPanel({
       setResult(verified);
       setResultSelection(ids);
       setResultHistorical(false);
+      setImportedComparisonId(null);
       setMessage(
         verified.groups.length
           ? `Comparison completed for ${verified.filesCompared} explicitly selected files.`
@@ -238,6 +250,49 @@ export default function DuplicateComparisonPanel({
       if (activeAttempt.current === attempt) activeAttempt.current = null;
       setRunning(false);
       setCancelPhase("ready");
+      onBusyChange(false);
+    }
+  };
+
+  const importGroups = async () => {
+    if (
+      !native ||
+      busy ||
+      running ||
+      importPendingRef.current ||
+      activeAttempt.current ||
+      !result ||
+      historical ||
+      result.groups.length === 0 ||
+      importedComparisonId === result.comparisonId
+    )
+      return;
+    importPendingRef.current = true;
+    setImportPending(true);
+    setMessage("");
+    onBusyChange(true);
+    try {
+      const before = await invoke<EditorSnapshot>("get_general_plan", {
+        request: { profile: "live" },
+      });
+      await invoke<EditorSnapshot>("import_duplicate_review_items", {
+        request: {
+          expectedObservationId: snapshot.observationId,
+          comparisonId: result.comparisonId,
+          expectedRevisionId: before.revisionId,
+        },
+      });
+      setImportedComparisonId(result.comparisonId);
+      setMessage(
+        "Matching evidence was saved to your local review plan. New review items default to Keep; existing choices are preserved. No survivor was chosen automatically, duplicate items remain blocked, and no files were changed or executed.",
+      );
+    } catch {
+      setMessage(
+        "The plan import could not be verified. Your comparison evidence and selection remain; open your plan to check its latest state before trying again.",
+      );
+    } finally {
+      importPendingRef.current = false;
+      setImportPending(false);
       onBusyChange(false);
     }
   };
@@ -275,7 +330,7 @@ export default function DuplicateComparisonPanel({
     <section
       className="duplicate-comparison"
       aria-labelledby={headingId}
-      aria-busy={running}
+      aria-busy={busy || running || importPending}
     >
       <h3 id={headingId}>Compare selected files for exact matches</h3>
       <p>
@@ -319,6 +374,7 @@ export default function DuplicateComparisonPanel({
               !native ||
               busy ||
               running ||
+              importPending ||
               Boolean(reason) ||
               wouldExceedTotal ||
               wouldExceedCount;
@@ -365,6 +421,7 @@ export default function DuplicateComparisonPanel({
             !native ||
             busy ||
             running ||
+            importPending ||
             selectedIds.length < 2 ||
             selectedBytes > MAX_INPUT_BYTES
           }
@@ -390,6 +447,7 @@ export default function DuplicateComparisonPanel({
           !native ||
           busy ||
           running ||
+          importPending ||
           !contentConsent ||
           selectedIds.length < 2 ||
           selectedBytes > MAX_INPUT_BYTES
@@ -448,11 +506,53 @@ export default function DuplicateComparisonPanel({
           )}
         </section>
       )}
+      {result && result.groups.length > 0 && !historical && (
+        <div className="duplicate-comparison__import-actions">
+          <p>
+            Adding groups saves matching names, logical sizes, and comparison
+            evidence locally. It does not save paths, digests, or contents.
+            Existing plan choices are preserved; no survivor is selected
+            automatically. Native import requires retained comparison proof from
+            the last five minutes; changed identity, metadata, or policy may
+            also cause refusal. Saved plan evidence remains historical and
+            non-executable after that proof expires.
+          </p>
+          <button
+            className="button secondary"
+            type="button"
+            disabled={
+              !native ||
+              busy ||
+              running ||
+              importPending ||
+              importedComparisonId === result.comparisonId
+            }
+            onClick={() => void importGroups()}
+          >
+            {importPending
+              ? "Adding matching groups…"
+              : importedComparisonId === result.comparisonId
+                ? "Matching groups added to plan"
+                : "Add matching groups to plan"}
+          </button>
+          {importedComparisonId === result.comparisonId && onOpenPlan && (
+            <button
+              className="button secondary"
+              type="button"
+              disabled={busy || importPending}
+              onClick={onOpenPlan}
+            >
+              Review matching groups in plan
+            </button>
+          )}
+        </div>
+      )}
       <p>
         Matching bytes are historical comparison evidence after native identity
         checks. They do not establish unique physical storage, reclaimable
-        space, or APFS clone sharing. This panel offers no survivor, cleanup, or
-        plan-eligibility action.
+        space, or APFS clone sharing. Adding evidence does not grant cleanup
+        authority. The review plan can record a survivor choice, but duplicate
+        items remain blocked and no execution is available.
       </p>
     </section>
   );

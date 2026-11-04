@@ -551,6 +551,35 @@ impl FolderInventoryState {
         Ok(items)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn duplicate_review_bundle(
+        &self,
+        expected_observation_id: InventoryItemId,
+        comparison_id: disk_steward_core::InventoryItemId,
+        policy: &crate::global_exclusions::SummaryExclusionPolicy,
+        revision: disk_steward_core::RevisionId,
+        started: Instant,
+        duration: Duration,
+    ) -> Result<
+        (
+            Vec<disk_steward_plan_model::InventoryItem>,
+            Vec<disk_steward_plan_model::DuplicateSet>,
+        ),
+        &'static str,
+    > {
+        let state = self.0.lock().map_err(|_| "observation_unavailable")?;
+        let session = state.as_ref().ok_or("observation_unavailable")?;
+        duplicate_compare::review_bundle(
+            session,
+            expected_observation_id,
+            comparison_id,
+            policy,
+            revision,
+            started,
+            duration,
+        )
+    }
+
     #[cfg(not(unix))]
     pub(crate) fn blocked_items_for_observation(
         &self,
@@ -594,6 +623,7 @@ struct Session {
     snapshot: FolderInventorySnapshot,
     cursor: Option<DirectoryCursor>,
     subtree_job: Option<subtree_job::SubtreeJob>,
+    duplicate_evidence: Option<duplicate_compare::RetainedComparison>,
 }
 
 #[cfg(not(unix))]
@@ -1279,6 +1309,7 @@ fn selected_root_session(
         snapshot: scanned.snapshot.clone(),
         cursor: scanned.cursor,
         subtree_job: None,
+        duplicate_evidence: None,
     };
     Ok((session, scanned.snapshot))
 }
@@ -1450,6 +1481,7 @@ fn navigate_session(
         validate_session_bindings(session, started, duration)?;
         session.frames.truncate(current_index);
         session.subtree_job = None;
+        session.duplicate_evidence = None;
         session.observation_id = scanned.snapshot.observation_id;
         session.entries = scanned.entries;
         session.snapshot = scanned.snapshot.clone();
@@ -1545,6 +1577,7 @@ fn navigate_session(
     validate_child_binding(parent, &child, session.root_device, started, duration)?;
     session.frames.push(child);
     session.subtree_job = None;
+    session.duplicate_evidence = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
@@ -1621,6 +1654,7 @@ fn continue_session(
         return Err(error);
     }
     session.subtree_job = None;
+    session.duplicate_evidence = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();
@@ -1668,6 +1702,7 @@ fn refresh_session(
     validate_session_bindings(session, started, duration)?;
 
     session.subtree_job = None;
+    session.duplicate_evidence = None;
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
     session.snapshot = scanned.snapshot.clone();

@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use super::duplicate_content::{self, ReadBudget};
 
+const RETAINED_REVIEW_TTL: Duration = Duration::from_secs(5 * 60);
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CompareRequest {
@@ -56,6 +58,14 @@ struct DuplicateGroup {
     logical_bytes: String,
 }
 
+pub(super) struct RetainedComparison {
+    comparison: Comparison,
+    exclusion_revision: RevisionId,
+    created_at: Instant,
+    items: Vec<disk_steward_plan_model::InventoryItem>,
+    duplicate_sets: Vec<disk_steward_plan_model::DuplicateSet>,
+}
+
 #[tauri::command]
 pub(crate) async fn compare_observed_files(
     folders: tauri::State<'_, FolderInventoryState>,
@@ -89,6 +99,8 @@ pub(crate) async fn compare_observed_files(
         {
             return Err("Folder observation is stale. Inspect it again.".into());
         }
+        // A new explicit attempt supersedes the previous importable proof immediately.
+        session.duplicate_evidence = None;
         check_summary_cancellation(cancellation)?;
         let (revision, policy) = exclusions
             .summary_policy(started, duration)
@@ -112,6 +124,11 @@ pub(crate) async fn compare_observed_files(
         }
         if started.elapsed() >= duration {
             return Err("Duplicate comparison exceeded its cooperative time limit.".into());
+        }
+        retain_after_success(session, &result, revision).map_err(str::to_owned)?;
+        if check_summary_cancellation(cancellation).is_err() || started.elapsed() >= duration {
+            session.duplicate_evidence = None;
+            return Err("Duplicate comparison ended without a current importable proof.".into());
         }
         Ok(result)
     })
@@ -368,6 +385,242 @@ fn compare_session(
     })
 }
 
+fn retain_after_success(
+    session: &mut Session,
+    comparison: &Comparison,
+    exclusion_revision: RevisionId,
+) -> Result<(), &'static str> {
+    use disk_steward_plan_model::{
+        Blocker, Choice, DuplicateSet, EvidenceRef, InventoryItem, ItemKind, Suggestion,
+    };
+
+    if comparison.observation_id != session.observation_id
+        || session.snapshot.observation_id != session.observation_id
+        || comparison.groups.len() > 16
+        || !(2..=32).contains(&comparison.files_compared)
+        || comparison.detector_version != "exact-regular-file-v1"
+    {
+        return Err("Duplicate comparison could not be retained for this observation.");
+    }
+    let observation_id = serde_json::to_value(session.observation_id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("Duplicate comparison could not be retained for this observation.")?;
+    let comparison_id = serde_json::to_value(comparison.comparison_id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("Duplicate comparison could not be retained for this observation.")?;
+    let mut items = Vec::new();
+    let mut duplicate_sets = Vec::with_capacity(comparison.groups.len());
+    let mut retained_ids = std::collections::HashSet::new();
+    for group in &comparison.groups {
+        if !(2..=32).contains(&group.entry_ids.len()) {
+            return Err("Duplicate comparison contained an invalid group.");
+        }
+        let group_size = group
+            .logical_bytes
+            .parse::<u64>()
+            .map_err(|_| "Duplicate comparison contained an invalid size.")?;
+        for entry_id in &group.entry_ids {
+            if !retained_ids.insert(*entry_id)
+                || retained_ids.len() > comparison.files_compared as usize
+            {
+                return Err("Duplicate comparison contained overlapping groups.");
+            }
+            let entry = session
+                .snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == *entry_id)
+                .ok_or("Duplicate comparison no longer matches the observation.")?;
+            let observed = session
+                .entries
+                .iter()
+                .find(|entry| entry.id == *entry_id)
+                .ok_or("Duplicate comparison no longer matches the observation.")?;
+            if entry.kind != "file"
+                || observed.file_type != FileType::RegularFile
+                || observed.identity.device != session.root_device
+                || observed.name.first() == Some(&b'.')
+                || observed.content_stamp.is_none()
+                || entry
+                    .logical_bytes
+                    .as_deref()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    != Some(group_size)
+            {
+                return Err("Duplicate comparison no longer matches the observed files.");
+            }
+            let evidence = format!(
+                "Selected-file comparison {comparison_id}, detector {}, observation {observation_id}: exact full-content match for {} files was verified at comparison time. Logical bytes per file: {}. This is historical evidence; import requires unchanged native metadata, without rereading contents; later changes remain unknown. APFS physical deduplication and reclaimable space are unknown. Cleanup eligibility is not established and no execution adapter is available.",
+                comparison.detector_version,
+                group.entry_ids.len(),
+                group.logical_bytes,
+            );
+            if evidence.len() > 2048 {
+                return Err("Duplicate comparison evidence exceeded its size limit.");
+            }
+            items.push(InventoryItem {
+                id: *entry_id,
+                parent_id: None,
+                label: entry.name.clone(),
+                kind: ItemKind::File,
+                logical_bytes: Some(group_size),
+                recovery_lower_bytes: None,
+                recovery_upper_bytes: None,
+                storage_identity: None,
+                blockers: vec![
+                    Blocker {
+                        code: "read_only_comparison".to_owned(),
+                        reason: "The duplicate match is evidence for review only; it does not establish that either copy is safe to remove.".to_owned(),
+                    },
+                    Blocker {
+                        code: "no_execution_adapter".to_owned(),
+                        reason: "No native cleanup adapter is available for this item.".to_owned(),
+                    },
+                ],
+                evidence: vec![EvidenceRef {
+                    id: disk_steward_core::EvidenceId::new(),
+                    summary: evidence,
+                }],
+                suggestion: Suggestion {
+                    choice: Choice::Keep,
+                    rationale: "Keep by default; a content match does not establish cleanup safety.".to_owned(),
+                },
+            });
+        }
+        duplicate_sets.push(DuplicateSet {
+            id: group.id,
+            item_ids: group.entry_ids.clone(),
+            survivor_id: None,
+        });
+    }
+    session.duplicate_evidence = Some(RetainedComparison {
+        comparison: comparison.clone(),
+        exclusion_revision,
+        created_at: Instant::now(),
+        items,
+        duplicate_sets,
+    });
+    Ok(())
+}
+
+pub(super) fn review_bundle(
+    session: &Session,
+    expected_observation_id: InventoryItemId,
+    comparison_id: InventoryItemId,
+    current_policy: &SummaryExclusionPolicy,
+    revision: RevisionId,
+    started: Instant,
+    duration: Duration,
+) -> Result<
+    (
+        Vec<disk_steward_plan_model::InventoryItem>,
+        Vec<disk_steward_plan_model::DuplicateSet>,
+    ),
+    &'static str,
+> {
+    let check_deadline = || {
+        if started.elapsed() >= duration {
+            Err("Duplicate evidence review exceeded its time limit.")
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
+    if session.observation_id != expected_observation_id
+        || session.snapshot.observation_id != expected_observation_id
+    {
+        return Err("Folder observation is stale.");
+    }
+    let retained = session
+        .duplicate_evidence
+        .as_ref()
+        .ok_or("No retained duplicate comparison is available.")?;
+    if retained.comparison.comparison_id != comparison_id
+        || retained.comparison.observation_id != expected_observation_id
+        || retained.exclusion_revision != revision
+        || retained.duplicate_sets.is_empty()
+        || retained.items.is_empty()
+        || retained.duplicate_sets.len() > 16
+        || retained.items.len() > 32
+    {
+        return Err("Duplicate comparison evidence is stale or unavailable.");
+    }
+    if started
+        .checked_duration_since(retained.created_at)
+        .is_none_or(|age| age >= RETAINED_REVIEW_TTL)
+    {
+        return Err("Duplicate comparison evidence expired. Compare the files again.");
+    }
+    validate_session_bindings(session, started, duration)?;
+    let frame = session
+        .frames
+        .last()
+        .ok_or("The current folder observation is unavailable.")?;
+    super::duplicate_scope::ensure_allowed(&frame.fd, started, duration)?;
+    current_policy.ensure_ancestor_scope_allowed(&frame.fd, started, duration)?;
+
+    let mut seen = std::collections::HashSet::new();
+    for set in &retained.duplicate_sets {
+        check_deadline()?;
+        if !(2..=32).contains(&set.item_ids.len()) {
+            return Err("Retained duplicate group is invalid.");
+        }
+        for item_id in &set.item_ids {
+            check_deadline()?;
+            if !seen.insert(*item_id) {
+                return Err("Retained duplicate groups overlap.");
+            }
+            let observed = session
+                .entries
+                .iter()
+                .find(|entry| entry.id == *item_id)
+                .ok_or("Duplicate evidence no longer matches the observation.")?;
+            let display = session
+                .snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == *item_id)
+                .ok_or("Duplicate evidence no longer matches the observation.")?;
+            if display.kind != "file"
+                || observed.file_type != FileType::RegularFile
+                || observed.identity.device != session.root_device
+                || observed.name.first() == Some(&b'.')
+                || is_managed_boundary(&observed.name)
+                || display.availability == "dataless"
+            {
+                return Err("Duplicate evidence no longer matches eligible observed files.");
+            }
+            let name = CString::new(observed.name.as_slice())
+                .map_err(|_| "Duplicate evidence name is unavailable.")?;
+            let stat = statat(&frame.fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| "A duplicate member changed since comparison.")?;
+            let current_stamp = super::checkpoint_replay::stamp(&stat)?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                || stat.st_dev as u64 != session.root_device
+                || identity(&stat) != observed.identity
+                || stat.st_nlink != 1
+                || is_dataless(&stat)
+                || observed.content_stamp.as_ref() != Some(&current_stamp)
+            {
+                return Err(
+                    "A duplicate member changed since comparison. Refresh and compare again.",
+                );
+            }
+        }
+    }
+    check_deadline()?;
+    validate_session_bindings(session, started, duration)?;
+    super::duplicate_scope::ensure_allowed(&frame.fd, started, duration)?;
+    current_policy.ensure_ancestor_scope_allowed(&frame.fd, started, duration)?;
+    check_deadline()?;
+    if retained.created_at.elapsed() >= RETAINED_REVIEW_TTL {
+        return Err("Duplicate comparison evidence expired. Compare the files again.");
+    }
+    Ok((retained.items.clone(), retained.duplicate_sets.clone()))
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -536,6 +789,198 @@ mod tests {
         let error = compare(&session, &ids).unwrap_err();
         assert!(error.contains("changed since its observation"));
         assert_eq!(std::fs::read(root.path().join("one")).unwrap(), b"diff");
+    }
+
+    #[test]
+    fn retained_review_bundle_contains_only_blocked_matched_metadata_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one"), b"same bytes").unwrap();
+        std::fs::write(root.path().join("two"), b"same bytes").unwrap();
+        std::fs::write(root.path().join("unmatched"), b"other data").unwrap();
+        let (mut session, ids) = fixture(root.path());
+        let revision = RevisionId::new();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
+        let result = compare_session(
+            &session,
+            &ids,
+            &policy,
+            revision,
+            &AtomicBool::new(false),
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .unwrap();
+        assert_eq!(result.groups.len(), 1);
+        retain_after_success(&mut session, &result, revision).unwrap();
+
+        let first = review_bundle(
+            &session,
+            session.observation_id,
+            result.comparison_id,
+            &policy,
+            revision,
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .unwrap();
+        let second = review_bundle(
+            &session,
+            session.observation_id,
+            result.comparison_id,
+            &policy,
+            revision,
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.0.len(), 2);
+        assert_eq!(first.1.len(), 1);
+        assert_eq!(first.1[0].survivor_id, None);
+        for item in &first.0 {
+            assert_eq!(
+                item.suggestion.choice,
+                disk_steward_plan_model::Choice::Keep
+            );
+            assert_eq!(item.parent_id, None);
+            assert_eq!(item.storage_identity, None);
+            assert_eq!(item.recovery_lower_bytes, None);
+            assert_eq!(item.recovery_upper_bytes, None);
+            assert!(item
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "read_only_comparison"));
+            assert!(item
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "no_execution_adapter"));
+            let evidence = &item.evidence[0].summary;
+            assert!(evidence.contains("exact full-content match"));
+            assert!(evidence.contains("APFS physical deduplication"));
+            assert!(evidence.len() <= 2048);
+            assert!(!evidence.contains(root.path().to_str().unwrap()));
+            assert!(!evidence.contains("same bytes"));
+            assert!(!evidence.contains("ba7816bf"));
+        }
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            InventoryItemId::new(),
+            &policy,
+            revision,
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .is_err());
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            result.comparison_id,
+            &policy,
+            RevisionId::new(),
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn changed_member_and_successful_refresh_invalidate_retained_proof() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one"), b"same").unwrap();
+        std::fs::write(root.path().join("two"), b"same").unwrap();
+        let (mut session, ids) = fixture(root.path());
+        let revision = RevisionId::new();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
+        let result = compare_session(
+            &session,
+            &ids,
+            &policy,
+            revision,
+            &AtomicBool::new(false),
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .unwrap();
+        retain_after_success(&mut session, &result, revision).unwrap();
+        std::fs::write(root.path().join("one"), b"diff").unwrap();
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            result.comparison_id,
+            &policy,
+            revision,
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .is_err());
+
+        session.duplicate_evidence = None; // A new explicit attempt revokes the old import proof.
+        assert!(compare_session(
+            &session,
+            &ids,
+            &policy,
+            revision,
+            &AtomicBool::new(false),
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .is_err());
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            result.comparison_id,
+            &policy,
+            revision,
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .is_err());
+
+        let current = session.observation_id;
+        super::super::refresh_session(
+            &mut session,
+            super::super::RefreshInventoryRequest {
+                expected_observation_id: current,
+            },
+            super::super::MAX_RAW_ENTRIES,
+            super::super::MAX_DURATION,
+        )
+        .unwrap();
+        assert!(session.duplicate_evidence.is_none());
+    }
+
+    #[test]
+    fn retained_review_proof_expires_on_monotonic_five_minute_ttl() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("one"), b"same").unwrap();
+        std::fs::write(root.path().join("two"), b"same").unwrap();
+        let (mut session, ids) = fixture(root.path());
+        let revision = RevisionId::new();
+        let policy = SummaryExclusionPolicy::empty_for_tests();
+        let result = compare_session(
+            &session,
+            &ids,
+            &policy,
+            revision,
+            &AtomicBool::new(false),
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .unwrap();
+        retain_after_success(&mut session, &result, revision).unwrap();
+        session.duplicate_evidence.as_mut().unwrap().created_at =
+            Instant::now() - RETAINED_REVIEW_TTL - Duration::from_secs(1);
+        assert!(review_bundle(
+            &session,
+            session.observation_id,
+            result.comparison_id,
+            &policy,
+            revision,
+            Instant::now(),
+            duplicate_content::MAX_DURATION,
+        )
+        .is_err());
     }
 
     #[test]
