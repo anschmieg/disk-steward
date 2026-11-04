@@ -5,6 +5,7 @@ mod folder_inventory;
 mod general_plan;
 mod global_exclusions;
 mod selected_metadata;
+mod summary_control;
 #[cfg(unix)]
 mod summary_exclusions;
 
@@ -71,6 +72,7 @@ pub fn run() {
             app.manage(general_plan::GeneralPlanState::open(app.handle()));
             app.manage(global_exclusions::ExclusionState::open(app.handle()));
             app.manage(folder_inventory::FolderInventoryState::default());
+            app.manage(summary_control::SummaryControlState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -81,6 +83,7 @@ pub fn run() {
             folder_inventory::continue_folder_inventory,
             folder_inventory::clear_folder_inventory,
             folder_inventory::inspect_folder_tree_summary,
+            folder_inventory::cancel_folder_tree_summary,
             preview_native_review,
             example_plan::get_example_plan,
             example_plan::edit_example_plan,

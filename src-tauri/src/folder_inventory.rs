@@ -111,6 +111,14 @@ pub struct ClearInventoryRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TreeSummaryRequest {
     expected_observation_id: InventoryItemId,
+    attempt_id: disk_steward_core::SummaryAttemptId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CancelTreeSummaryRequest {
+    expected_observation_id: InventoryItemId,
+    attempt_id: disk_steward_core::SummaryAttemptId,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1423,14 +1431,21 @@ pub async fn clear_folder_inventory(
 #[tauri::command]
 pub async fn inspect_folder_tree_summary(
     state: tauri::State<'_, FolderInventoryState>,
+    control: tauri::State<'_, crate::summary_control::SummaryControlState>,
     exclusions: tauri::State<'_, crate::global_exclusions::ExclusionState>,
     request: TreeSummaryRequest,
 ) -> Result<FolderTreeSummary, String> {
     let guard = crate::NativeCheckGuard::acquire()?;
+    let registration = control
+        .register(request.expected_observation_id, request.attempt_id)
+        .map_err(|_| "A subtree summary is already active or cannot be controlled.".to_owned())?;
     let sessions = Arc::clone(&state.0);
     let exclusions = exclusions.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
+        let _registration = registration;
+        let cancellation = _registration.cancellation_flag();
+        check_summary_cancellation(cancellation)?;
         let current = sessions
             .lock()
             .map_err(|_| "Folder inventory state is unavailable.".to_owned())?;
@@ -1447,11 +1462,15 @@ pub async fn inspect_folder_tree_summary(
         #[cfg(unix)]
         {
             let started = Instant::now();
+            check_summary_cancellation(cancellation)?;
             validate_session_bindings(session, started, MAX_DURATION).map_err(str::to_owned)?;
+            check_summary_cancellation(cancellation)?;
             let (exclusion_revision, policy) = exclusions.summary_policy(started, MAX_DURATION).map_err(str::to_owned)?;
+            check_summary_cancellation(cancellation)?;
             let summary = tree_summary::summarize(
                 session,
                 &policy,
+                cancellation,
                 request.expected_observation_id,
                 started,
                 MAX_DURATION,
@@ -1459,8 +1478,11 @@ pub async fn inspect_folder_tree_summary(
                 MAX_NAVIGATION_DEPTH,
             )
             .map_err(str::to_owned)?;
+            check_summary_cancellation(cancellation)?;
             validate_session_bindings(session, started, MAX_DURATION).map_err(str::to_owned)?;
+            check_summary_cancellation(cancellation)?;
             let (after_revision, after_policy) = exclusions.summary_policy(started, MAX_DURATION).map_err(str::to_owned)?;
+            check_summary_cancellation(cancellation)?;
             if exclusion_revision != after_revision || policy != after_policy {
                 return Err("Remembered exclusions changed during inspection. Refresh before summarizing again.".into());
             }
@@ -1473,6 +1495,29 @@ pub async fn inspect_folder_tree_summary(
     })
     .await
     .map_err(|_| "Folder subtree summary did not complete.".to_owned())?
+}
+
+fn check_summary_cancellation(cancellation: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        Err("Subtree summary was canceled.".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_folder_tree_summary(
+    control: tauri::State<'_, crate::summary_control::SummaryControlState>,
+    request: CancelTreeSummaryRequest,
+) -> Result<(), String> {
+    let control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        control
+            .cancel(request.expected_observation_id, request.attempt_id)
+            .map_err(|_| "No matching active subtree summary could be canceled.".to_owned())
+    })
+    .await
+    .map_err(|_| "Subtree summary cancellation could not be completed.".to_owned())?
 }
 
 #[cfg(all(test, unix))]
