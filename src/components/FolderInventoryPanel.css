@@ -32,3 +32,33 @@
   padding: 8px;
   font: inherit;
 }
+.folder-inventory nav ol {
+  display: flex;
+  flex-wrap: wrap;
+  list-style: none;
+  gap: 8px;
+  padding: 0;
+}
+.folder-inventory nav li + li::before {
+  content: "/";
+  margin-right: 8px;
+}
+.folder-inventory input {
+  max-width: 100%;
+  margin: 8px;
+  padding: 8px;
+  font: inherit;
+}
+.folder-inventory .inventory-size {
+  position: relative;
+}
+.inventory-size-bar {
+  position: absolute;
+  inset: 4px auto 4px 0;
+  background: currentColor;
+  opacity: 0.09;
+  pointer-events: none;
+}
+.inventory-size-value {
+  position: relative;
+}
