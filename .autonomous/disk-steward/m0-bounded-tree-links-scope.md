@@ -1,0 +1,5 @@
+# M0 bounded SHA-1 tree links
+
+Inactive pure parser of one supplied tree body: canonical modes, bounded raw basename/NUL and 20-byte nonzero object IDs; borrow names without UTF-8/path conversion. Hard16MiB input/4096entries/1024name bytes, caller may lower entry count. Strict Git directory-aware ordering and duplicate basename refusal, bounded mode/name scans, fallible bounded metadata allocation, cooperative cancellation/deadlines. Reject slash/dot/dotdot/ASCII-case-insensitive .git; this is not comprehensive platform path validation.
+
+Mode160000 is reported as Gitlink metadata and not followed; product complex-layout gates remain. Does not bind tree ID/type, verify referenced objects/types, parse commit/tag links, perform full Git fsck, prove graph completeness, extract paths or authorize cleanup. Experimental bounds not product acceptance. Luna new tree.rs/root source review/API/tests/real-Git correspondence. Branch atop66135a289/main baseline9635f78, preserve local notes/watches/0.0.x/no releases/no overlapping builds. Primary Git source fsck.c/tree-walk.c and Git Objects format.
