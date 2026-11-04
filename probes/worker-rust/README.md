@@ -14,6 +14,13 @@ reading after 64 KiB plus one byte, and applies a one-second monotonic deadline.
 On either limit it kills the child, waits for its exit, and joins the reader
 before reporting success.
 
+The shared stdout reader accepts readiness only when the first byte is exactly
+`R`. Other first bytes fail the reader without emitting readiness. Empty EOF
+remains a zero-byte completion for the fixed partial-write failure case.
+Interrupted reads have a cumulative allowance of sixteen; the seventeenth
+fails, and successful reads do not reset the allowance. These checks bound
+protocol handling, not the duration of a blocking OS read or arbitrary peers.
+
 The executable path comes only from `current_exe()`. The stdout parent cases accept none or `--run`; the private child dispatcher accepts only the two
 fixed modes. These stdout cases have no data-file, network, credential, shell, or renderer
 operations, and their children create no descendants.
@@ -163,3 +170,97 @@ stop and registry reopen. Reopen must refuse further reservation growth until
 reconciliation. This is an admission-bookkeeping exercise, not a measurement of
 the fixture's footprint or proof of global aggregate enforcement. The probe
 retains its per-store private control layout and grants no cleanup authority.
+
+All four fixed current-executable child launch paths clear the caller environment
+before spawning. They need no ambient PATH, Git configuration, credentials or
+caller-selected temporary directory. A fixed synthetic sentinel is rejected by
+the private child dispatcher without printing its value. Integration tests first
+prove that direct inheritance is detected, then run stdout supervision, store
+worker, creator-death reinspection and indexed store worker with that sentinel
+set in their parent. This checks the actual launch boundary, not OS-level process
+isolation or production transport integration. Local evidence is macOS; other
+supported-platform behavior requires its current-head CI.
+
+## Descriptor-only store handoff
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-handoff`
+uses the indexed-store fixture with an additional fixed capability handoff. It
+commits the same identity-bound 128 KiB registry reservation before spawn, then
+passes a one-shot clone of the verified store directory as the exact child’s
+stdin. The child receives no path or descriptor-number argument.
+
+Before emitting its readiness byte, the child checks directory type, private
+owner/mode, root device/inode and a bounded regular ownership journal naming its
+own PID. The initial parent bind may be observed as a created or partial journal;
+only valid prefixes may wait, for at most 256 polls and 500 ms. Reads are bounded
+to 513 bytes with at most 16 interruptions, and the named journal is reopened to
+reject replacement. Changed, malformed or foreign identities refuse readiness.
+A failed handoff attempt cannot be renewed by restoring marker permissions.
+
+The child performs read-only validation and the existing fixed stall. After
+readiness the parent kills/reaps the exact child, joins its reader, records
+stopped state, and checks the reopened registry remains reconciliation-required.
+Only then does the report include `descriptor_handoff=true`. The fixture and
+reservation remain retained; no cleanup, payload write, Git access or credential
+operation is authorized by this mode. Existing fixed modes keep their behavior.
+
+Passing a directory descriptor is not an OS sandbox or process-tree containment.
+Cooperative deadlines and ordinary local kill/wait/join evidence do not prove
+hard latency under OS stalls, atomicity against same-user interference, power-loss
+durability or production verification ownership. Linux/macOS paths are supported
+by the probe; this change was locally exercised on macOS arm64 and still needs
+current-head cross-platform CI.
+
+## Fixed payload through the worker descriptor
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-payload`
+adds a separate fixed synthetic write to the directory handoff. The parent
+commits the same 128 KiB identity-bound reservation before launch. The child
+validates its bound directory capability, then writes only `payload.bin` with
+the existing deterministic 32 KiB generator through the shared accounting core.
+That core preserves native free-space sampling, the 2 GiB reserve plus 1 MiB
+headroom, admission checks, allocation-aware high-water charges, partial-write
+accounting, exclusive no-follow creation, identity checks and synchronization.
+The original in-process payload mode uses that same core.
+
+Readiness requires the full fixed write. After exact child shutdown and reader
+join, the parent requires the matching stop receipt and stopped journal before
+readback. It checks all bytes through a held descriptor, exact file metadata,
+size and identity, named-file identity and metadata, EOF, and final unchanged
+metadata. Readback has a cooperative one-second deadline and bounded reads and
+interruptions. The report requires payload high-water usage within the committed
+reservation; reopening the registry must still yield reconciliation-required
+state with the reservation retained. Neither success nor failure deletes the
+payload or authorizes cleanup.
+
+The command accepts no path, data, FD number, endpoint, credential or cleanup
+argument. Missing/wrong capabilities, repeat writes, changed journals/files and
+unconfirmed worker stop refuse acceptance. This is synthetic worker/store
+composition only: no Git transfer, durable byte receipt, directory/index
+footprint accounting, OS hard latency/process-tree/RSS guarantee, private
+authentication, atomicity against same-user interference or milestone completion
+is established. Current-head platform CI remains required.
+
+## Partial payload failure before readiness
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-payload-partial`
+checks a separate fixed failure path. The environment-cleared child receives
+only the identity-bound store directory, writes a deterministic 2 KiB prefix
+through the shared payload accounting core, then injects a write error. It exits
+with a fixed failure status and emits no readiness bytes. This does not simulate
+a real disk-full error or arbitrary kill timing.
+
+The parent requires bounded empty stdout completion, exact child shutdown and
+reader join, and the expected exit status before inspecting the partial file.
+The complete-payload inspector must reject it. A separate fixed partial
+observation checks the prefix, EOF, private metadata, held and named identity,
+and unchanged metadata under the same cooperative readback deadline. The
+observation is evidence of an incomplete attempt, never successful verification.
+
+The 128 KiB reservation remains retained. Because readiness never succeeded,
+the registry never becomes Active; reopening requires reconciliation with prior
+Registered state and refuses retry and reservation growth. The file remains in
+the task-owned fixture. No cleanup authority or source-repository access is
+added. This is process-exit evidence, not synchronized power-loss durability,
+production worker isolation, global store accounting, credential validation or
+milestone acceptance.
