@@ -15,7 +15,7 @@ const MAX_GIT_OUT: usize = 65_536;
 const MAX_PACK: usize = 512;
 // Setup and receiver verification run outside the HTTP attempt. Shared CI can
 // take longer to start a cold system Git; keep RPC supervision at three seconds.
-const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(10);
+const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(30);
 const GIT_RPC_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 
@@ -431,8 +431,93 @@ fn git_upload_pack(root: &PrivateRoot, args: &[&str], input: &[u8]) -> io::Resul
     Ok(result.stdout)
 }
 
+const VERIFICATION_COMPLETE: &[u8] = b"DISK_STEWARD_GIT_VERIFICATION_COMPLETE\n";
+
 #[test]
 fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
+    let receipt = super::completion_supervision::supervise(
+        "tests::git_interop::real_git_verification_child",
+        VERIFICATION_COMPLETE,
+        Duration::from_secs(30),
+    )
+    .expect("bounded real-Git verification child must complete");
+    assert!(receipt.reader_joined);
+    assert!(receipt.bytes > VERIFICATION_COMPLETE.len() && receipt.bytes <= 1024);
+}
+
+#[test]
+#[ignore = "selected only by the exact real-Git verification supervisor"]
+fn real_git_verification_child() {
+    run_real_git_verification();
+    let mut stdout = io::stdout();
+    stdout.write_all(VERIFICATION_COMPLETE).unwrap();
+    stdout.flush().unwrap();
+}
+
+fn capture_fixture_ref_manifest(root: &PrivateRoot, source_repo: &str) -> RequiredRefManifest {
+    let current_refs = checked_git(
+        root,
+        &[
+            "-C",
+            source_repo,
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(objecttype) %(symref)",
+        ],
+        b"",
+    )
+    .unwrap();
+    let mut inputs = current_refs
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let parts: Vec<_> = line.split(|b| *b == b' ').collect();
+            assert_eq!(parts.len(), 4);
+            let kind = match parts[2] {
+                b"commit" => GitObjectKind::Commit,
+                b"tag" => GitObjectKind::Tag,
+                _ => panic!("unexpected fixture ref kind"),
+            };
+            RequiredRefInput {
+                symref_target: (!parts[3].is_empty()).then_some(parts[3]),
+                name: parts[0],
+                oid: hex_oid(std::str::from_utf8(parts[1]).unwrap()),
+                kind,
+            }
+        })
+        .collect::<Vec<_>>();
+    let head = checked_git(
+        root,
+        &["-C", source_repo, "rev-parse", "--verify", "HEAD"],
+        b"",
+    )
+    .unwrap();
+    let symbolic = run_git(
+        root,
+        &["-C", source_repo, "symbolic-ref", "-q", "HEAD"],
+        b"",
+        None,
+    )
+    .unwrap();
+    let target = match symbolic.status.code() {
+        Some(0) => Some(symbolic.stdout.strip_suffix(b"\n").unwrap()),
+        Some(1) => None,
+        _ => panic!("unexpected fixture symbolic HEAD failure"),
+    };
+    inputs.push(RequiredRefInput {
+        name: b"HEAD",
+        oid: hex_oid(&object_id(&head).unwrap()),
+        kind: GitObjectKind::Commit,
+        symref_target: target,
+    });
+    RequiredRefManifest::capture(
+        &inputs,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap()
+}
+
+fn run_real_git_verification() {
     let root = PrivateRoot::create().unwrap();
     let (repo, blob, tree, commit, tag_object) = make_repository(&root).unwrap();
     let peeled = object_id(
@@ -449,7 +534,7 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let server_tls = tls.server.clone();
     let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let fetch_transport = candidate_transport(fetch_repository, &tls, address);
-    let mut pack_sink = BudgetFileSink::new(&root, fetch_transport.cancellation_handle()).unwrap();
+    let mut pack_sink = BudgetFileSink::new_for_transport(&root, &fetch_transport).unwrap();
     let inspection_repo = repo.clone();
     let expected_commit = commit.clone();
     let expected_tag = tag_object.clone();
@@ -524,7 +609,13 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let root = server.join().expect("fixture server panicked").unwrap();
     let report = report_result.unwrap();
     let fetch_report = fetch_result.unwrap();
-    pack_sink.sync_and_observe().unwrap();
+    let advertised_closure = pack_sink
+        .decode_download(&fetch_report, 4096, Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        pack_sink.ingress_bytes_charged(),
+        fetch_report.finalization().observed_ingress_bytes()
+    );
     let pack = pack_sink.contents().unwrap();
     let checksum = check_sha1_pack_checksum(
         &mut std::io::Cursor::new(&pack),
@@ -535,6 +626,237 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     .unwrap();
     assert_eq!(checksum.version(), 2);
     assert_eq!(checksum.declared_object_count(), 4);
+    let decoded_pack = decode_sha1_pack(
+        &pack,
+        4096,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(decoded_pack.objects().len(), 4);
+
+    assert_eq!(advertised_closure.decoded().objects().len(), 4);
+    assert_eq!(advertised_closure.graph().reachable_objects(), 4);
+    assert_eq!(
+        advertised_closure.advertised_ref_count(),
+        fetch_report.advertised_refs().unwrap().len()
+    );
+
+    let coverage = advertised_closure
+        .check_required_objects(
+            &crate::RepositoryUrl::parse("https://github.com/example/repo.git").unwrap(),
+            &[
+                (hex_oid(&commit), GitObjectKind::Commit),
+                (hex_oid(&tree), GitObjectKind::Tree),
+                (hex_oid(&blob), GitObjectKind::Blob),
+                (hex_oid(&tag_object), GitObjectKind::Tag),
+            ],
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(coverage.required_object_count(), 4);
+    assert_eq!(coverage.graph().reachable_objects(), 4);
+
+    let source_repo = root.repo().to_str().unwrap().to_owned();
+    // This local name has covered history but did not exist in the advertisement.
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "refs/heads/local-only",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    let manifest = capture_fixture_ref_manifest(&root, &source_repo);
+    let expected_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
+    let named = advertised_closure
+        .check_required_refs(
+            &expected_repository,
+            &fetch_report,
+            &manifest,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(named.coverage().required_object_count(), 4);
+    assert_eq!(
+        named
+            .unmatched_remote_refs()
+            .map(|(entry, reason)| (entry.name(), reason))
+            .collect::<Vec<_>>(),
+        [(
+            b"refs/heads/local-only".as_slice(),
+            RemoteRefMismatch::MissingName
+        )]
+    );
+
+    let unchanged = capture_fixture_ref_manifest(&root, &source_repo);
+    named
+        .recheck_manifest(
+            &expected_repository,
+            &unchanged,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "refs/heads/renamed",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "-d",
+            "refs/heads/local-only",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    let renamed = capture_fixture_ref_manifest(&root, &source_repo);
+    assert_ne!(manifest.digest(), renamed.digest());
+    assert_eq!(
+        manifest
+            .entries()
+            .iter()
+            .map(|entry| entry.oid())
+            .collect::<Vec<_>>(),
+        renamed
+            .entries()
+            .iter()
+            .map(|entry| entry.oid())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        named
+            .recheck_manifest(
+                &expected_repository,
+                &renamed,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    // An old caller snapshot cannot revive an already-invalidated named result.
+    assert_eq!(
+        named
+            .recheck_manifest(
+                &expected_repository,
+                &manifest,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+
+    let before_head_change = advertised_closure
+        .check_required_refs(
+            &expected_repository,
+            &fetch_report,
+            &renamed,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/renamed",
+        ],
+        b"",
+    )
+    .unwrap();
+    let switched = capture_fixture_ref_manifest(&root, &source_repo);
+    assert_eq!(renamed.entries()[0].oid(), switched.entries()[0].oid());
+    assert_eq!(switched.entries()[0].name(), b"HEAD");
+    assert_eq!(
+        switched.entries()[0].symref_target(),
+        Some(b"refs/heads/renamed".as_slice())
+    );
+    assert!(before_head_change
+        .recheck_manifest(
+            &expected_repository,
+            &switched,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .is_err());
+    let symbolic_coverage = advertised_closure
+        .check_required_refs(
+            &expected_repository,
+            &fetch_report,
+            &switched,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert!(symbolic_coverage
+        .unmatched_remote_refs()
+        .any(|(entry, reason)| entry.name() == b"HEAD"
+            && reason == RemoteRefMismatch::DifferentSymrefTarget));
+    checked_git(
+        &root,
+        &[
+            "-C",
+            &source_repo,
+            "update-ref",
+            "--no-deref",
+            "HEAD",
+            &commit,
+        ],
+        b"",
+    )
+    .unwrap();
+    let detached = capture_fixture_ref_manifest(&root, &source_repo);
+    assert_eq!(switched.entries()[0].oid(), detached.entries()[0].oid());
+    assert_eq!(detached.entries()[0].symref_target(), None);
+    assert!(symbolic_coverage
+        .recheck_manifest(
+            &expected_repository,
+            &detached,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .is_err());
+
+    let closure = check_pack_graph_closure(
+        &decoded_pack,
+        &[
+            (hex_oid(&commit), GitObjectKind::Commit),
+            (hex_oid(&tag_object), GitObjectKind::Tag),
+        ],
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(closure.root_count(), 2);
+    assert_eq!(closure.reachable_objects(), 4);
+    assert_eq!(closure.checked_edges(), 3);
+
     assert_eq!(checksum.checksum().as_slice(), &pack[pack.len() - 20..]);
     let entry = parse_sha1_pack_entry_header(&pack[12..], 12, 512).unwrap();
     let first_object = match entry.kind() {
@@ -587,6 +909,71 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     )
     .unwrap();
     assert_eq!(inflated.bytes(), raw_object);
+    for (kind, object_type, oid) in [
+        (GitObjectKind::Commit, "commit", &commit),
+        (GitObjectKind::Tree, "tree", &tree),
+        (GitObjectKind::Blob, "blob", &blob),
+        (GitObjectKind::Tag, "tag", &tag_object),
+    ] {
+        let raw = checked_git(
+            &root,
+            &["-C", &inspection_repo, "cat-file", object_type, oid],
+            b"",
+        )
+        .unwrap();
+        let actual = git_sha1_object_id(
+            kind,
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(actual, hex_oid(oid));
+        let decoded = decoded_pack
+            .objects()
+            .iter()
+            .find(|object| object.oid() == &actual)
+            .unwrap();
+        assert_eq!(decoded.kind(), kind);
+        assert_eq!(decoded.content(), raw);
+        if kind == GitObjectKind::Tag {
+            let link = parse_sha1_tag(
+                decoded.content(),
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(link.target(), &hex_oid(&commit));
+            assert_eq!(link.target_kind(), GitObjectKind::Commit);
+            assert_eq!(link.name(), b"fixture");
+        }
+
+        if kind == GitObjectKind::Commit {
+            let links = parse_sha1_commit(
+                decoded.content(),
+                1024,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(links.tree(), &hex_oid(&tree));
+            assert!(links.parents().is_empty());
+        }
+
+        if kind == GitObjectKind::Tree {
+            let links = parse_sha1_tree(
+                decoded.content(),
+                4096,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].mode(), GitTreeMode::Regular);
+            assert_eq!(links[0].name(), b"fixture.txt");
+            assert_eq!(links[0].oid(), &hex_oid(&blob));
+        }
+    }
 
     let mut damaged_pack = pack.clone();
     *damaged_pack.last_mut().unwrap() ^= 1;
@@ -753,20 +1140,77 @@ fn hex_oid(value: &str) -> [u8; 20] {
 }
 
 #[test]
+fn live_ingress_busy_refuses_pack_write_without_charging_or_writing() {
+    let root = PrivateRoot::create().unwrap();
+    let (transport, server) =
+        super::pack_tests::pack_fixture(super::pack_tests::pack_body(b"PACKbusy-counter-fixture"));
+    let counter = transport.budget.used.clone();
+    let signal = transport.cancellation_handle();
+    let mut sink = BudgetFileSink::new_for_transport(&root, &transport).unwrap();
+
+    // Complete and join the local transport fixture before holding the shared
+    // counter lock, so a failed assertion cannot strand network cleanup.
+    let report = transport.download_advertised_pack(&mut Vec::new()).unwrap();
+    server.join().unwrap();
+    let observed = report.finalization().observed_ingress_bytes();
+    assert!(observed > 0);
+
+    let held = counter.lock().unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let result = sink.write(b"PACKmust-not-be-written");
+        let charged_storage = sink.bytes_charged();
+        let charged_ingress = sink.ingress_bytes_charged();
+        let contents = sink.contents().unwrap();
+        let _ = finished_tx.send(());
+        (result, charged_storage, charged_ingress, contents, sink)
+    });
+    let completed_before_unlock = finished_rx.recv_timeout(Duration::from_secs(1));
+    // Always release the counter before joining/asserting, including if a
+    // regression makes the sink block in the observer.
+    drop(held);
+    let (write_result, charged_storage, charged_ingress, contents, mut sink) =
+        writer.join().unwrap();
+
+    assert!(completed_before_unlock.is_ok());
+    let error = write_result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(error.to_string(), "transport ingress observation busy");
+    assert_eq!(charged_storage, 0);
+    assert_eq!(charged_ingress, 0);
+    assert!(contents.is_empty());
+    assert!(signal.is_cancelled());
+    // Contention refusal must not hide already observed bytes at finalization.
+    sink.reconcile_transfer_ingress(&report).unwrap();
+    assert_eq!(sink.ingress_bytes_charged(), observed);
+    assert!(signal.is_cancelled());
+    assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+    drop(sink);
+    assert_durable_reservation_blocks_reopen(&root);
+}
+
+#[test]
 fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
     let root = PrivateRoot::create().unwrap();
     let mut body = super::ref_packet(b"packfile\n");
     body.extend(super::ref_packet(b"\x01PACKfixture"));
     body.extend_from_slice(b"0000");
     let (transport, server) = super::pack_tests::pack_fixture(body);
-    let mut sink =
-        BudgetFileSink::new_with_limit(&root, transport.cancellation_handle(), 5).unwrap();
+    let mut sink = BudgetFileSink::new_with_limit_for_transport(&root, &transport, 5).unwrap();
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
     assert!(report.advertised_refs().is_none());
     assert_eq!(sink.contents().unwrap(), b"PACKf");
     assert_eq!(report.bytes_written(), 5);
+    assert!(sink
+        .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+        .is_err());
+    assert_eq!(
+        sink.ingress_bytes_charged(),
+        report.finalization().observed_ingress_bytes()
+    );
+    assert!(sink.ingress_bytes_charged() > report.bytes_written());
     let partial_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
     assert!(
         sink.bytes_charged()
@@ -891,4 +1335,176 @@ fn delta_reconstruction_matches_independent_strict_git_import() {
     .unwrap();
     assert_eq!(git_result, b"hello braveworld!");
     assert_eq!(reconstructed, git_result);
+    let decoded = decode_sha1_pack(
+        pack,
+        1024,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(decoded.objects().len(), 2);
+    assert_eq!(decoded.objects()[1].content(), git_result);
+    assert_eq!(
+        decoded.objects()[1].oid(),
+        &hex_oid("799d6e2806898251c4b4be06ec68ca7a32bb8c31")
+    );
+
+    assert_eq!(
+        git_sha1_object_id(
+            GitObjectKind::Blob,
+            &reconstructed,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .unwrap(),
+        hex_oid("799d6e2806898251c4b4be06ec68ca7a32bb8c31")
+    );
+    let base_oid = git_sha1_object_id(
+        GitObjectKind::Blob,
+        base.bytes(),
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        delta_header.kind(),
+        PackEntryKind::ReferenceDelta { base_oid }
+    );
+}
+
+#[test]
+fn real_git_tree_modes_and_directory_order_match_parser() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, blob, tree, commit, _) = make_repository(&root).unwrap();
+    // Git sorts this deliberately unordered input and canonicalizes 040000.
+    let input = format!("040000 tree {tree}\tfoo\n100755 blob {blob}\tfoo0\n100644 blob {blob}\tfoo.bar\n160000 commit {commit}\tb-module\n120000 blob {blob}\ta-link\n");
+    let tree_oid =
+        object_id(&checked_git(&root, &["-C", &repo, "mktree"], input.as_bytes()).unwrap())
+            .unwrap();
+    let raw = checked_git(&root, &["-C", &repo, "cat-file", "tree", &tree_oid], b"").unwrap();
+    let links = parse_sha1_tree(
+        &raw,
+        5,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        links.iter().map(|link| link.name()).collect::<Vec<_>>(),
+        [
+            b"a-link".as_slice(),
+            b"b-module",
+            b"foo.bar",
+            b"foo",
+            b"foo0"
+        ]
+    );
+    assert_eq!(
+        links.iter().map(|link| link.mode()).collect::<Vec<_>>(),
+        [
+            GitTreeMode::Symlink,
+            GitTreeMode::Gitlink,
+            GitTreeMode::Regular,
+            GitTreeMode::Directory,
+            GitTreeMode::Executable
+        ]
+    );
+    assert_eq!(links[1].oid(), &hex_oid(&commit));
+    assert_eq!(links[3].oid(), &hex_oid(&tree));
+    for index in [0, 2, 4] {
+        assert_eq!(links[index].oid(), &hex_oid(&blob));
+    }
+}
+
+#[test]
+fn real_git_merge_commit_preserves_ordered_parent_links() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, _, tree, commit, _) = make_repository(&root).unwrap();
+    let child = object_id(
+        &checked_git(
+            &root,
+            &["-C", &repo, "commit-tree", &tree, "-p", &commit],
+            b"child\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let merge = object_id(
+        &checked_git(
+            &root,
+            &[
+                "-C",
+                &repo,
+                "commit-tree",
+                &tree,
+                "-p",
+                &child,
+                "-p",
+                &commit,
+            ],
+            b"merge\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let raw = checked_git(&root, &["-C", &repo, "cat-file", "commit", &merge], b"").unwrap();
+    let links = parse_sha1_commit(
+        &raw,
+        2,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(links.tree(), &hex_oid(&tree));
+    assert_eq!(links.parents(), &[hex_oid(&child), hex_oid(&commit)]);
+    assert_eq!(&raw[links.header_bytes()..], b"merge\n");
+    assert_eq!(
+        git_sha1_object_id(
+            GitObjectKind::Commit,
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .unwrap(),
+        hex_oid(&merge)
+    );
+}
+
+#[test]
+fn real_git_mktag_matches_all_declared_target_kinds() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, blob, tree, commit, tag) = make_repository(&root).unwrap();
+    for (kind, expected, target) in [
+        ("blob", GitObjectKind::Blob, &blob),
+        ("tree", GitObjectKind::Tree, &tree),
+        ("commit", GitObjectKind::Commit, &commit),
+        ("tag", GitObjectKind::Tag, &tag),
+    ] {
+        let name = format!("v-{kind}");
+        let input=format!("object {target}\ntype {kind}\ntag {name}\ntagger P <p@e> 1234567890 +0000\n\nfixture\n");
+        let oid =
+            object_id(&checked_git(&root, &["-C", &repo, "mktag"], input.as_bytes()).unwrap())
+                .unwrap();
+        let raw = checked_git(&root, &["-C", &repo, "cat-file", "tag", &oid], b"").unwrap();
+        let link = parse_sha1_tag(
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(link.target(), &hex_oid(target));
+        assert_eq!(link.target_kind(), expected);
+        assert_eq!(link.name(), name.as_bytes());
+        assert_eq!(&raw[link.header_bytes()..], b"fixture\n");
+        assert_eq!(
+            git_sha1_object_id(
+                GitObjectKind::Tag,
+                &raw,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap(),
+            hex_oid(&oid)
+        );
+    }
 }

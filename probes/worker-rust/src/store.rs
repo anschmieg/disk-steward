@@ -1,5 +1,7 @@
 //! Private, app-created Git-worker store fixture with bounded live cleanup.
 
+#[path = "store/handoff.rs"]
+mod handoff;
 #[path = "store/payload.rs"]
 mod payload;
 
@@ -79,6 +81,7 @@ pub struct OwnedStore {
     phase: Phase,
     poisoned: bool,
     cleanup_started: bool,
+    worker_stdin_issued: bool,
     #[cfg(test)]
     fail_after_marker_unlink: bool,
 }
@@ -92,7 +95,36 @@ enum Phase {
 
 pub(crate) type ControlIdentity = ((u64, u64), (u64, u64));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerPayloadObservation {
+    pub(crate) written_bytes: u64,
+    pub(crate) high_water_bytes: u64,
+}
+
+/// Run the fixed synthetic payload writer against the validated worker stdin
+/// directory capability. No paths or payload parameters are accepted.
+pub(crate) fn write_worker_stdin_payload() -> Result<payload::PayloadReport, StoreError> {
+    handoff::write_stdin_payload()
+}
+
 impl OwnedStore {
+    /// Return the verified store-root descriptor for the single fixed worker
+    /// stdin handoff. The child receives only this directory capability.
+    pub(crate) fn worker_stdin_once(&mut self) -> Result<File, StoreError> {
+        handoff::worker_stdin_once(self)
+    }
+
+    pub(crate) fn validate_worker_stdin_handoff() -> Result<(), StoreError> {
+        handoff::validate_stdin()
+    }
+
+    pub(crate) fn inspect_stopped_worker_payload(
+        &self,
+        receipt: &crate::StopReceipt,
+    ) -> Result<WorkerPayloadObservation, StoreError> {
+        handoff::inspect_stopped_worker_payload(self, receipt)
+    }
+
     pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {
         self.inspect_state()?;
         Ok(self.parent_path.join("verification-registry.sqlite3"))
@@ -517,6 +549,7 @@ fn create_supported() -> Result<OwnedStore, StoreError> {
         phase: Phase::Created,
         poisoned: false,
         cleanup_started: false,
+        worker_stdin_issued: false,
         #[cfg(test)]
         fail_after_marker_unlink: false,
     })

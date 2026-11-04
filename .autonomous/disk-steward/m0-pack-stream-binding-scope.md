@@ -1,0 +1,5 @@
+# M0 accepted-byte pack binding
+
+Inactive transport reports SHA256 only after complete Git+HTTP operation, hashing valid prefixes returned by sink writes in constantmemory. Partial/error reports retain bytecounts but no digest. Decoder requires exactcount+SHA256match before packdecode, under prechecked16MiBcap and8KiBcooperative hashchunks. Shortwrites/Interrupted/errors preserve existing count/control behavior. Pinsha2=0.10.9 alreadycached/locked; lock adds only directdependency edge, no version changes.
+
+This strengthens earlier length/root-only comparison: matching supplied content is bound to bytes the sink reported accepting under SHA256. It does not attest physical persistence, fileidentity/fsync, remote authenticity, atomicref snapshot, local inventory/preservation, receipt expiry/fullfsck, productionworker/RSS/globalstore lifecycle or cleanup eligibility. Existing experimental graph/parser limits remain. No app/renderer/filesystem/shell/network endpoint expansion. Branch atop73c637e65/main eventualbaseline, dependencies/currentheadchecks required,0.0.17/no release/M0inprogress. Luna bounded packdigestwrapper/root decoderguard/API/source review/tests.
