@@ -1,3 +1,4 @@
+import type { EditorSnapshot } from "../general-plan-contract";
 import "./FolderInventoryPanel.css";
 import { useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -25,8 +26,10 @@ export type FolderInventory = {
 export default function FolderInventoryPanel({
   native,
   onBusyChange,
+  onOpenPlan,
 }: {
   native: boolean;
+  onOpenPlan?: () => void;
   onBusyChange: (busy: boolean) => void;
 }) {
   const titleId = useId();
@@ -35,6 +38,7 @@ export default function FolderInventoryPanel({
   const [snapshot, setSnapshot] = useState<FolderInventory | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [imported, setImported] = useState(false);
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<"name" | "size">("size");
   useEffect(() => {
@@ -60,6 +64,7 @@ export default function FolderInventoryPanel({
               },
             });
       if (next) {
+        setImported(false);
         setSnapshot(next);
         setQuery("");
       } else
@@ -69,6 +74,39 @@ export default function FolderInventoryPanel({
     } catch {
       setMessage(
         "The folder could not be inspected. Choose it again to retry. Any previous observation remains below.",
+      );
+    } finally {
+      activeRequest.current = false;
+      setBusy(false);
+      onBusyChange(false);
+    }
+  };
+  const addToPlan = async () => {
+    if (!native || !snapshot || activeRequest.current) return;
+    activeRequest.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    setMessage("");
+    try {
+      const before = await invoke<EditorSnapshot>("get_general_plan", {
+        request: { profile: "live" },
+      });
+      const after = await invoke<EditorSnapshot>(
+        "import_observed_review_items",
+        {
+          request: {
+            expectedObservationId: snapshot.observationId,
+            expectedRevisionId: before.revisionId,
+          },
+        },
+      );
+      setImported(true);
+      setMessage(
+        `Added ${after.items.length - before.items.length} observed entries to your local review plan. They remain blocked from cleanup.`,
+      );
+    } catch {
+      setMessage(
+        "The entries could not be added. Your observation is unchanged. Open your plan to check its latest state before trying again.",
       );
     } finally {
       activeRequest.current = false;
@@ -157,6 +195,37 @@ export default function FolderInventoryPanel({
             {snapshot.regularFileLogicalBytes} bytes. Hard links are counted per
             name. This is neither occupied disk space nor recoverable space;
             nested contents and shared allocation are unknown.
+          </p>
+          <div className="panel-actions">
+            <button
+              className="button secondary"
+              disabled={
+                busy ||
+                !native ||
+                imported ||
+                !snapshot.entries.some(
+                  (entry) => entry.kind === "file" || entry.kind === "folder",
+                )
+              }
+              onClick={() => void addToPlan()}
+            >
+              Add observed entries to your plan
+            </button>
+            {onOpenPlan && (
+              <button
+                className="button secondary"
+                disabled={busy}
+                onClick={onOpenPlan}
+              >
+                Open your review plan
+              </button>
+            )}
+          </div>
+          <p>
+            Adding saves the observed file/folder names and metadata locally,
+            including entries hidden by the filter. It does not save source
+            paths or grant cleanup permission. The separate plan starts empty;
+            all imported entries default to Keep and stay blocked.
           </p>
           <label>
             Filter observed names{" "}

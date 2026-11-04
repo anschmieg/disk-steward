@@ -204,3 +204,64 @@ test("filtering keeps the full observed logical-size denominator and never chang
   ).not.toBeInTheDocument();
   expect(invoke).toHaveBeenCalledTimes(1);
 });
+
+test("explicit plan import uses current observation and live revision without renderer metadata", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce({ revisionId: "live-r7", items: [1] })
+    .mockResolvedValueOnce({ revisionId: "live-r8", items: [1, 2, 3, 4] });
+  const openPlan = vi.fn();
+  render(
+    <FolderInventoryPanel
+      native
+      onBusyChange={vi.fn()}
+      onOpenPlan={openPlan}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "Alpha" },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+  );
+  await screen.findByText(/Added 3 observed entries/);
+  expect(invoke).toHaveBeenNthCalledWith(2, "get_general_plan", {
+    request: { profile: "live" },
+  });
+  expect(invoke).toHaveBeenNthCalledWith(3, "import_observed_review_items", {
+    request: {
+      expectedObservationId: "observation-1",
+      expectedRevisionId: "live-r7",
+    },
+  });
+  expect(
+    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+  ).toBeDisabled();
+  expect(screen.getByRole("heading", { name: "Chosen folder" })).toBeVisible();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open your review plan" }),
+  );
+  expect(openPlan).toHaveBeenCalledOnce();
+});
+
+test("failed import preserves observed entries and does not automatically retry", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce({ revisionId: "live-r7", items: [] })
+    .mockRejectedValueOnce(new Error("stale private database path"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+  );
+  await screen.findByText(/entries could not be added/);
+  expect(
+    screen.getByRole("button", { name: "Add observed entries to your plan" }),
+  ).toBeEnabled();
+  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(invoke).toHaveBeenCalledTimes(3);
+  expect(screen.queryByText(/private database path/)).not.toBeInTheDocument();
+});

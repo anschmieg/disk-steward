@@ -7,6 +7,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+const MAX_SAFE_JS_INTEGER: u64 = 9_007_199_254_740_991;
+
 const MAX_RAW_ENTRIES: usize = 512;
 const MAX_DURATION: Duration = Duration::from_secs(2);
 const MAX_LABEL_CHARS: usize = 120;
@@ -68,6 +70,123 @@ pub struct NavigationRequest {
 #[derive(Clone, Default)]
 pub struct FolderInventoryState(Arc<Mutex<Option<Session>>>);
 
+impl FolderInventoryState {
+    /// Copies only the latest explicitly observed, immediate file and folder
+    /// metadata for a matching backend-held observation. It never reads files.
+    #[cfg(unix)]
+    pub(crate) fn blocked_items_for_observation(
+        &self,
+        expected_observation_id: InventoryItemId,
+    ) -> Result<Vec<disk_steward_plan_model::InventoryItem>, &'static str> {
+        let state = self.0.lock().map_err(|_| "observation_unavailable")?;
+        let session = state.as_ref().ok_or("observation_unavailable")?;
+        if session.observation_id != expected_observation_id
+            || session.snapshot.observation_id != expected_observation_id
+        {
+            return Err("stale_observation");
+        }
+
+        use disk_steward_plan_model::{
+            Blocker, Choice, EvidenceRef, InventoryItem, ItemKind, Suggestion,
+        };
+        let observation = serde_json::to_value(expected_observation_id)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or("observation_unavailable")?;
+        let breadcrumb_text = session
+            .snapshot
+            .breadcrumbs
+            .last()
+            .map(String::as_str)
+            .unwrap_or("selected folder");
+        let mut items = Vec::new();
+        let mut known_total = 0u64;
+        for entry in &session.snapshot.entries {
+            let kind = match entry.kind {
+                "file" => ItemKind::File,
+                "folder" => ItemKind::Folder,
+                _ => continue,
+            };
+            let Some(observed) = session.entries.iter().find(|row| row.id == entry.id) else {
+                continue;
+            };
+            if observed.identity.device != session.root_device
+                || (kind == ItemKind::Folder
+                    && observed.file_type != rustix::fs::FileType::Directory)
+                || (kind == ItemKind::File
+                    && observed.file_type != rustix::fs::FileType::RegularFile)
+            {
+                continue;
+            }
+            let logical_bytes = match entry.logical_bytes.as_deref() {
+                Some(value) if kind == ItemKind::File => {
+                    let parsed = value.parse::<u64>().map_err(|_| "unsafe_observed_size")?;
+                    if parsed > MAX_SAFE_JS_INTEGER {
+                        return Err("unsafe_observed_size");
+                    }
+                    known_total = known_total
+                        .checked_add(parsed)
+                        .filter(|total| *total <= MAX_SAFE_JS_INTEGER)
+                        .ok_or("unsafe_observed_size")?;
+                    Some(parsed)
+                }
+                Some(_) => return Err("unsafe_observed_size"),
+                None => None,
+            };
+            let mut blockers = vec![
+                Blocker {
+                    code: "metadata_only".to_owned(),
+                    reason: "Only immediate entry metadata was observed; no file contents or cleanup eligibility were established.".to_owned(),
+                },
+                Blocker {
+                    code: "incomplete_coverage".to_owned(),
+                    reason: "This observation is shallow and does not represent all contents of the selected storage scope.".to_owned(),
+                },
+            ];
+            if kind == ItemKind::Folder {
+                blockers.push(Blocker {
+                    code: "folder_children_unknown".to_owned(),
+                    reason: "The folder's children were not imported or inspected recursively."
+                        .to_owned(),
+                });
+            }
+            items.push(InventoryItem {
+                id: entry.id,
+                parent_id: None,
+                label: entry.name.clone(),
+                kind,
+                logical_bytes,
+                recovery_lower_bytes: None,
+                recovery_upper_bytes: None,
+                storage_identity: None,
+                blockers,
+                evidence: vec![EvidenceRef {
+                    id: disk_steward_core::EvidenceId::new(),
+                    summary: format!(
+                        "Observation {observation} at {breadcrumb_text}. Shallow immediate-entry metadata only; no paths or contents were retained. Per-entry logical sizes may overlap through hard links or aliases."
+                    ),
+                }],
+                suggestion: Suggestion {
+                    choice: Choice::Keep,
+                    rationale: "Keep by default until a person reviews evidence and the storage scope.".to_owned(),
+                },
+            });
+        }
+        if items.is_empty() {
+            return Err("no_importable_entries");
+        }
+        Ok(items)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn blocked_items_for_observation(
+        &self,
+        _: InventoryItemId,
+    ) -> Result<Vec<disk_steward_plan_model::InventoryItem>, &'static str> {
+        Err("observation_unavailable")
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DirectoryIdentity {
@@ -98,6 +217,7 @@ struct Session {
     frames: Vec<DirectoryFrame>,
     observation_id: InventoryItemId,
     entries: Vec<ObservedEntry>,
+    snapshot: FolderInventorySnapshot,
 }
 
 #[cfg(not(unix))]
@@ -571,6 +691,7 @@ fn selected_root_session(
         frames: vec![frame],
         observation_id: scanned.snapshot.observation_id,
         entries: scanned.entries,
+        snapshot: scanned.snapshot.clone(),
     };
     Ok((session, scanned.snapshot))
 }
@@ -736,6 +857,7 @@ fn navigate_session(
         session.frames.truncate(current_index);
         session.observation_id = scanned.snapshot.observation_id;
         session.entries = scanned.entries;
+        session.snapshot = scanned.snapshot.clone();
         return Ok(scanned.snapshot);
     }
 
@@ -823,6 +945,7 @@ fn navigate_session(
     session.frames.push(child);
     session.observation_id = scanned.snapshot.observation_id;
     session.entries = scanned.entries;
+    session.snapshot = scanned.snapshot.clone();
     Ok(scanned.snapshot)
 }
 
@@ -1224,6 +1347,98 @@ mod tests {
     }
 
     #[test]
+    fn import_mapping_keeps_only_file_and_folder_metadata_blocked_by_default() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("observed.txt"), b"abc").unwrap();
+        fs::create_dir(root.path().join("child-folder")).unwrap();
+        unix_fs::symlink("observed.txt", root.path().join("alias-link")).unwrap();
+        let (session, snapshot) =
+            selected_root_session(root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+
+        let imported = state
+            .blocked_items_for_observation(snapshot.observation_id)
+            .unwrap();
+        assert_eq!(imported.len(), 2);
+        assert!(imported.iter().all(|item| item.parent_id.is_none()));
+        assert!(imported
+            .iter()
+            .all(|item| item.recovery_lower_bytes.is_none()));
+        assert!(imported
+            .iter()
+            .all(|item| item.recovery_upper_bytes.is_none()));
+        assert!(imported.iter().all(|item| item.storage_identity.is_none()));
+        assert!(imported
+            .iter()
+            .all(|item| item.suggestion.choice == disk_steward_plan_model::Choice::Keep));
+        assert!(imported.iter().all(|item| {
+            item.blockers
+                .iter()
+                .any(|blocker| blocker.code == "metadata_only")
+                && item
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.code == "incomplete_coverage")
+        }));
+        let folder = imported
+            .iter()
+            .find(|item| item.kind == disk_steward_plan_model::ItemKind::Folder)
+            .unwrap();
+        assert!(folder
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "folder_children_unknown"));
+        let evidence = &imported[0].evidence[0].summary;
+        let observation_id = serde_json::to_value(snapshot.observation_id)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(evidence.contains(&observation_id));
+        assert!(!evidence.contains(root.path().to_str().unwrap()));
+
+        let stale = state.blocked_items_for_observation(InventoryItemId::new());
+        assert_eq!(stale.unwrap_err(), "stale_observation");
+    }
+
+    #[test]
+    fn import_mapping_refuses_empty_supported_set_and_unsafe_integer_sizes() {
+        let root = tempdir().unwrap();
+        unix_fs::symlink("missing", root.path().join("link-only")).unwrap();
+        let (session, snapshot) =
+            selected_root_session(root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+        assert_eq!(
+            state
+                .blocked_items_for_observation(snapshot.observation_id)
+                .unwrap_err(),
+            "no_importable_entries"
+        );
+
+        let sized_root = tempdir().unwrap();
+        fs::write(sized_root.path().join("large"), b"x").unwrap();
+        let (mut session, snapshot) =
+            selected_root_session(sized_root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        let file = session
+            .snapshot
+            .entries
+            .iter_mut()
+            .find(|entry| entry.kind == "file")
+            .unwrap();
+        file.logical_bytes = Some((MAX_SAFE_JS_INTEGER + 1).to_string());
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+        assert_eq!(
+            state
+                .blocked_items_for_observation(snapshot.observation_id)
+                .unwrap_err(),
+            "unsafe_observed_size"
+        );
+    }
+
+    #[test]
     fn native_selection_inside_a_known_managed_boundary_is_refused() {
         let root = tempdir().unwrap();
         for name in ["Sample.app", "Photos.PHOTOSLIBRARY"] {
@@ -1267,6 +1482,62 @@ mod tests {
         assert_eq!(session.observation_id, snapshot.observation_id);
         assert_eq!(session.frames.len(), 1);
         assert!(navigate_into(&mut session, "child").is_ok());
+    }
+
+    #[test]
+    fn observed_metadata_to_durable_review_stays_blocked_and_replay_is_atomic() {
+        use disk_steward_plan_model::{Choice, PlanEdit};
+        use disk_steward_plan_store::{FixtureScale, GeneralPlanStore};
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("valuable.txt"), b"unchanged").unwrap();
+        let (session, snapshot) =
+            selected_root_session(root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+        let data = tempdir().unwrap();
+        let database = data.path().join("live.sqlite3");
+        let mut store = GeneralPlanStore::open(&database, FixtureScale::EmptyReview).unwrap();
+        let empty = store.get_plan().unwrap();
+        let imported = store
+            .append_items(
+                empty.revision_id,
+                state
+                    .blocked_items_for_observation(snapshot.observation_id)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(imported.items.len(), 1);
+        assert!(!imported.execution_available);
+        assert_eq!(imported.totals.selected_count, 0);
+        assert!(store
+            .append_items(
+                imported.revision_id,
+                state
+                    .blocked_items_for_observation(snapshot.observation_id)
+                    .unwrap()
+            )
+            .is_err());
+        assert_eq!(store.get_plan().unwrap(), imported);
+        let changed = store
+            .edit(
+                imported.revision_id,
+                PlanEdit::SetChoice {
+                    item_id: imported.items[0].item_id,
+                    choice: Choice::Include,
+                },
+            )
+            .unwrap()
+            .snapshot;
+        assert_eq!(changed.totals.selected_count, 0);
+        assert!(!changed.items[0].effective_selected);
+        let review = store.freeze_review(changed.revision_id).unwrap();
+        drop(store);
+        let reopened = GeneralPlanStore::open(&database, FixtureScale::EmptyReview).unwrap();
+        assert_eq!(reopened.get_saved_review(review.review_id).unwrap(), review);
+        assert_eq!(
+            fs::read(root.path().join("valuable.txt")).unwrap(),
+            b"unchanged"
+        );
     }
 
     fn symlink_for_test(target: &Path, link: &Path) {
