@@ -436,3 +436,22 @@ validate tagger identity/timestamps, verify signatures, perform full fsck, prove
 graph completeness, or authorize cleanup. Tests compare all four declared target
 kinds with Git mktag and canonical IDs, and cover raw names, tagger-less framing,
 opaque signature bytes, malformed headers, truncation, limits and controls.
+
+### Selected-root pack closure
+
+`check_pack_graph_closure` inspects a decoded pack from explicit typed roots. It
+requires every reachable commit tree/parent, tree entry and annotated-tag target
+to resolve to an object of the expected kind in that pack. Reachable gitlinks
+are unsupported. An iterative traversal visits each object ID once, while every
+repeated edge still consumes the 16,384-edge limit. Roots are limited to 64;
+existing decoder and per-object parser bounds also apply. Index, queue and visit
+storage use fallible bounded allocation. Identical duplicate pack entries share
+one visit; conflicting entries for an ID are refused.
+
+Only selected-root presence and type closure is established. Unreachable entries
+are not syntax-checked. This is not full Git fsck, complete semantic validation,
+platform path validation, signature verification, fresh remote-ref binding or
+local-work preservation evidence. The caller supplies root types; this stage does
+not infer which roots are required. It remains inactive and grants no cleanup
+eligibility. Logical work limits do not establish a total process-memory bound;
+cooperative controls still require an outer supervised worker.
