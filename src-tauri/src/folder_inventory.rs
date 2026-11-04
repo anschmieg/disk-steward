@@ -17,6 +17,8 @@ const MAX_PAGES_PER_DIRECTORY: u32 = 128;
 const MAX_TREE_SUMMARY_ENTRIES: usize = 4096;
 const MAX_CHECKPOINT_NAMES: usize = 65_536;
 const MAX_CHECKPOINT_NAME_BYTES: usize = 255;
+const MAX_CHECKPOINT_RAW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHECKPOINT_ENCODED_BYTES: usize = 16 * 1024 * 1024 - 4096;
 
 #[cfg(target_os = "macos")]
 // macOS SDK sys/stat.h defines SF_DATALESS as 0x40000000 (Xcode 16 SDK).
@@ -44,6 +46,8 @@ pub(crate) mod checkpoint_commands {
     }
 }
 
+#[cfg(unix)]
+mod checkpoint_prefix;
 #[cfg(unix)]
 mod checkpoint_replay;
 #[cfg(unix)]
@@ -91,6 +95,7 @@ pub struct FolderInventorySnapshot {
     pub page_number: u32,
     pub entries_seen: String,
     pub can_continue: bool,
+    pub can_checkpoint: bool,
 }
 
 fn empty_snapshot(
@@ -113,6 +118,7 @@ fn empty_snapshot(
         page_number: 1,
         entries_seen: "0".to_owned(),
         can_continue: false,
+        can_checkpoint: false,
     }
 }
 
@@ -373,9 +379,9 @@ struct DirectoryCursor {
     identity: DirectoryIdentity,
     page_number: u32,
     entries_seen: u64,
-    /// Exact raw names in the iteration prefix, including entries whose metadata failed.
-    /// Kept only in the native process until the user explicitly saves a checkpoint.
-    replay_names: Vec<Vec<u8>>,
+    /// Bounded exact raw names in the iteration prefix, including metadata failures.
+    /// Checkpoint tracking may become unavailable while ordinary paging continues.
+    replay_prefix: checkpoint_prefix::CheckpointPrefix,
 }
 
 #[cfg(unix)]
@@ -692,26 +698,25 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         return Err("The selected folder changed. Choose it again to inspect it.");
     }
     refuse_dataless_directory(&root_before)?;
-    let mut pending_cursor = cursor;
-    let cursor_baseline = pending_cursor
-        .as_ref()
-        .map(|cursor| cursor.baseline)
-        .unwrap_or(root_before);
-    let mut replay_names = pending_cursor
-        .as_ref()
-        .map(|cursor| cursor.replay_names.clone())
-        .unwrap_or_default();
-    if let Some(cursor) = pending_cursor.as_ref() {
-        if cursor.identity != expected_identity
-            || !root_metadata_matches(&cursor_baseline, &root_before)
-        {
+    let (cursor_baseline, mut replay_prefix, pending_directory, cursor_identity) = match cursor {
+        Some(cursor) => (
+            cursor.baseline,
+            cursor.replay_prefix,
+            Some(cursor.directory),
+            Some(cursor.identity),
+        ),
+        None => (
+            root_before,
+            checkpoint_prefix::CheckpointPrefix::default(),
+            None,
+            None,
+        ),
+    };
+    if let Some(identity) = cursor_identity {
+        if identity != expected_identity || !root_metadata_matches(&cursor_baseline, &root_before) {
             return Err("Folder changed while paging. Choose the folder again.");
         }
     }
-    let directory_result = match pending_cursor.take() {
-        Some(cursor) => Ok(cursor.directory),
-        None => Dir::read_from(fd),
-    };
     if started.elapsed() >= duration {
         snapshot.stop_reason = Some("time_limit");
         return Ok(ScannedDirectory {
@@ -720,8 +725,10 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             cursor: None,
         });
     }
-    let mut directory =
-        directory_result.map_err(|_| "The selected folder could not be read safely.")?;
+    let mut directory = match pending_directory {
+        Some(directory) => directory,
+        None => Dir::read_from(fd).map_err(|_| "The selected folder could not be read safely.")?,
+    };
     let mut raw_entries = 0usize;
     let mut entries_seen = entries_seen;
     let mut logical_bytes = 0u64;
@@ -759,7 +766,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         }
         raw_entries += 1;
         entries_seen = entries_seen.saturating_add(1);
-        replay_names.push(raw_name.to_vec());
+        replay_prefix.push(raw_name);
         if started.elapsed() >= duration {
             snapshot.stop_reason = Some("time_limit");
             break;
@@ -914,13 +921,14 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         && stable
         && page_number < MAX_PAGES_PER_DIRECTORY;
     snapshot.can_continue = continue_paging;
+    snapshot.can_checkpoint = continue_paging && replay_prefix.is_available();
     let cursor = continue_paging.then_some(DirectoryCursor {
         directory,
         baseline: cursor_baseline,
         identity: expected_identity,
         page_number,
         entries_seen,
-        replay_names,
+        replay_prefix,
     });
     Ok(ScannedDirectory {
         snapshot,
@@ -1288,6 +1296,7 @@ fn continue_session(
     if let Err(error) = validate_session_bindings(session, started, duration) {
         session.cursor.take();
         session.snapshot.can_continue = false;
+        session.snapshot.can_checkpoint = false;
         return Err(error);
     }
     let cursor = session
@@ -1297,12 +1306,15 @@ fn continue_session(
     if !session.snapshot.can_continue
         || session.snapshot.page_number != cursor.page_number
         || session.snapshot.entries_seen != cursor.entries_seen.to_string()
+        || session.snapshot.can_checkpoint != cursor.replay_prefix.is_available()
     {
         session.snapshot.can_continue = false;
+        session.snapshot.can_checkpoint = false;
         return Err("Folder paging state changed. Choose the folder again to inspect it.");
     }
     let Some(next_page) = cursor.page_number.checked_add(1) else {
         session.snapshot.can_continue = false;
+        session.snapshot.can_checkpoint = false;
         return Err("Folder paging limit reached. Choose the folder again to inspect it.");
     };
     let entries_seen = cursor.entries_seen;
@@ -1329,11 +1341,13 @@ fn continue_session(
         Ok(scanned) => scanned,
         Err(error) => {
             session.snapshot.can_continue = false;
+            session.snapshot.can_checkpoint = false;
             return Err(error);
         }
     };
     if let Err(error) = validate_session_bindings(session, started, duration) {
         session.snapshot.can_continue = false;
+        session.snapshot.can_checkpoint = false;
         return Err(error);
     }
     session.observation_id = scanned.snapshot.observation_id;
@@ -1898,6 +1912,39 @@ mod tests {
         assert_eq!(names.len(), 6);
         assert!(names.iter().all(|name| name.starts_with("item-")));
         assert!(end.entries.len() <= 3);
+    }
+
+    #[test]
+    fn unavailable_checkpoint_prefix_does_not_interrupt_ordinary_paging() {
+        let root = tempdir().unwrap();
+        for index in 0..4 {
+            fs::write(root.path().join(format!("item-{index}")), b"x").unwrap();
+        }
+        let (mut session, first) = selected_root_session(root.path(), 2, MAX_DURATION).unwrap();
+        assert!(first.can_continue);
+        assert!(first.can_checkpoint);
+        session.cursor.as_mut().unwrap().replay_prefix =
+            checkpoint_prefix::CheckpointPrefix::unavailable_for_tests();
+        session.snapshot.can_checkpoint = false;
+        assert!(
+            checkpoint_replay::capture(&session, disk_steward_core::RevisionId::new()).is_err()
+        );
+
+        let mut names = first
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        while session.snapshot.can_continue {
+            let page = continue_current_page(&mut session, 2).unwrap();
+            assert!(!page.can_checkpoint);
+            names.extend(page.entries.into_iter().map(|entry| entry.name));
+        }
+        assert!(session.snapshot.enumeration_complete);
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4);
+        assert!(names.iter().all(|name| name.starts_with("item-")));
     }
 
     #[test]

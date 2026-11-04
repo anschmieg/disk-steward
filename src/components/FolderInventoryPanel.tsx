@@ -8,6 +8,7 @@ export type FolderInventory = {
   pageNumber: number;
   entriesSeen: string;
   canContinue: boolean;
+  canCheckpoint: boolean;
   observationId: string;
   breadcrumbs: string[];
   canGoBack: boolean;
@@ -159,7 +160,9 @@ export default function FolderInventoryPanel({
       if (nextPage) setTreeSummary(null);
       if (nextPage)
         setSnapshot((previous) =>
-          previous ? { ...previous, canContinue: false } : previous,
+          previous
+            ? { ...previous, canContinue: false, canCheckpoint: false }
+            : previous,
         );
       setMessage(
         nextPage
@@ -174,11 +177,13 @@ export default function FolderInventoryPanel({
       onBusyChange(false);
     }
   };
-  const checkpointAction = async (action: "save" | "resume" | "forget") => {
+  const checkpointAction = async (
+    action: "save" | "resume" | "forget" | "inspect",
+  ) => {
     if (
       !native ||
       activeRequest.current ||
-      (action === "save" && !snapshot?.canContinue)
+      (action === "save" && (!snapshot?.canContinue || !snapshot.canCheckpoint))
     )
       return;
     if (action === "forget" && !checkpoint) return;
@@ -200,7 +205,13 @@ export default function FolderInventoryPanel({
           "get_folder_checkpoint",
         );
         setCheckpoint(saved);
-        if (action === "save") {
+        if (action === "inspect") {
+          setMessage(
+            saved
+              ? "Saved checkpoint inspected. No folder access was requested."
+              : "No saved folder checkpoint is available. Choose a folder to start a new observation.",
+          );
+        } else if (action === "save") {
           const next = await invoke<FolderCheckpoint>(
             "save_folder_checkpoint",
             {
@@ -436,6 +447,13 @@ export default function FolderInventoryPanel({
       <button
         className="button secondary"
         disabled={busy || !native}
+        onClick={() => void checkpointAction("inspect")}
+      >
+        Inspect saved checkpoint
+      </button>
+      <button
+        className="button secondary"
+        disabled={busy || !native}
         onClick={() => void checkpointAction("resume")}
       >
         Resume saved folder scan
@@ -475,16 +493,29 @@ export default function FolderInventoryPanel({
         <>
           <button
             className="button secondary"
-            disabled={busy || !native || !snapshot.canContinue}
+            disabled={
+              busy ||
+              !native ||
+              !snapshot.canContinue ||
+              !snapshot.canCheckpoint
+            }
             onClick={() => void checkpointAction("save")}
           >
             Save folder checkpoint
           </button>
           <p>
-            Save only an incomplete, stable paging observation. Saving replaces
+            Save only an incomplete, stable paging observation. Checkpoint name
+            and memory limits are independent of folder paging. Saving replaces
             the previous checkpoint after a revision check. It does not add
             entries to your plan or save subtree summaries.
           </p>
+          {snapshot.canContinue && !snapshot.canCheckpoint && (
+            <p>
+              Checkpoint tracking is unavailable because its name or memory
+              limits were reached. You can continue paging; a refresh starts a
+              new observation.
+            </p>
+          )}
           <button
             className="button secondary"
             disabled={busy || !native}

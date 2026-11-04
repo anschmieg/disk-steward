@@ -39,6 +39,7 @@ test("returning from review and unavailable example pages retains the bounded ex
         pageNumber: 3,
         entriesSeen: "1025",
         canContinue: true,
+        canCheckpoint: true,
         breadcrumbs: ["Retained folder"],
         canGoBack: false,
         enumerationComplete: false,

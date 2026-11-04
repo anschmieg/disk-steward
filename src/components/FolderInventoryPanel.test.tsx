@@ -17,6 +17,7 @@ const sample: FolderInventory = {
   pageNumber: 1,
   entriesSeen: "3",
   canContinue: true,
+  canCheckpoint: true,
   observationId: "observation-1",
   breadcrumbs: ["Chosen folder"],
   canGoBack: false,
@@ -876,4 +877,54 @@ test("successful forgetting clears only checkpoint UI while completed pages cann
     screen.queryByRole("region", { name: "Saved folder checkpoint" }),
   ).not.toBeInTheDocument();
   expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+});
+
+test("checkpoint tracking limits disable saving without blocking folder paging", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce({ ...sample, canCheckpoint: false })
+    .mockResolvedValueOnce({
+      ...sample,
+      observationId: "next-page",
+      pageNumber: 2,
+      canCheckpoint: false,
+    });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  const save = screen.getByRole("button", { name: "Save folder checkpoint" });
+  expect(save).toBeDisabled();
+  expect(
+    screen.getByText(/Checkpoint tracking is unavailable/),
+  ).toHaveTextContent("You can continue paging");
+  fireEvent.click(save);
+  expect(invoke).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  await waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Next page" })).toBeEnabled(),
+  );
+  expect(invoke).toHaveBeenLastCalledWith("continue_folder_inventory", {
+    request: { expectedObservationId: "observation-1" },
+  });
+  expect(save).toBeDisabled();
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+});
+
+test("saved checkpoint inspection offers metadata and forgetting without native source access", async () => {
+  vi.mocked(invoke).mockResolvedValueOnce(savedCheckpoint);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Inspect saved checkpoint" }),
+  );
+  await screen.findByText(
+    /Saved checkpoint inspected\. No folder access was requested/,
+  );
+  expect(invoke).toHaveBeenCalledExactlyOnceWith("get_folder_checkpoint");
+  expect(
+    screen.getByRole("region", { name: "Saved folder checkpoint" }),
+  ).toHaveTextContent("Chosen folder");
+  expect(
+    screen.getByRole("button", { name: "Forget saved checkpoint" }),
+  ).toBeEnabled();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
 });
