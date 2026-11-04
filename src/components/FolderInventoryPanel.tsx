@@ -1,3 +1,4 @@
+import PytestCachePanel from "./PytestCachePanel";
 import DuplicateComparisonPanel from "./DuplicateComparisonPanel";
 import {
   formatObservationTime,
@@ -1267,6 +1268,17 @@ export default function FolderInventoryPanel({
               <option value="name">Name</option>
             </select>
           </label>
+          <PytestCachePanel
+            key={`pytest-${snapshot.observationId}`}
+            snapshot={snapshot}
+            native={native}
+            busy={busy}
+            onBusyChange={(running) => {
+              activeRequest.current = running;
+              setBusy(running);
+              onBusyChange(running);
+            }}
+          />
           <DuplicateComparisonPanel
             onOpenPlan={onOpenPlan}
             key={snapshot.observationId}

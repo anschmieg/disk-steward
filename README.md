@@ -115,3 +115,26 @@ On a current folder page, explicitly select 2–32 regular files and allow local
 Each selected file is limited to 16 MiB, total selected input to 64 MiB, and cumulative actual reads to 192 MiB. SHA-256 groups are verified by a full streaming byte comparison; no digest, path or file content enters renderer output or persistent comparison storage. Work uses fixed buffers, one active native operation and cooperative five-second checks. Cancel signals only the exact active attempt; the interface stays busy until native work settles. In-flight filesystem calls may block longer than the cooperative interval. Known dataless files are refused, but other content availability and provider behavior remain unverified: explicit selected reads may trigger provider I/O, whose traffic is not measured by this app. Reads may update filesystem access metadata, but this tool writes no source contents.
 
 Matching groups are historical evidence for the explicitly selected files only. No-match results do not mean the folder is clean. The UI retains previous successful evidence as historical after a failed attempt. Results establish no dispensability, unique physical/reclaimable bytes, survivor approval or cleanup authority; APFS sharing and later changes remain uncertain. Validated stage/restore/separate-purge integration, the named generated/cache families and full M3/MVP acceptance remain open.
+
+### Explicit pytest cache record inspection (D3, format evidence only)
+
+From a selected project folder, explicitly navigate `.pytest_cache/v/cache` and
+select `nodeids` and/or `lastfailed`. This exact dot-folder can be opened for
+metadata navigation; other hidden-folder traversal rules still apply. With
+per-attempt consent, native inspection reads at most two 64KiB records through
+retained no-follow file handles, rechecks metadata/scope/exclusions, and runs the
+bounded structural parser. It returns record counts and a tested format
+reference version, without returning node IDs, record contents, paths or hashes.
+
+The reference is pytest9.2.0; matching structure does not prove installed or
+producing version, ownership, freshness, idle tests or regeneration. Unknown or
+invalid records refuse, and live cleanup stays disabled. No pytest, project hook
+or plugin runs during inspection. Known dataless/protected scopes refuse; other
+provider availability is unverified, and explicitly reading selected records may
+cause provider I/O. The common two-second limit is cooperative and cannot
+interrupt an in-flight filesystem call. Cancel remains busy until work settles.
+
+Native ownership/active-use checks and the separately reviewed staging,
+restoration and permanent-removal adapter remain required for executable D3.
+See the [format corpus](probes/generated_cache/README.md) and
+[current scope](.autonomous/disk-steward/m3-native-pytest-records-scope.md).

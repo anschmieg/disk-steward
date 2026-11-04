@@ -47,6 +47,19 @@ pub(crate) mod checkpoint_commands {
 }
 
 #[cfg(unix)]
+pub(crate) mod pytest_records;
+#[cfg(not(unix))]
+pub(crate) mod pytest_records {
+    #[tauri::command]
+    pub(crate) async fn inspect_pytest_cache_records() -> Result<(), String> {
+        Err("Pytest record inspection is unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn cancel_pytest_cache_inspection() -> Result<(), String> {
+        Err("Pytest record inspection is unsupported on this platform.".into())
+    }
+}
+#[cfg(unix)]
 pub(crate) mod duplicate_compare;
 #[cfg(unix)]
 mod duplicate_content;
@@ -804,7 +817,7 @@ fn folder_navigation_blocker(
         Some("dataless")
     } else if stat.st_dev as u64 != root_device {
         Some("cross_device")
-    } else if name.first() == Some(&b'.') {
+    } else if name.first() == Some(&b'.') && name != b".pytest_cache" {
         Some("hidden")
     } else if is_managed_boundary(name) {
         Some("managed_boundary")
@@ -2318,6 +2331,26 @@ mod tests {
             folder_navigation_blocker(&stat, b".hidden", root_device, 1),
             Some("hidden")
         );
+        // Only explicit navigation of this exact cache directory is allowed;
+        // its name does not establish ownership or cleanup eligibility.
+        assert_eq!(
+            folder_navigation_blocker(&stat, b".pytest_cache", root_device, 1),
+            None
+        );
+        for name in [b".pytest_cache-extra".as_slice(), b".Pytest_cache", b".git"] {
+            assert_eq!(
+                folder_navigation_blocker(&stat, name, root_device, 1),
+                Some("hidden")
+            );
+        }
+        assert_eq!(
+            folder_navigation_blocker(&stat, b".pytest_cache", root_device ^ 1, 1),
+            Some("cross_device")
+        );
+        assert_eq!(
+            folder_navigation_blocker(&stat, b".pytest_cache", root_device, MAX_NAVIGATION_DEPTH),
+            Some("depth_limit")
+        );
         assert_eq!(
             folder_navigation_blocker(&stat, b"Mock.app", root_device, 1),
             Some("managed_boundary")
@@ -2876,6 +2909,42 @@ mod tests {
             fs::read(root.path().join("child/note.txt")).unwrap(),
             b"unchanged"
         );
+    }
+
+    #[test]
+    fn explicit_pytest_navigation_remains_metadata_only_and_blocked_from_cleanup() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join(".pytest_cache/v/cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir(root.path().join(".private")).unwrap();
+        let bytes =
+            include_bytes!("../../probes/generated_cache/fixtures/pytest-9.2.0/nodeids.json");
+        fs::write(cache.join("nodeids"), bytes).unwrap();
+        let (mut session, _) =
+            selected_root_session(root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        assert!(
+            !session
+                .entries
+                .iter()
+                .find(|entry| entry.name == b".private")
+                .unwrap()
+                .can_open
+        );
+        navigate_into(&mut session, ".pytest_cache").unwrap();
+        navigate_into(&mut session, "v").unwrap();
+        let page = navigate_into(&mut session, "cache").unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].name, "nodeids");
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+        let items = state
+            .blocked_items_for_observation(page.observation_id)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].blockers.is_empty());
+        assert!(items[0].recovery_lower_bytes.is_none());
+        assert!(items[0].recovery_upper_bytes.is_none());
+        assert_eq!(fs::read(cache.join("nodeids")).unwrap(), bytes);
     }
 
     #[test]

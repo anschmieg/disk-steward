@@ -13,6 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+disk-steward-generated-evidence = { path = "../crates/generated-evidence" }
 disk-steward-exclusion-store = { path = "../crates/exclusion-store" }
 disk-steward-plan-model = { path = "../crates/plan-model" }
 disk-steward-plan-store = { path = "../crates/plan-store" }
