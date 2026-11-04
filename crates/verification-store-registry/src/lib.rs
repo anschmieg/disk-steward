@@ -447,6 +447,58 @@ impl VerificationStoreRegistry {
         Ok(record)
     }
 
+    /// Mark an incomplete live attempt as needing reconciliation without
+    /// changing its identity or reservation. This records failure state only;
+    /// it does not adopt the store or authorize cleanup.
+    pub fn require_reconciliation(
+        &mut self,
+        id: &str,
+        expected: StoreState,
+    ) -> Result<StoreRecord, RegistryError> {
+        self.validate_lease()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RegistryError::Storage)?;
+        validate_schema(&tx)?;
+        validate_records(&tx)?;
+        validate_id(id)?;
+        if !matches!(
+            expected,
+            StoreState::Registered
+                | StoreState::Active
+                | StoreState::Stopped
+                | StoreState::CleanupPending
+        ) {
+            return Err(RegistryError::InvalidTransition);
+        }
+        let changed = tx.execute(
+            "UPDATE verification_stores SET state='needs_reconciliation', prior_state=?2 WHERE store_id=?1 AND state=?2",
+            params![id, expected.as_str()],
+        ).map_err(|_| RegistryError::Storage)?;
+        if changed == 0 {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM verification_stores WHERE store_id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| RegistryError::Storage)?;
+            return Err(if exists {
+                RegistryError::StaleState
+            } else {
+                RegistryError::NotFound
+            });
+        }
+        let record = tx.query_row(
+            "SELECT store_id,parent_dev,parent_ino,root_dev,root_ino,state,prior_state,reserved_bytes FROM verification_stores WHERE store_id=?1",
+            [id],
+            read_record,
+        ).map_err(|_| RegistryError::Storage)?;
+        tx.commit().map_err(|_| RegistryError::Storage)?;
+        Ok(record)
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<StoreRecord>, RegistryError> {
         self.validate_lease()?;
         let tx = self
@@ -893,6 +945,13 @@ impl VerificationStoreRegistry {
     ) -> Result<StoreRecord, RegistryError> {
         Err(RegistryError::UnsupportedPlatform)
     }
+    pub fn require_reconciliation(
+        &mut self,
+        _: &str,
+        _: StoreState,
+    ) -> Result<StoreRecord, RegistryError> {
+        Err(RegistryError::UnsupportedPlatform)
+    }
     pub fn get(&self, _: &str) -> Result<Option<StoreRecord>, RegistryError> {
         Err(RegistryError::UnsupportedPlatform)
     }
@@ -983,6 +1042,170 @@ mod tests {
             registry.transition(id, StoreState::NeedsReconciliation, StoreState::Active),
             Err(RegistryError::InvalidTransition)
         ));
+    }
+
+    #[test]
+    fn live_reconciliation_latch_preserves_identity_reservation_and_prior_state() {
+        let (_dir, path) = setup();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
+        let cases = [
+            ("10000000000000000000000000000001", StoreState::Registered),
+            ("10000000000000000000000000000002", StoreState::Active),
+            ("10000000000000000000000000000003", StoreState::Stopped),
+            (
+                "10000000000000000000000000000004",
+                StoreState::CleanupPending,
+            ),
+        ];
+        for (index, (id, expected)) in cases.iter().enumerate() {
+            let identity = (
+                index as u64 + 10,
+                index as u64 + 20,
+                index as u64 + 30,
+                index as u64 + 40,
+            );
+            registry
+                .register(id, identity.0, identity.1, identity.2, identity.3)
+                .unwrap();
+            registry.reserve(id, 0, 4096 + index as u64).unwrap();
+            for (from, to) in [
+                (StoreState::Registered, StoreState::Active),
+                (StoreState::Active, StoreState::Stopped),
+                (StoreState::Stopped, StoreState::CleanupPending),
+            ] {
+                if *expected == StoreState::Registered {
+                    break;
+                }
+                registry.transition(id, from, to).unwrap();
+                if *expected == to {
+                    break;
+                }
+            }
+        }
+        for (index, (id, expected)) in cases.iter().enumerate() {
+            let record = registry.require_reconciliation(id, *expected).unwrap();
+            assert_eq!(record.state, StoreState::NeedsReconciliation);
+            assert_eq!(record.prior_state, Some(*expected));
+            assert_eq!(record.reserved_bytes, 4096 + index as u64);
+            let identity = (
+                index as u64 + 10,
+                index as u64 + 20,
+                index as u64 + 30,
+                index as u64 + 40,
+            );
+            assert_eq!(
+                (
+                    record.parent_dev,
+                    record.parent_ino,
+                    record.root_dev,
+                    record.root_ino
+                ),
+                identity
+            );
+            assert!(matches!(
+                registry.require_reconciliation(id, *expected),
+                Err(RegistryError::StaleState)
+            ));
+            assert!(matches!(
+                registry.require_reconciliation(id, StoreState::NeedsReconciliation),
+                Err(RegistryError::InvalidTransition)
+            ));
+        }
+        drop(registry);
+        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        for (id, expected) in cases {
+            let record = registry.get(id).unwrap().unwrap();
+            assert_eq!(record.state, StoreState::NeedsReconciliation);
+            assert_eq!(record.prior_state, Some(expected));
+        }
+    }
+
+    #[test]
+    fn live_reconciliation_latch_refuses_invalid_stale_missing_and_complete_rows() {
+        let (_dir, path) = setup();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
+        let id = "20000000000000000000000000000001";
+        registry.register(id, 1, 2, 3, 4).unwrap();
+        registry.reserve(id, 0, 8192).unwrap();
+        assert!(matches!(
+            registry.require_reconciliation(id, StoreState::Active),
+            Err(RegistryError::StaleState)
+        ));
+        assert!(matches!(
+            registry.require_reconciliation("not-an-id", StoreState::Registered),
+            Err(RegistryError::InvalidInput)
+        ));
+        assert!(matches!(
+            registry
+                .require_reconciliation("20000000000000000000000000000002", StoreState::Registered),
+            Err(RegistryError::NotFound)
+        ));
+        let registered = registry.get(id).unwrap().unwrap();
+        assert_eq!(registered.state, StoreState::Registered);
+        assert_eq!(registered.reserved_bytes, 8192);
+        registry
+            .transition(id, StoreState::Registered, StoreState::Active)
+            .unwrap();
+        registry
+            .transition(id, StoreState::Active, StoreState::Stopped)
+            .unwrap();
+        registry
+            .transition(id, StoreState::Stopped, StoreState::CleanupPending)
+            .unwrap();
+        registry
+            .transition(id, StoreState::CleanupPending, StoreState::CleanupComplete)
+            .unwrap();
+        assert!(matches!(
+            registry.require_reconciliation(id, StoreState::CleanupComplete),
+            Err(RegistryError::InvalidTransition)
+        ));
+        assert!(matches!(
+            registry.require_reconciliation(id, StoreState::Registered),
+            Err(RegistryError::StaleState)
+        ));
+        let complete = registry.get(id).unwrap().unwrap();
+        assert_eq!(complete.state, StoreState::CleanupComplete);
+        assert_eq!(complete.prior_state, None);
+        assert_eq!(complete.reserved_bytes, 8192);
+    }
+
+    #[test]
+    fn live_reconciliation_latch_blocks_admission_across_registered_rows() {
+        let (_dir, path) = setup();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
+        let a = "30000000000000000000000000000001";
+        let b = "30000000000000000000000000000002";
+        let c = "30000000000000000000000000000003";
+        registry.register(a, 1, 2, 3, 4).unwrap();
+        registry.register(b, 5, 6, 7, 8).unwrap();
+        registry.register(c, 9, 10, 11, 12).unwrap();
+        registry.reserve(a, 0, 1024).unwrap();
+        registry.reserve(b, 0, 2048).unwrap();
+        registry.reserve(c, 0, 4096).unwrap();
+        registry
+            .transition(b, StoreState::Registered, StoreState::Active)
+            .unwrap();
+        registry
+            .require_reconciliation(a, StoreState::Registered)
+            .unwrap();
+        assert_eq!(
+            registry
+                .transition(b, StoreState::Active, StoreState::Stopped)
+                .unwrap()
+                .state,
+            StoreState::Stopped
+        );
+        assert!(matches!(
+            registry.reserve(c, 4096, 8192),
+            Err(RegistryError::ReconciliationRequired)
+        ));
+        assert_eq!(registry.get(b).unwrap().unwrap().reserved_bytes, 2048);
+        assert_eq!(registry.get(b).unwrap().unwrap().state, StoreState::Stopped);
+        assert_eq!(registry.get(c).unwrap().unwrap().reserved_bytes, 4096);
+        assert_eq!(
+            registry.get(c).unwrap().unwrap().state,
+            StoreState::Registered
+        );
     }
 
     #[test]
@@ -1343,6 +1566,10 @@ mod tests {
             Err(RegistryError::UnsupportedSchema)
         ));
         assert!(matches!(
+            registry.require_reconciliation(id, StoreState::Registered),
+            Err(RegistryError::UnsupportedSchema)
+        ));
+        assert!(matches!(
             registry.register("dddddddddddddddddddddddddddddddd", 1, 2, 3, 4),
             Err(RegistryError::UnsupportedSchema)
         ));
@@ -1433,7 +1660,7 @@ mod tests {
     #[test]
     fn replaced_lease_and_database_paths_are_refused() {
         let (dir, path) = setup();
-        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
         let lease = sibling(&path, ".lease").unwrap();
         let moved_lease = dir.path().join("old.lease");
         fs::rename(&lease, &moved_lease).unwrap();
@@ -1447,10 +1674,15 @@ mod tests {
             registry.get("ffffffffffffffffffffffffffffffff"),
             Err(RegistryError::UnsafePath)
         ));
+        assert!(matches!(
+            registry
+                .require_reconciliation("ffffffffffffffffffffffffffffffff", StoreState::Registered),
+            Err(RegistryError::UnsafePath)
+        ));
         drop(registry);
 
         let (_dir, path) = setup();
-        let registry = VerificationStoreRegistry::open(&path).unwrap();
+        let mut registry = VerificationStoreRegistry::open(&path).unwrap();
         let moved_db = path.with_extension("old");
         fs::rename(&path, &moved_db).unwrap();
         OpenOptions::new()
@@ -1461,6 +1693,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             registry.get("ffffffffffffffffffffffffffffffff"),
+            Err(RegistryError::UnsafePath)
+        ));
+        assert!(matches!(
+            registry
+                .require_reconciliation("ffffffffffffffffffffffffffffffff", StoreState::Registered),
             Err(RegistryError::UnsafePath)
         ));
     }
