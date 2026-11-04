@@ -38,6 +38,7 @@ type Props = {
 type Row = { key: string; groupId: string; itemId?: string; item?: EditorItem };
 const ROW_HEIGHT = 58;
 const WINDOW_HEIGHT = 464;
+const VIRTUAL_ROW_COUNT = Math.ceil(WINDOW_HEIGHT / ROW_HEIGHT) + 6;
 const choiceLabel: Record<PlanChoice, string> = {
   include: "Include",
   keep: "Keep",
@@ -79,18 +80,38 @@ export default function AdvancedPlanPanel({
   const [descendantSearch, setDescendantSearch] = useState("");
   const [descendantPage, setDescendantPage] = useState(0);
   const scroller = useRef<HTMLDivElement>(null);
+  const panelRoot = useRef<HTMLElement>(null);
   const rowRefs = useRef(new Map<string, HTMLElement>());
   const pendingFocusRow = useRef<string | null>(null);
   const focusContext = useRef<{
     focusKey: string | null;
     itemId: string | null;
     rowKey: string | null;
-  }>({ focusKey: null, itemId: null, rowKey: null });
+    groupId: string | null;
+  }>({ focusKey: null, itemId: null, rowKey: null, groupId: null });
   const lastRevision = useRef(snapshot.revisionId);
   const pendingFocusRestore = useRef(false);
+  const focusRestoreGeneration = useRef(0);
   const items = useMemo(
     () => new Map(snapshot.items.map((item) => [item.itemId, item])),
     [snapshot.items],
+  );
+  const hiddenRemovedItemIds = useMemo(
+    () =>
+      new Set(
+        snapshot.items
+          .filter((item) => !item.inPlan)
+          .map((item) => item.itemId),
+      ),
+    [snapshot.items],
+  );
+  const hasHiddenRemovedGroupMembers = useMemo(
+    () =>
+      !showRemoved &&
+      snapshot.groups.some((group) =>
+        group.memberIds.some((itemId) => hiddenRemovedItemIds.has(itemId)),
+      ),
+    [showRemoved, snapshot.groups, hiddenRemovedItemIds],
   );
   const maxKnownLogicalBytes = useMemo(
     () => Math.max(0, ...snapshot.items.map((item) => item.logicalBytes ?? 0)),
@@ -175,15 +196,26 @@ export default function AdvancedPlanPanel({
     collator,
   ]);
   const visibleRows = useMemo(() => {
-    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 3);
+    const lastValidStart = Math.max(0, rows.length - VIRTUAL_ROW_COUNT);
+    const start = Math.min(
+      lastValidStart,
+      Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 3),
+    );
     return {
       start,
-      rows: rows.slice(
-        start,
-        start + Math.ceil(WINDOW_HEIGHT / ROW_HEIGHT) + 6,
-      ),
+      rows: rows.slice(start, start + VIRTUAL_ROW_COUNT),
     };
   }, [rows, scrollTop]);
+  useLayoutEffect(() => {
+    const container = scroller.current;
+    if (!container) return;
+    const viewportHeight = container.clientHeight || WINDOW_HEIGHT;
+    const maximum = Math.max(0, rows.length * ROW_HEIGHT - viewportHeight);
+    if (scrollTop > maximum) {
+      setScrollTop(maximum);
+      if (container.scrollTop > maximum) container.scrollTop = maximum;
+    }
+  }, [rows.length, scrollTop]);
   const requestFocusRow = (index: number) => {
     const boundedIndex = Math.max(0, Math.min(rows.length - 1, index));
     const next = rows[boundedIndex];
@@ -231,12 +263,28 @@ export default function AdvancedPlanPanel({
       pendingFocusRestore.current = true;
     }
     if (busy || !pendingFocusRestore.current) return;
-    pendingFocusRestore.current = false;
     const previous = focusContext.current;
-    requestAnimationFrame(() => {
+    const focusedWhenScheduled = document.activeElement;
+    const generation = ++focusRestoreGeneration.current;
+    let completed = false;
+    const frame = requestAnimationFrame(() => {
+      if (focusRestoreGeneration.current !== generation) return;
+      completed = true;
+      pendingFocusRestore.current = false;
+      if (focusContext.current !== previous) return;
+      const currentFocus = document.activeElement;
+      if (
+        currentFocus !== focusedWhenScheduled &&
+        currentFocus instanceof HTMLElement &&
+        currentFocus !== document.body &&
+        currentFocus !== document.documentElement
+      )
+        return;
       if (previous.focusKey) {
         const eligible = Array.from(
-          document.querySelectorAll<HTMLElement>("[data-editor-focus]"),
+          panelRoot.current?.querySelectorAll<HTMLElement>(
+            "[data-editor-focus]",
+          ) ?? [],
         ).find((element) => element.dataset.editorFocus === previous.focusKey);
         if (eligible && !eligible.matches(":disabled")) {
           eligible.focus({ preventScroll: true });
@@ -258,9 +306,28 @@ export default function AdvancedPlanPanel({
         if (row) {
           const index = rows.indexOf(row);
           requestFocusRow(index);
+          return;
         }
       }
+      if (previous.groupId) {
+        const groupIndex = rows.findIndex(
+          (row) => row.groupId === previous.groupId && !row.item,
+        );
+        if (groupIndex >= 0) {
+          requestFocusRow(groupIndex);
+          return;
+        }
+      }
+      if ((previous.itemId || previous.rowKey) && rows.length > 0)
+        requestFocusRow(0);
     });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (focusRestoreGeneration.current === generation) {
+        focusRestoreGeneration.current += 1;
+        if (!completed) pendingFocusRestore.current = true;
+      }
+    };
   }, [snapshot.revisionId, busy, rows]);
   const descendants = useMemo(() => {
     if (!inspected || inspected.kind !== "folder") return [] as EditorItem[];
@@ -303,20 +370,53 @@ export default function AdvancedPlanPanel({
     1,
     Math.ceil(filteredDescendants.length / 50),
   );
+  const lastDescendantsPage = descendantsPageCount - 1;
+  const boundedDescendantPage = Math.min(descendantPage, lastDescendantsPage);
   const pagedDescendants = filteredDescendants.slice(
-    descendantPage * 50,
-    descendantPage * 50 + 50,
+    boundedDescendantPage * 50,
+    boundedDescendantPage * 50 + 50,
   );
+  // Only the visible page needs display context. Keep the existing traversal
+  // depth bound and avoid materializing paths for the whole 10,000-item plan.
+  const descendantContexts = new Map<string, string>();
+  for (const child of pagedDescendants) {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([child.itemId]);
+    let parentId = child.parentId;
+    while (
+      parentId &&
+      parentId !== inspected?.itemId &&
+      ancestors.length < 64
+    ) {
+      if (seen.has(parentId)) break;
+      seen.add(parentId);
+      const parent = items.get(parentId);
+      if (!parent) break;
+      ancestors.unshift(parent.label);
+      parentId = parent.parentId;
+    }
+    if (parentId !== inspected?.itemId)
+      ancestors.unshift("Incomplete location");
+    descendantContexts.set(child.itemId, ancestors.join(" › "));
+  }
+  useEffect(() => {
+    if (descendantPage > lastDescendantsPage)
+      setDescendantPage(lastDescendantsPage);
+  }, [descendantPage, lastDescendantsPage]);
   useEffect(() => setDescendantPage(0), [inspectedId, descendantSearch]);
   const captureFocus = (event: React.FocusEvent<HTMLElement>) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
     const keyed = target.closest<HTMLElement>("[data-editor-focus]");
     const row = target.closest<HTMLElement>("[data-editor-row]");
+    const rowKey = row?.dataset.editorRow ?? null;
     focusContext.current = {
       focusKey: keyed?.dataset.editorFocus ?? null,
       itemId: row?.dataset.itemId ?? null,
-      rowKey: row?.dataset.editorRow ?? null,
+      rowKey,
+      groupId: rowKey
+        ? (rows.find((entry) => entry.key === rowKey)?.groupId ?? null)
+        : null,
     };
   };
   const setChoice = (item: EditorItem, choice: PlanChoice) =>
@@ -329,6 +429,7 @@ export default function AdvancedPlanPanel({
     : 0;
   return (
     <section
+      ref={panelRoot}
       className="advanced-plan"
       aria-labelledby="advanced-plan-title"
       onFocusCapture={captureFocus}
@@ -479,6 +580,11 @@ export default function AdvancedPlanPanel({
               Show removed items
             </label>
           </div>
+          {hasHiddenRemovedGroupMembers && (
+            <p className="ap-window-note" aria-live="polite">
+              Show removed items before changing a group that contains them.
+            </p>
+          )}
           {normalizedQuery && (
             <p className="ap-window-note">
               Summary totals include the whole plan, including findings hidden
@@ -510,9 +616,26 @@ export default function AdvancedPlanPanel({
                 if (!item) {
                   const label = group?.label ?? "Other findings";
                   const count = group?.memberIds.length ?? 0;
+                  const hasHiddenRemovedMembers = Boolean(
+                    group &&
+                    !showRemoved &&
+                    group.memberIds.some((itemId) =>
+                      hiddenRemovedItemIds.has(itemId),
+                    ),
+                  );
+                  const groupChoiceDisabled =
+                    editsBlocked ||
+                    Boolean(normalizedQuery) ||
+                    hasHiddenRemovedMembers;
+                  const groupChoiceTitle = normalizedQuery
+                    ? "Clear search before group-wide changes"
+                    : hasHiddenRemovedMembers
+                      ? "Show removed items before group-wide changes"
+                      : undefined;
                   return (
                     <div
                       key={row.key}
+                      data-editor-row={row.key}
                       role="listitem"
                       aria-posinset={index + 1}
                       aria-setsize={rows.length}
@@ -575,15 +698,13 @@ export default function AdvancedPlanPanel({
                       {group && (
                         <div
                           className="ap-group-choice"
+                          role="group"
                           aria-label={`Set all eligible ${label} items`}
                         >
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            data-editor-focus={`group-choice:include:${row.groupId}`}
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -595,12 +716,9 @@ export default function AdvancedPlanPanel({
                             Include group
                           </button>
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            data-editor-focus={`group-choice:keep:${row.groupId}`}
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -612,12 +730,9 @@ export default function AdvancedPlanPanel({
                             Keep group
                           </button>
                           <button
-                            disabled={editsBlocked || Boolean(normalizedQuery)}
-                            title={
-                              normalizedQuery
-                                ? "Clear search before group-wide changes"
-                                : undefined
-                            }
+                            data-editor-focus={`group-choice:investigate:${row.groupId}`}
+                            disabled={groupChoiceDisabled}
+                            title={groupChoiceTitle}
                             onClick={() =>
                               void onEdit({
                                 kind: "setGroupChoice",
@@ -932,7 +1047,7 @@ export default function AdvancedPlanPanel({
                   <div className="ap-descendant-count" aria-live="polite">
                     {filteredDescendants.length === 0
                       ? "No matching descendants"
-                      : `Showing ${descendantPage * 50 + 1}–${Math.min((descendantPage + 1) * 50, filteredDescendants.length)} of ${filteredDescendants.length}`}
+                      : `Showing ${boundedDescendantPage * 50 + 1}–${Math.min((boundedDescendantPage + 1) * 50, filteredDescendants.length)} of ${filteredDescendants.length}`}
                   </div>
                   <div className="ap-descendants">
                     {pagedDescendants.map((child) => {
@@ -965,6 +1080,11 @@ export default function AdvancedPlanPanel({
                           <span>
                             {child.label}
                             <small>{formatBytes(child.logicalBytes)}</small>
+                            {descendantContexts.get(child.itemId) && (
+                              <small>
+                                {descendantContexts.get(child.itemId)}
+                              </small>
+                            )}
                           </span>
                         </label>
                       );
@@ -975,23 +1095,29 @@ export default function AdvancedPlanPanel({
                       <button
                         data-editor-focus={`descendant-previous:${inspected.itemId}`}
                         type="button"
-                        disabled={descendantPage === 0}
+                        disabled={boundedDescendantPage === 0}
                         onClick={() =>
-                          setDescendantPage((page) => Math.max(0, page - 1))
+                          setDescendantPage(
+                            Math.max(0, boundedDescendantPage - 1),
+                          )
                         }
                       >
                         Previous
                       </button>
                       <span>
-                        Page {descendantPage + 1} of {descendantsPageCount}
+                        Page {boundedDescendantPage + 1} of{" "}
+                        {descendantsPageCount}
                       </span>
                       <button
                         data-editor-focus={`descendant-next:${inspected.itemId}`}
                         type="button"
-                        disabled={descendantPage + 1 >= descendantsPageCount}
+                        disabled={boundedDescendantPage >= lastDescendantsPage}
                         onClick={() =>
-                          setDescendantPage((page) =>
-                            Math.min(descendantsPageCount - 1, page + 1),
+                          setDescendantPage(
+                            Math.min(
+                              lastDescendantsPage,
+                              boundedDescendantPage + 1,
+                            ),
                           )
                         }
                       >
