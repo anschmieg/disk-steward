@@ -15,7 +15,7 @@ const MAX_GIT_OUT: usize = 65_536;
 const MAX_PACK: usize = 512;
 // Setup and receiver verification run outside the HTTP attempt. Shared CI can
 // take longer to start a cold system Git; keep RPC supervision at three seconds.
-const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(10);
+const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(30);
 const GIT_RPC_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 
@@ -534,7 +534,7 @@ fn run_real_git_verification() {
     let server_tls = tls.server.clone();
     let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let fetch_transport = candidate_transport(fetch_repository, &tls, address);
-    let mut pack_sink = BudgetFileSink::new(&root, fetch_transport.cancellation_handle()).unwrap();
+    let mut pack_sink = BudgetFileSink::new_for_transport(&root, &fetch_transport).unwrap();
     let inspection_repo = repo.clone();
     let expected_commit = commit.clone();
     let expected_tag = tag_object.clone();
@@ -612,6 +612,10 @@ fn run_real_git_verification() {
     let advertised_closure = pack_sink
         .decode_download(&fetch_report, 4096, Instant::now() + Duration::from_secs(5))
         .unwrap();
+    assert_eq!(
+        pack_sink.ingress_bytes_charged(),
+        fetch_report.finalization().observed_ingress_bytes()
+    );
     let pack = pack_sink.contents().unwrap();
     let checksum = check_sha1_pack_checksum(
         &mut std::io::Cursor::new(&pack),
@@ -1136,20 +1140,77 @@ fn hex_oid(value: &str) -> [u8; 20] {
 }
 
 #[test]
+fn live_ingress_busy_refuses_pack_write_without_charging_or_writing() {
+    let root = PrivateRoot::create().unwrap();
+    let (transport, server) =
+        super::pack_tests::pack_fixture(super::pack_tests::pack_body(b"PACKbusy-counter-fixture"));
+    let counter = transport.budget.used.clone();
+    let signal = transport.cancellation_handle();
+    let mut sink = BudgetFileSink::new_for_transport(&root, &transport).unwrap();
+
+    // Complete and join the local transport fixture before holding the shared
+    // counter lock, so a failed assertion cannot strand network cleanup.
+    let report = transport.download_advertised_pack(&mut Vec::new()).unwrap();
+    server.join().unwrap();
+    let observed = report.finalization().observed_ingress_bytes();
+    assert!(observed > 0);
+
+    let held = counter.lock().unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        let result = sink.write(b"PACKmust-not-be-written");
+        let charged_storage = sink.bytes_charged();
+        let charged_ingress = sink.ingress_bytes_charged();
+        let contents = sink.contents().unwrap();
+        let _ = finished_tx.send(());
+        (result, charged_storage, charged_ingress, contents, sink)
+    });
+    let completed_before_unlock = finished_rx.recv_timeout(Duration::from_secs(1));
+    // Always release the counter before joining/asserting, including if a
+    // regression makes the sink block in the observer.
+    drop(held);
+    let (write_result, charged_storage, charged_ingress, contents, mut sink) =
+        writer.join().unwrap();
+
+    assert!(completed_before_unlock.is_ok());
+    let error = write_result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(error.to_string(), "transport ingress observation busy");
+    assert_eq!(charged_storage, 0);
+    assert_eq!(charged_ingress, 0);
+    assert!(contents.is_empty());
+    assert!(signal.is_cancelled());
+    // Contention refusal must not hide already observed bytes at finalization.
+    sink.reconcile_transfer_ingress(&report).unwrap();
+    assert_eq!(sink.ingress_bytes_charged(), observed);
+    assert!(signal.is_cancelled());
+    assert_eq!(sink.reservation_bytes().unwrap(), RESERVATION);
+    drop(sink);
+    assert_durable_reservation_blocks_reopen(&root);
+}
+
+#[test]
 fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
     let root = PrivateRoot::create().unwrap();
     let mut body = super::ref_packet(b"packfile\n");
     body.extend(super::ref_packet(b"\x01PACKfixture"));
     body.extend_from_slice(b"0000");
     let (transport, server) = super::pack_tests::pack_fixture(body);
-    let mut sink =
-        BudgetFileSink::new_with_limit(&root, transport.cancellation_handle(), 5).unwrap();
+    let mut sink = BudgetFileSink::new_with_limit_for_transport(&root, &transport, 5).unwrap();
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
     assert!(report.advertised_refs().is_none());
     assert_eq!(sink.contents().unwrap(), b"PACKf");
     assert_eq!(report.bytes_written(), 5);
+    assert!(sink
+        .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+        .is_err());
+    assert_eq!(
+        sink.ingress_bytes_charged(),
+        report.finalization().observed_ingress_bytes()
+    );
+    assert!(sink.ingress_bytes_charged() > report.bytes_written());
     let partial_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
     assert!(
         sink.bytes_charged()
