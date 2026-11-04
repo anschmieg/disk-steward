@@ -291,25 +291,23 @@ export default function App() {
   };
   const reviewActions = useMemo(() => review?.actions ?? [], [review]);
 
-  if (!plan && page !== "explore" && page !== "advanced")
-    return (
-      <div className="loading-shell">
-        <HardDrive />
-        <p>
-          {pending
-            ? "Loading example plan…"
-            : "The example plan could not be loaded."}
-        </p>
-        {error && <p role="alert">{error}</p>}
-        <button
-          className="button secondary"
-          onClick={() => void refresh()}
-          disabled={pending}
-        >
-          <RefreshCw size={15} /> Refresh plan
-        </button>
-      </div>
-    );
+  const exampleUnavailable = (
+    <div className="loading-shell">
+      <HardDrive />
+      <p>
+        {pending
+          ? "Loading example plan…"
+          : "The example plan could not be loaded."}
+      </p>
+      <button
+        className="button secondary"
+        onClick={() => void refresh()}
+        disabled={pending}
+      >
+        <RefreshCw size={15} /> Refresh plan
+      </button>
+    </div>
+  );
 
   const displayedExample = plan ?? browserPlan;
   return (
@@ -381,7 +379,9 @@ export default function App() {
                   ? generalSummary
                     ? fmt(generalSummary.bytes)
                     : "Loading…"
-                  : fmt(displayedExample.totalBytes)}
+                  : plan
+                    ? fmt(plan.totalBytes)
+                    : "Unknown"}
               </b>
               <small>
                 {page === "advanced"
@@ -396,12 +396,14 @@ export default function App() {
                   ? generalSummary
                     ? fmt(generalSummary.selectedBytes)
                     : "—"
-                  : fmt(displayedExample.selectedBytes)}
+                  : plan
+                    ? fmt(plan.selectedBytes)
+                    : "Unknown"}
               </b>
               <small>
                 {page === "advanced"
                   ? (generalSummary?.selectedCount ?? "—")
-                  : displayedExample.selectedCount}{" "}
+                  : (plan?.selectedCount ?? "—")}{" "}
                 {page === "advanced"
                   ? "items"
                   : displayedExample.selectedCount === 1
@@ -499,19 +501,23 @@ export default function App() {
             </button>
           </div>
         )}
-        {page === "explore" ? (
+        <div hidden={page !== "explore"}>
           <FolderInventoryPanel
             onOpenPlan={() => setPage("advanced")}
+            active={page === "explore"}
             native={native}
             onBusyChange={setInventoryBusy}
           />
-        ) : page === "advanced" ? (
+        </div>
+        {page === "explore" ? null : page === "advanced" ? (
           <GeneralPlanWorkspace
             initialProfile="live"
             native={native}
             onBusyChange={setGeneralBusy}
             onSummaryChange={setGeneralSummary}
           />
+        ) : !plan ? (
+          exampleUnavailable
         ) : page === "demo" ? (
           <DemoLifecyclePanel
             plan={{

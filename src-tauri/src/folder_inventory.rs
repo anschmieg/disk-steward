@@ -97,10 +97,34 @@ pub struct ContinueInventoryRequest {
     expected_observation_id: InventoryItemId,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClearInventoryRequest {
+    expected_observation_id: InventoryItemId,
+}
+
 #[derive(Clone, Default)]
 pub struct FolderInventoryState(Arc<Mutex<Option<Session>>>);
 
 impl FolderInventoryState {
+    #[cfg(unix)]
+    fn clear_exact(&self, expected_observation_id: InventoryItemId) -> Result<(), &'static str> {
+        let mut state = self.0.lock().map_err(|_| "observation_unavailable")?;
+        let session = state.as_ref().ok_or("observation_unavailable")?;
+        if session.observation_id != expected_observation_id
+            || session.snapshot.observation_id != expected_observation_id
+        {
+            return Err("stale_observation");
+        }
+        state.take();
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn clear_exact(&self, _: InventoryItemId) -> Result<(), &'static str> {
+        Err("observation_unavailable")
+    }
+
     /// Copies only the latest explicitly observed, immediate file and folder
     /// metadata for a matching backend-held observation. It never reads files.
     #[cfg(unix)]
@@ -1346,6 +1370,27 @@ pub async fn continue_folder_inventory(
     .map_err(|_| "Folder page continuation did not complete.".to_owned())?
 }
 
+#[tauri::command]
+pub async fn clear_folder_inventory(
+    state: tauri::State<'_, FolderInventoryState>,
+    request: ClearInventoryRequest,
+) -> Result<(), String> {
+    let guard = crate::NativeCheckGuard::acquire()?;
+    let sessions = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let state = FolderInventoryState(sessions);
+        state
+            .clear_exact(request.expected_observation_id)
+            .map_err(|_| {
+                "The folder observation could not be cleared. Inspect the current folder again."
+                    .to_owned()
+            })
+    })
+    .await
+    .map_err(|_| "Folder observation could not be cleared.".to_owned())?
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1698,6 +1743,73 @@ mod tests {
             "path": "/tmp"
         });
         assert!(serde_json::from_value::<ContinueInventoryRequest>(with_path).is_err());
+    }
+
+    #[test]
+    fn clear_releases_owned_cursor_and_observation_cache() {
+        let root = tempdir().unwrap();
+        for index in 0..3 {
+            fs::write(root.path().join(format!("item-{index}")), b"x").unwrap();
+        }
+        let (session, snapshot) = selected_root_session(root.path(), 1, MAX_DURATION).unwrap();
+        assert!(session.cursor.is_some());
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+
+        state.clear_exact(snapshot.observation_id).unwrap();
+        assert!(state.0.lock().unwrap().is_none());
+        assert_eq!(
+            state
+                .blocked_items_for_observation(snapshot.observation_id)
+                .err(),
+            Some("observation_unavailable")
+        );
+    }
+
+    #[test]
+    fn stale_clear_preserves_the_current_session_and_cursor() {
+        let root = tempdir().unwrap();
+        for index in 0..3 {
+            fs::write(root.path().join(format!("item-{index}")), b"x").unwrap();
+        }
+        let (session, snapshot) = selected_root_session(root.path(), 1, MAX_DURATION).unwrap();
+        let state = FolderInventoryState::default();
+        *state.0.lock().unwrap() = Some(session);
+        let cursor_address = {
+            let lock = state.0.lock().unwrap();
+            let session = lock.as_ref().unwrap();
+            session.cursor.as_ref().unwrap() as *const DirectoryCursor
+        };
+
+        assert_eq!(
+            state.clear_exact(InventoryItemId::new()),
+            Err("stale_observation")
+        );
+        let lock = state.0.lock().unwrap();
+        let session = lock.as_ref().unwrap();
+        assert_eq!(session.observation_id, snapshot.observation_id);
+        assert_eq!(
+            session.cursor.as_ref().unwrap() as *const DirectoryCursor,
+            cursor_address
+        );
+    }
+
+    #[test]
+    fn clear_request_rejects_paths_and_extra_scope() {
+        let valid = serde_json::json!({
+            "expectedObservationId": typed_id_string(InventoryItemId::new())
+        });
+        assert!(serde_json::from_value::<ClearInventoryRequest>(valid).is_ok());
+        let with_path = serde_json::json!({
+            "expectedObservationId": typed_id_string(InventoryItemId::new()),
+            "path": "/tmp"
+        });
+        assert!(serde_json::from_value::<ClearInventoryRequest>(with_path).is_err());
+        let with_scope = serde_json::json!({
+            "expectedObservationId": typed_id_string(InventoryItemId::new()),
+            "all": true
+        });
+        assert!(serde_json::from_value::<ClearInventoryRequest>(with_scope).is_err());
     }
 
     #[test]
@@ -2199,6 +2311,10 @@ mod tests {
         assert_eq!(changed.totals.selected_count, 0);
         assert!(!changed.items[0].effective_selected);
         let review = store.freeze_review(changed.revision_id).unwrap();
+        state.clear_exact(snapshot.observation_id).unwrap();
+        assert!(state
+            .blocked_items_for_observation(snapshot.observation_id)
+            .is_err());
         drop(store);
         let reopened = GeneralPlanStore::open(&database, FixtureScale::EmptyReview).unwrap();
         assert_eq!(reopened.get_saved_review(review.review_id).unwrap(), review);

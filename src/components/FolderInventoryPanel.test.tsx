@@ -439,3 +439,38 @@ test("known dataless folders show a reason and no Open control; absence of the f
   ).toBeVisible();
   expect(invoke).toHaveBeenCalledTimes(1);
 });
+
+test("clear releases the current scope only after exact backend success and returns focus to selection", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockResolvedValueOnce(undefined);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(screen.getByRole("button", { name: "Clear folder scope" }));
+  await screen.findByText(/Folder scope cleared/);
+  expect(invoke).toHaveBeenNthCalledWith(2, "clear_folder_inventory", {
+    request: { expectedObservationId: "observation-1" },
+  });
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.queryByText("Zeta")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Choose folder" })).toHaveFocus();
+  expect(screen.getByText(/Folder scope cleared/)).toHaveTextContent(
+    "Saved plan and review metadata remain",
+  );
+});
+
+test("failed scope clear keeps the observation and does not claim release", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockRejectedValueOnce(new Error("stale private/path"));
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(screen.getByRole("button", { name: "Clear folder scope" }));
+  await screen.findByText(/folder scope could not be cleared/);
+  expect(screen.getByText("Zeta")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Next page" })).toBeEnabled();
+  expect(screen.queryByText(/Folder scope cleared/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/private\/path/)).not.toBeInTheDocument();
+});

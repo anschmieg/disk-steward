@@ -77,6 +77,7 @@ pub fn run() {
             folder_inventory::inspect_selected_folder_entries,
             folder_inventory::navigate_folder_inventory,
             folder_inventory::continue_folder_inventory,
+            folder_inventory::clear_folder_inventory,
             preview_native_review,
             example_plan::get_example_plan,
             example_plan::edit_example_plan,
