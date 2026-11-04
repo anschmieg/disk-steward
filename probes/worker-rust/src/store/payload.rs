@@ -494,7 +494,7 @@ pub(super) fn validate_payload_metadata(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn sampled_free_bytes(root: &impl AsFd) -> Result<u64, StoreError> {
+pub(super) fn sampled_free_bytes(root: &impl AsFd) -> Result<u64, StoreError> {
     use rustix::fs::fstatvfs;
     let stat = fstatvfs(root)?;
     free_bytes(stat.f_bavail, stat.f_frsize)

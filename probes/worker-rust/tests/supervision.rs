@@ -97,6 +97,7 @@ fn indexed_store_worker_reopens_as_reconciliation_without_cleanup_authority() {
     );
     let report = String::from_utf8(output.stdout).unwrap();
     for evidence in [
+        "coordinated_admission=true",
         "worker_joined=true",
         "registered_stopped=true",
         "reopened_reconciliation=true",
@@ -292,6 +293,7 @@ fn indexed_store_descriptor_handoff_requires_exact_capability_and_arguments() {
     );
     let report = String::from_utf8(output.stdout).unwrap();
     for evidence in [
+        "coordinated_admission=true",
         "descriptor_handoff=true",
         "worker_joined=true",
         "registered_stopped=true",
@@ -339,6 +341,7 @@ fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() 
     let report = String::from_utf8(output.stdout).unwrap();
     assert_eq!(report.lines().count(), 1);
     for evidence in [
+        "coordinated_admission=true",
         "worker_joined=true",
         "registered_stopped=true",
         "reopened_reconciliation=true",
@@ -409,6 +412,7 @@ fn indexed_partial_payload_fails_before_readiness_and_retains_reservation() {
     let report = String::from_utf8(output.stdout).unwrap();
     assert_eq!(report.lines().count(), 1);
     for evidence in [
+        "coordinated_admission=true",
         "worker_joined=true",
         "store_stopped=true",
         "partial_payload_validated=true",

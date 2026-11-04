@@ -167,6 +167,19 @@ impl OwnedStore {
         Ok((self.parent_id, self.root_id))
     }
 
+    /// Sample available space on this validated owned store's volume.
+    pub(crate) fn sample_free_space_bytes(&self) -> Result<u64, StoreError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inspect_state()?;
+            payload::sampled_free_bytes(&self.root)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(StoreError::UnsupportedPlatform)
+        }
+    }
+
     /// Creates a fresh private parent and store. There is intentionally no
     /// caller-supplied path and no TempDir/drop cleanup behavior.
     pub fn create() -> Result<Self, StoreError> {

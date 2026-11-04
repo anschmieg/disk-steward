@@ -177,6 +177,7 @@ enum IndexedWorkerMode {
 
 fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     let descriptor_handoff = mode != IndexedWorkerMode::Stall;
+    use verification_budget::{BudgetController, JobState, Limits};
     use verification_store_registry::{
         RegistryError, StoreState as RState, VerificationStoreRegistry,
     };
@@ -193,12 +194,35 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     registry
         .register(FIXTURE_ID, parent.0, parent.1, root.0, root.1)
         .map_err(|e| format!("register store: {e}"))?;
-    // Commit admission before child access; directory/index overhead is not measured.
-    let reserved = registry
-        .reserve(FIXTURE_ID, 0, store::WORKER_PAYLOAD_RESERVATION)
-        .map_err(|e| format!("reserve indexed fixture: {e}"))?;
-    if reserved.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION {
-        return Err("registry reservation mismatch".into());
+    let free_bytes = store
+        .sample_free_space_bytes()
+        .map_err(|_| "sample owned-store volume free space refused".to_owned())?;
+    let mut admission_budget = BudgetController::new(Limits {
+        headroom_bytes: 1024 * 1024,
+    });
+    let admission = verification_admission::admit_registered_store(
+        &mut admission_budget,
+        &mut registry,
+        FIXTURE_ID,
+        store::WORKER_PAYLOAD_RESERVATION,
+        free_bytes,
+    )
+    .map_err(|_| "coordinated pre-handoff admission refused".to_owned())?;
+    if admission.record.state != RState::Registered
+        || admission.record.prior_state.is_some()
+        || admission.record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+        || (
+            admission.record.parent_dev,
+            admission.record.parent_ino,
+            admission.record.root_dev,
+            admission.record.root_ino,
+        ) != (parent.0, parent.1, root.0, root.1)
+        || admission_budget
+            .snapshot(admission.job_id)
+            .map(|job| job.state != JobState::Running || job.usage.stored_bytes != 0)
+            .unwrap_or(true)
+    {
+        return Err("coordinated pre-handoff admission record mismatch".into());
     }
     if matches!(
         mode,
@@ -407,7 +431,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             }
             Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
         }
-        println!("worker_joined=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
         return Ok(());
     }
     if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
@@ -514,11 +538,11 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         let high_water = observation.high_water_bytes;
         let footprint =
             fixture_footprint.ok_or("complete payload footprint observation missing")?;
-        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
     } else if descriptor_handoff {
-        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     } else {
-        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
     }
     Ok(())
 }
