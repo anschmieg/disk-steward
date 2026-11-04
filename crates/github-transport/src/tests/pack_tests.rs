@@ -8,12 +8,27 @@ fn pack_fixture_with_framing(
     body: Vec<u8>,
     truncated_http: bool,
 ) -> (GitHubTransport, thread::JoinHandle<()>) {
+    pack_fixture_with_refs(
+        body,
+        truncated_http,
+        b"0123456789abcdef0123456789abcdef01234567 HEAD\n".to_vec(),
+    )
+}
+
+fn pack_fixture_with_refs(
+    body: Vec<u8>,
+    truncated_http: bool,
+    advertised: Vec<u8>,
+) -> (GitHubTransport, thread::JoinHandle<()>) {
     let tls = fixture_tls();
     let (listener, address) = listener();
     let config = Arc::clone(&tls.server);
     let server = thread::spawn(move || {
         let caps = ref_caps(&[b"ls-refs\n", b"fetch\n", b"object-format=sha1\n"]);
-        let mut refs = ref_packet(b"0123456789abcdef0123456789abcdef01234567 HEAD\n");
+        let mut refs = Vec::new();
+        for line in advertised.split_inclusive(|b| *b == b'\n') {
+            refs.extend(ref_packet(line));
+        }
         refs.extend_from_slice(b"0000");
         for (index, (method, ct, response)) in [
             ("GET", "application/x-git-upload-pack-advertisement", &caps),
@@ -271,4 +286,277 @@ fn outer_deadline_stops_blocked_pack_sink() {
         "tests::pack_tests::blocked_pack_sink_child",
         BLOCKED_PACK_SINK_READY,
     );
+}
+
+fn advertised_decode_fixture(refs: Vec<u8>, bytes: &[u8]) -> PackTransferReport {
+    let (transport, server) = pack_fixture_with_refs(pack_body(bytes), false, refs);
+    let mut sink = Vec::new();
+    let report = transport.download_advertised_pack(&mut sink).unwrap();
+    server.join().unwrap();
+    assert_eq!(sink, bytes);
+    assert!(report.is_complete_transfer());
+    report
+}
+fn decode_report(report: &PackTransferReport, bytes: &[u8]) -> io::Result<AdvertisedPackReport> {
+    decode_advertised_pack(
+        report,
+        bytes,
+        16 * 1024 * 1024,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+}
+#[test]
+fn advertised_pack_closure_binds_all_tip_claims_and_peeled_targets() {
+    use super::graph_tests::{commit, hex, oid, pack_bytes, tree};
+    use GitObjectKind as K;
+    let blob = b"x".to_vec();
+    let blob_id = oid(K::Blob, &blob);
+    let t = tree("100644", blob_id);
+    let tree_id = oid(K::Tree, &t);
+    let c = commit(tree_id, &[]);
+    let commit_id = oid(K::Commit, &c);
+    let tag = format!("object {}\ntype commit\ntag inner\n\n", hex(&commit_id)).into_bytes();
+    let tag_id = oid(K::Tag, &tag);
+    let outer = format!("object {}\ntype tag\ntag outer\n\n", hex(&tag_id)).into_bytes();
+    let outer_id = oid(K::Tag, &outer);
+    let bytes = pack_bytes(&[
+        (K::Blob, blob),
+        (K::Tree, t),
+        (K::Commit, c),
+        (K::Tag, tag),
+        (K::Tag, outer),
+    ]);
+    let refs=format!("{} HEAD symref-target:refs/heads/main\n{} refs/heads/main\n{} refs/tags/outer peeled:{}\n{} refs/tags/blob\n",hex(&commit_id),hex(&commit_id),hex(&outer_id),hex(&commit_id),hex(&blob_id)).into_bytes();
+    let report = advertised_decode_fixture(refs, &bytes);
+    let result = decode_report(&report, &bytes).unwrap();
+    assert_eq!(result.advertised_ref_count(), 4);
+    assert_eq!(result.graph().root_count(), 3);
+    assert_eq!(result.graph().reachable_objects(), 5);
+    assert_eq!(result.decoded().objects().len(), 5);
+    let mut corrupt = bytes.clone();
+    corrupt[15] ^= 1;
+    assert!(decode_report(&report, &corrupt).is_err());
+    assert!(decode_report(&report, &bytes[..bytes.len() - 1]).is_err());
+    let cancel = CancellationHandle::new();
+    cancel.cancel();
+    assert_eq!(
+        decode_advertised_pack(
+            &report,
+            &bytes,
+            4096,
+            &cancel,
+            Instant::now() + Duration::from_secs(5)
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    assert_eq!(
+        decode_advertised_pack(
+            &report,
+            &bytes,
+            4096,
+            &CancellationHandle::new(),
+            Instant::now()
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::TimedOut
+    );
+    for refs in [
+        format!("{} refs/heads/wrong\n", hex(&blob_id)),
+        format!("{} HEAD\n", hex(&blob_id)),
+        format!("{} refs/tags/missing\n", hex(&[1; 20])),
+        format!("{} HEAD symref-target:refs/heads/absent\n", hex(&commit_id)),
+        format!(
+            "{} refs/heads/self symref-target:refs/heads/self\n",
+            hex(&commit_id)
+        ),
+        format!(
+            "{} HEAD symref-target:refs/heads/tail\n{} refs/heads/tail symref-target:refs/heads/a\n{} refs/heads/a symref-target:refs/heads/b\n{} refs/heads/b symref-target:refs/heads/a\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+        format!(
+            "{} refs/heads/c symref-target:refs/heads/a\n{} refs/heads/a symref-target:refs/heads/b\n{} HEAD symref-target:refs/heads/c\n{} refs/heads/b symref-target:refs/heads/c\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+        format!(
+            "{} HEAD symref-target:refs/tags/blob\n{} refs/tags/blob\n",
+            hex(&commit_id),
+            hex(&blob_id)
+        ),
+        format!(
+            "{} refs/tags/outer peeled:{}\n",
+            hex(&outer_id),
+            hex(&tag_id)
+        ),
+        format!(
+            "{} refs/tags/outer peeled:{}\n",
+            hex(&outer_id),
+            hex(&blob_id)
+        ),
+        format!(
+            "{} refs/tags/blob peeled:{}\n",
+            hex(&blob_id),
+            hex(&blob_id)
+        ),
+    ] {
+        let report = advertised_decode_fixture(refs.into_bytes(), &bytes);
+        assert!(decode_report(&report, &bytes).is_err());
+    }
+
+    for refs in [
+        format!(
+            "{} HEAD symref-target:refs/heads/a\n{} refs/heads/a symref-target:refs/heads/main\n{} refs/heads/b symref-target:refs/heads/main\n{} refs/heads/main\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+        format!(
+            "{} refs/heads/main\n{} refs/heads/b symref-target:refs/heads/main\n{} refs/heads/a symref-target:refs/heads/main\n{} HEAD symref-target:refs/heads/a\n",
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id),
+            hex(&commit_id)
+        ),
+    ] {
+        let report = advertised_decode_fixture(refs.into_bytes(), &bytes);
+        let decoded = decode_report(&report, &bytes).unwrap();
+        assert_eq!(decoded.graph().root_count(), 1);
+    }
+}
+#[test]
+fn advertised_symref_chain_at_reference_limit_is_bounded_and_cycle_refused() {
+    use super::graph_tests::{commit, hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let tree = Vec::new();
+    let commit = commit(oid(K::Tree, &tree), &[]);
+    let commit_id = hex(&oid(K::Commit, &commit));
+    let bytes = pack_bytes(&[(K::Tree, tree), (K::Commit, commit)]);
+    let mut refs = String::new();
+    for index in 0..1023 {
+        refs.push_str(&format!(
+            "{commit_id} refs/heads/r{index:04} symref-target:refs/heads/r{:04}\n",
+            index + 1
+        ));
+    }
+    let mut chain = refs.clone();
+    chain.push_str(&format!("{commit_id} refs/heads/r1023\n"));
+    let report = advertised_decode_fixture(chain.into_bytes(), &bytes);
+    let decoded = decode_report(&report, &bytes).unwrap();
+    assert_eq!(decoded.advertised_ref_count(), 1024);
+    assert_eq!(decoded.graph().root_count(), 1);
+
+    refs.push_str(&format!(
+        "{commit_id} refs/heads/r1023 symref-target:refs/heads/r0000\n"
+    ));
+    let report = advertised_decode_fixture(refs.into_bytes(), &bytes);
+    let error = decode_report(&report, &bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "advertised symbolic reference cycle");
+}
+
+#[test]
+fn advertised_pack_decode_refuses_incomplete_transfer_and_missing_graph_links() {
+    use super::graph_tests::{commit, hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let bytes = pack_bytes(&[(K::Blob, b"x".to_vec())]);
+    let (transport, server) = pack_fixture_with_framing(pack_body(&bytes), true);
+    let mut sink = Vec::new();
+    let report = transport.download_advertised_pack(&mut sink).unwrap();
+    server.join().unwrap();
+    assert!(!report.is_complete_transfer());
+    assert!(decode_report(&report, &bytes).is_err());
+    let c = commit([1; 20], &[]);
+    let id = oid(K::Commit, &c);
+    let bytes = pack_bytes(&[(K::Commit, c)]);
+    let report = advertised_decode_fixture(
+        format!("{} refs/heads/main\n", hex(&id)).into_bytes(),
+        &bytes,
+    );
+    assert_eq!(
+        decode_report(&report, &bytes).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn repeated_advertised_peel_claims_consume_one_cumulative_budget() {
+    use super::graph_tests::{hex, oid, pack_bytes};
+    use GitObjectKind as K;
+    let blob = b"x".to_vec();
+    let blob_id = oid(K::Blob, &blob);
+    let mut id = blob_id;
+    let mut objects = vec![(K::Blob, blob)];
+    for level in 0..33 {
+        let kind = if level == 0 { "blob" } else { "tag" };
+        let tag = format!("object {}\ntype {kind}\ntag level{level}\n\n", hex(&id)).into_bytes();
+        id = oid(K::Tag, &tag);
+        objects.push((K::Tag, tag));
+        if level >= 31 {
+            let bytes = pack_bytes(&objects);
+            let refs = (0..512)
+                .map(|i| format!("{} refs/tags/alias{i} peeled:{}\n", hex(&id), hex(&blob_id)))
+                .collect::<String>()
+                .into_bytes();
+            let report = advertised_decode_fixture(refs, &bytes);
+            let result = decode_report(&report, &bytes);
+            if level == 31 {
+                assert_eq!(result.unwrap().graph().reachable_objects(), 33);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+}
+
+#[test]
+fn advertised_report_retains_roots_for_required_object_coverage() {
+    use super::graph_tests::{commit, hex, oid, pack_bytes, tree};
+    use GitObjectKind as K;
+    let blob = b"linked".to_vec();
+    let id = oid(K::Blob, &blob);
+    let stray = b"stray".to_vec();
+    let stray_id = oid(K::Blob, &stray);
+    let t = tree("100644", id);
+    let tree_id = oid(K::Tree, &t);
+    let c = commit(tree_id, &[]);
+    let commit_id = oid(K::Commit, &c);
+    let bytes = pack_bytes(&[
+        (K::Blob, blob),
+        (K::Blob, stray),
+        (K::Tree, t),
+        (K::Commit, c),
+    ]);
+    let report =
+        advertised_decode_fixture(format!("{} HEAD\n", hex(&commit_id)).into_bytes(), &bytes);
+    let checked = decode_report(&report, &bytes).unwrap();
+    let cancel = CancellationHandle::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let coverage = checked
+        .check_required_objects(&[(id, K::Blob), (commit_id, K::Commit)], &cancel, deadline)
+        .unwrap();
+    assert_eq!(coverage.required_object_count(), 2);
+    assert_eq!(coverage.graph().reachable_objects(), 3);
+    assert_eq!(
+        checked
+            .check_required_objects(&[(stray_id, K::Blob)], &cancel, deadline)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(checked
+        .check_required_objects(&[], &cancel, deadline)
+        .is_err());
+    assert!(checked
+        .check_required_objects(&[(id, K::Tree)], &cancel, deadline)
+        .is_err());
 }
