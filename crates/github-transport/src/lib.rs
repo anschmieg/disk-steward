@@ -4,6 +4,26 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod advertised_graph;
+mod attempt_context;
+mod required_refs;
+pub use advertised_graph::{
+    decode_advertised_pack, AdvertisedPackReport, NamedRefCoverageReport, RemoteRefMismatch,
+    RequiredObjectCoverageReport,
+};
+pub use required_refs::{RequiredRefEntry, RequiredRefInput, RequiredRefManifest};
+mod graph;
+pub use graph::{check_pack_graph_closure, PackGraphReport};
+mod tag;
+pub use tag::{parse_sha1_tag, GitTagLink};
+mod commit;
+pub use commit::{parse_sha1_commit, GitCommitLinks};
+mod tree;
+pub use tree::{parse_sha1_tree, GitTreeEntry, GitTreeMode};
+mod decode;
+pub use decode::{decode_sha1_pack, DecodedPack, DecodedPackObject};
+mod object_identity;
+pub use object_identity::{git_sha1_object_id, GitObjectKind};
 mod inflate;
 pub use inflate::{inflate_pack_representation, InflatedRepresentation};
 mod delta;
@@ -29,7 +49,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use gix_error::{ErrorExt, ExnMessageResult, ExnResult};
@@ -431,6 +451,13 @@ fn assemble(
     let framing = http.framing.clone();
     let cancellation = http.cancellation.clone();
     let deadline = http.deadline;
+    let started_wall = http.started_wall;
+    let started_at = deadline.checked_sub(http.limits.timeout).ok_or_else(|| {
+        safe_error(
+            io::ErrorKind::InvalidData,
+            "verification clock context invalid",
+        )
+    })?;
     let retained = http.retained.clone();
     let url = gix_url::parse(repository.base())
         .map_err(|_| safe_error(io::ErrorKind::InvalidInput, "invalid repository URL"))?;
@@ -455,6 +482,7 @@ fn assemble(
             })?;
     }
     Ok(GitHubTransport {
+        context: attempt_context::AttemptContext::new(repository, started_at, started_wall),
         inner,
         budget,
         framing,
@@ -466,6 +494,7 @@ fn assemble(
 
 /// gix's blocking HTTP transport, ready for an explicit handshake.
 pub struct GitHubTransport {
+    context: attempt_context::AttemptContext,
     inner: gix_transport::client::blocking_io::http::Transport<RawHttp>,
     budget: Budget,
     framing: ResponseLedger,
@@ -523,6 +552,7 @@ impl GitHubTransport {
     /// ingress budget, deadline, and cancellation signal.
     pub fn finalize_http_framing(self) -> io::Result<HttpFinalizationReport> {
         let Self {
+            context: _,
             inner,
             budget,
             framing,
@@ -1061,6 +1091,7 @@ impl<R: Read> Read for Body<R> {
 }
 
 struct RawHttp {
+    started_wall: SystemTime,
     repository: RepositoryUrl,
     limits: AttemptLimits,
     deadline: Instant,
@@ -1085,10 +1116,13 @@ impl RawHttp {
         cancellation: CancellationHandle,
         #[cfg(test)] fixture: Option<(SocketAddr, Arc<str>)>,
     ) -> Self {
+        let started_at = Instant::now();
+        let started_wall = SystemTime::now();
         Self {
+            started_wall,
             repository,
             limits,
-            deadline: Instant::now() + limits.timeout,
+            deadline: started_at + limits.timeout,
             budget: Budget {
                 max: limits.ingress_bytes,
                 used: Arc::new(Mutex::new(0)),
@@ -1616,6 +1650,7 @@ impl Http for RawHttp {
             let state = Arc::new(Mutex::new(PostState {
                 receiver: rx,
                 http: RawHttp {
+                    started_wall: self.started_wall,
                     repository: self.repository.clone(),
                     limits: self.limits,
                     deadline: self.deadline,
@@ -2111,13 +2146,22 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 #[cfg(test)]
 mod tests {
     mod checksum_tests;
+    mod commit_tests;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod completion_supervision;
+    mod decode_tests;
     mod delta_tests;
     mod entry_header_tests;
     mod failure_tests;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod git_interop;
+    mod graph_tests;
     mod inflate_tests;
+    mod object_identity_tests;
     mod pack_tests;
+    mod required_refs_tests;
+    mod tag_tests;
+    mod tree_tests;
 
     use super::*;
     use gix_transport::bstr::ByteSlice as _;
