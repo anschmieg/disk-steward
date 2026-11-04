@@ -1,0 +1,9 @@
+# M0 worker store descriptor handoff
+
+Advance the worker/store ownership seam without exposing paths or generic execution. Add a closed --run-indexed-store-handoff fixture atop worker-environment PR80. Reserve the existing identity-bound128KiB admission before spawn; pass a one-shot clone of the verified fresh store directory as the exact current-executable child stdin. Parent binds the actual child PID; child validates the directory capability, private ownership/modes, root identity, bounded ownership journal and bound:self-PID before readiness.
+
+The fixed child performs read-only validation and then the existing bounded stall. It writes no payload and accepts no path, FD number, endpoint, credential or cleanup argument. Existing kill/wait/reader-join stop receipt and registry stopped/reopen reconciliation remain required; the new report field is emitted only after successful descriptor validation and shutdown. No cleanup is added. A directory descriptor is a capability, not an OS sandbox; ambient same-user/process-tree/OS-stall limitations remain.
+
+Refuse repeated handoff, post-binding/stopped handoff, wrong UID/mode/type, missing or replaced journal, unexpected entries, wrong root/PID, null stdin, extra arguments, missing readiness or unconfirmed shutdown. Only the initial created/partial journal race may retry within a fixed short deadline; no automatic rerun of a failed attempt.
+
+Version0.0.17/no release. Feature branchfeat/m0-worker-store-descriptor-handoff starts at80d8c4577, main eventual baseline; PR88 and all earlier local dated checkpoints preserved independently. This demonstrates descriptor ownership transfer only, not Git ingress/payload writes, production worker containment/globalbudget/credential access, cleanup eligibility or milestone completion. Fresh current-head CI/no blocking findings required before main integration.

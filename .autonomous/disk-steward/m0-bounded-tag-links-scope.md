@@ -1,0 +1,5 @@
+# M0 bounded SHA-1 annotated tag links
+
+Inactive structural parser of object ID, declared target kind, borrowed raw tag name and message boundary. Supported header order is object/type/tag, optional tagger, blank separator. Hard16MiB input/64KiB header/8192byte lines/1024byte tag name, canonical lowercase40hex nonzero IDs, existing pinned tag-name validation, cooperative controls. Extra headers/continuations remain unsupported. Tagger-less historical form is recognized; signatures/messages remain opaque and unscanned after separator.
+
+No object hash/type binding, target presence/type validation, recursive peeling, identity/timestamp/signature verification, fullfsck/graph/retention/cleanup authority. Experimental subset not product scope. No new dependency, filesystem, network or renderer interfaces. Luna new tag.rs/root API/source review/adversarial vectors/real-Git commit-tree-blob-nested-tag correspondence. Branch atop68537134b/main baselinec5997b2, preserve local notes/watches/0.0.x/no release/no overlapping builds. Primary Git mktag/gitformat-signature and exact cached gix-validate0.12.0 tag source.
