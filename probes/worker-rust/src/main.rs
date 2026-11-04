@@ -214,17 +214,17 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
     .map_err(|_| "coordinated pre-handoff admission refused".to_owned())?;
     let admitted_record = admission.record.clone();
     let mut registry_slot = Some(registry);
-    guard_indexed_attempt(&mut registry_slot, &admitted_record, |registry_slot| {
+    let attempt_result = guard_indexed_attempt(&mut registry_slot, &admitted_record, |slot| {
         macro_rules! registry_mut {
             () => {
-                registry_slot.as_mut().ok_or_else(|| {
+                slot.as_mut().ok_or_else(|| {
                     "registry lease unavailable inside admitted attempt".to_owned()
                 })?
             };
         }
         macro_rules! registry_ref {
             () => {
-                registry_slot.as_ref().ok_or_else(|| {
+                slot.as_ref().ok_or_else(|| {
                     "registry lease unavailable inside admitted attempt".to_owned()
                 })?
             };
@@ -450,7 +450,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             let live_state = store
                 .inspect_state()
                 .map_err(|error| format!("inspect interrupted store: {error}"))?;
-            drop(registry_slot.take());
+            drop(slot.take());
             drop(store);
             let mut reopened = VerificationStoreRegistry::open(&registry_path)
                 .map_err(|error| format!("reopen interrupted registry: {error}"))?;
@@ -611,7 +611,7 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
         } else {
             None
         };
-        drop(registry_slot.take());
+        drop(slot.take());
         drop(store);
         let mut reopened = VerificationStoreRegistry::open(&registry_path)
             .map_err(|e| format!("reopen private registry: {e}"))?;
@@ -674,7 +674,69 @@ fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
             return Err("stopped fixture accounting observation missing".into());
         }
         Ok(())
-    })
+    });
+    finalize_admitted_attempt_result(&mut admission_budget, admission.job_id, attempt_result)
+}
+
+fn finalize_admitted_attempt_result<T>(
+    budget: &mut verification_budget::BudgetController,
+    job_id: verification_budget::JobId,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    use verification_budget::{BlockReason, JobState};
+
+    let original = match result {
+        Ok(value) => return Ok(value),
+        Err(original) => original,
+    };
+    let Ok(snapshot) = budget.snapshot(job_id) else {
+        return Err(format!(
+            "{original}; could not establish StoreIncomplete worker_stopped=false: budget job unavailable"
+        ));
+    };
+    if snapshot.id != job_id {
+        return Err(format!(
+            "{original}; could not establish StoreIncomplete worker_stopped=false: budget job identity mismatch"
+        ));
+    }
+    let usage = snapshot.usage;
+    match snapshot.state {
+        JobState::Running => {
+            if budget.fail(job_id, BlockReason::StoreIncomplete).is_err() {
+                return Err(format!(
+                    "{original}; could not establish StoreIncomplete worker_stopped=false"
+                ));
+            }
+            match budget.snapshot(job_id) {
+                Ok(after)
+                    if after.id == job_id
+                        && after.usage == usage
+                        && after.state
+                            == (JobState::Failed {
+                                reason: BlockReason::StoreIncomplete,
+                                worker_stopped: false,
+                            }) =>
+                {
+                    Err(original)
+                }
+                _ => Err(format!(
+                    "{original}; could not establish StoreIncomplete worker_stopped=false without changing budget usage"
+                )),
+            }
+        }
+        JobState::Failed { .. } => Err(original),
+        JobState::Canceled {
+            cleanup_confirmed: false,
+            ..
+        } => Err(original),
+        JobState::Canceled {
+            cleanup_confirmed: true,
+            ..
+        }
+        | JobState::Completed { .. } => Err(format!(
+            "{original}; could not establish StoreIncomplete worker_stopped=false: budget state does not permit incomplete transition"
+        )),
+    }
 }
 
 fn guard_indexed_attempt<T>(
@@ -2413,5 +2475,231 @@ mod stop_policy_tests {
         .unwrap_err();
         assert!(error.contains("kill fixed child succeeded"));
         assert!(error.contains("exit unknown"));
+    }
+}
+
+#[cfg(test)]
+mod admitted_attempt_finalizer_tests {
+    use super::finalize_admitted_attempt_result;
+    use verification_budget::{
+        BlockReason, BudgetController, BudgetError, JobState, Limits, MINIMUM_FREE_RESERVE,
+    };
+
+    fn budget() -> BudgetController {
+        BudgetController::new(Limits { headroom_bytes: 0 })
+    }
+
+    #[test]
+    fn running_error_becomes_incomplete_without_changing_usage_or_releasing_slot() {
+        let mut controller = budget();
+        let job = controller.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        controller.record_ingress(job, 37).unwrap();
+        controller
+            .record_store(job, 2048, MINIMUM_FREE_RESERVE + 8192)
+            .unwrap();
+        assert_eq!(
+            finalize_admitted_attempt_result::<()>(
+                &mut controller,
+                job,
+                Err("late fixture failure".into()),
+            ),
+            Err("late fixture failure".into())
+        );
+        let first = controller.snapshot(job).unwrap().clone();
+        assert_eq!(first.usage.ingress_bytes, 37);
+        assert_eq!(first.usage.stored_bytes, 2048);
+        assert_eq!(
+            first.state,
+            JobState::Failed {
+                reason: BlockReason::StoreIncomplete,
+                worker_stopped: false,
+            }
+        );
+        assert_eq!(
+            controller.start(MINIMUM_FREE_RESERVE + 8192),
+            Err(BudgetError::Blocked(BlockReason::AlreadyAtConcurrencyLimit))
+        );
+        assert_eq!(
+            finalize_admitted_attempt_result::<()>(
+                &mut controller,
+                job,
+                Err("replayed fixture failure".into()),
+            ),
+            Err("replayed fixture failure".into())
+        );
+        assert_eq!(controller.snapshot(job).unwrap(), &first);
+    }
+
+    #[test]
+    fn earlier_real_ingress_refusal_keeps_overshoot_and_first_reason() {
+        let mut controller = budget();
+        let job = controller.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            controller.record_ingress(job, verification_budget::PER_REPOSITORY_INGRESS_LIMIT + 1),
+            Err(BudgetError::Blocked(BlockReason::IngressLimit)),
+        );
+        let before = controller.snapshot(job).unwrap().clone();
+        assert_eq!(
+            finalize_admitted_attempt_result::<()>(
+                &mut controller,
+                job,
+                Err("subsequent readback refused".into())
+            ),
+            Err("subsequent readback refused".into()),
+        );
+        assert_eq!(controller.snapshot(job).unwrap(), &before);
+        assert_eq!(
+            controller.start(MINIMUM_FREE_RESERVE + 8192),
+            Err(BudgetError::Blocked(BlockReason::AlreadyAtConcurrencyLimit))
+        );
+    }
+
+    #[test]
+    fn running_error_before_usage_still_records_incomplete_state() {
+        let mut controller = budget();
+        let job = controller.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            finalize_admitted_attempt_result::<()>(
+                &mut controller,
+                job,
+                Err("early fixture failure".into()),
+            ),
+            Err("early fixture failure".into())
+        );
+        assert_eq!(
+            controller.snapshot(job).unwrap().state,
+            JobState::Failed {
+                reason: BlockReason::StoreIncomplete,
+                worker_stopped: false,
+            }
+        );
+        assert_eq!(controller.snapshot(job).unwrap().usage.stored_bytes, 0);
+    }
+
+    #[test]
+    fn existing_failed_and_unclean_canceled_states_preserve_first_state_and_usage() {
+        for state in [
+            JobState::Failed {
+                reason: BlockReason::FreeSpaceReserve,
+                worker_stopped: false,
+            },
+            JobState::Failed {
+                reason: BlockReason::AttemptTimedOut,
+                worker_stopped: true,
+            },
+            JobState::Canceled {
+                cleanup_confirmed: false,
+                worker_stopped: false,
+            },
+            JobState::Canceled {
+                cleanup_confirmed: false,
+                worker_stopped: true,
+            },
+        ] {
+            let mut controller = budget();
+            let job = controller.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+            controller.record_ingress(job, 11).unwrap();
+            controller
+                .record_store(job, 19, MINIMUM_FREE_RESERVE + 8192)
+                .unwrap();
+            match state {
+                JobState::Failed { reason, .. } => controller.fail(job, reason).unwrap(),
+                JobState::Canceled { .. } => controller.cancel(job).unwrap(),
+                _ => unreachable!(),
+            }
+            if matches!(
+                state,
+                JobState::Failed {
+                    worker_stopped: true,
+                    ..
+                } | JobState::Canceled {
+                    worker_stopped: true,
+                    ..
+                }
+            ) {
+                controller.acknowledge_worker_stopped(job).unwrap();
+            }
+            let before = controller.snapshot(job).unwrap().clone();
+            assert_eq!(
+                finalize_admitted_attempt_result::<()>(
+                    &mut controller,
+                    job,
+                    Err("later fixture failure".into()),
+                ),
+                Err("later fixture failure".into())
+            );
+            assert_eq!(controller.snapshot(job).unwrap(), &before);
+        }
+    }
+
+    #[test]
+    fn unknown_completed_and_cleanup_confirmed_canceled_append_diagnostic_without_mutation() {
+        let mut controller = budget();
+        let missing = verification_budget::JobId(99);
+        let error = finalize_admitted_attempt_result::<()>(
+            &mut controller,
+            missing,
+            Err("original unknown error".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("original unknown error"));
+        assert!(error.contains("could not establish StoreIncomplete"));
+        assert_eq!(controller.retained_job_count(), 0);
+
+        for initial in [
+            JobState::Completed {
+                cleanup_confirmed: false,
+            },
+            JobState::Completed {
+                cleanup_confirmed: true,
+            },
+            JobState::Canceled {
+                cleanup_confirmed: true,
+                worker_stopped: true,
+            },
+        ] {
+            let mut controller = budget();
+            let job = controller.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+            match initial {
+                JobState::Completed { cleanup_confirmed } => {
+                    controller.complete(job).unwrap();
+                    if cleanup_confirmed {
+                        controller.confirm_cleanup(job).unwrap();
+                    }
+                }
+                JobState::Canceled { .. } => {
+                    controller.cancel(job).unwrap();
+                    controller.acknowledge_worker_stopped(job).unwrap();
+                    controller.confirm_cleanup(job).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = controller.snapshot(job).unwrap().clone();
+            let error = finalize_admitted_attempt_result::<()>(
+                &mut controller,
+                job,
+                Err("original terminal error".into()),
+            )
+            .unwrap_err();
+            assert!(error.contains("original terminal error"));
+            assert!(error.contains("could not establish StoreIncomplete"));
+            assert_eq!(controller.snapshot(job).unwrap(), &before);
+        }
+    }
+
+    #[test]
+    fn success_is_returned_unchanged() {
+        let mut controller = budget();
+        let job = controller.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        controller.record_ingress(job, 5).unwrap();
+        controller
+            .record_store(job, 7, MINIMUM_FREE_RESERVE + 8192)
+            .unwrap();
+        let before = controller.snapshot(job).unwrap().clone();
+        assert_eq!(
+            finalize_admitted_attempt_result(&mut controller, job, Ok(23)),
+            Ok(23)
+        );
+        assert_eq!(controller.snapshot(job).unwrap(), &before);
     }
 }

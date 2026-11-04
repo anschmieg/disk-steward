@@ -415,3 +415,17 @@ still lead to stop and confirmation attempts, that a kill/exit race needs
 independent exit confirmation, and that combined failures retain their reasons.
 The production wrapper continues to operate only on its existing owned child;
 this seam adds no command, renderer route, process selector or stop authority.
+
+After the live registry error finalizer, an indexed attempt also finalizes its
+existing in-process budget job. An error that leaves the job Running marks it
+Failed with StoreIncomplete while retaining its charged ingress/store usage
+and unconfirmed worker-stop state. Earlier failures and uncleaned cancellation
+states retain their original reason, usage and stop status. This fallback does
+not acknowledge shutdown or cleanup, release the occupied slot, clear charges
+or reset an attempt timer.
+
+An unknown job or an unexpected completed/cleanup-confirmed state is left
+unchanged and reported alongside the original operation error. This is
+in-process incomplete-state bookkeeping, not durable app-wide ownership, a
+measurement of unknown allocation, or evidence that a worker stopped. The
+registry's independent reservation and reconciliation rules remain unchanged.
