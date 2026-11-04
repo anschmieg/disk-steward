@@ -15,7 +15,7 @@ const MAX_GIT_OUT: usize = 65_536;
 const MAX_PACK: usize = 512;
 // Setup and receiver verification run outside the HTTP attempt. Shared CI can
 // take longer to start a cold system Git; keep RPC supervision at three seconds.
-const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(10);
+const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(30);
 const GIT_RPC_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 

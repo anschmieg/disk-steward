@@ -1,6 +1,6 @@
 # Disk Steward
 
-Working name; no naming or trademark research performed. Implementation is in progress at 0.0.16. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore/permanent-removal cycle for five disposable files it creates itself. Native file and folder selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. User-file scanning and cleanup are not enabled.
+Working name; no naming or trademark research performed. Implementation is in progress at 0.0.17. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore/permanent-removal cycle for five disposable files it creates itself. Native file and folder selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. The desktop Explore folder view can inspect up to 512 immediate entries of a natively selected folder using metadata only; recursive scanning and user-file cleanup are not enabled.
 
 ## Product
 
@@ -62,3 +62,21 @@ The current UI edits a backend-owned five-action synthetic plan, saves immutable
 See [M1C validation](docs/M1C-VALIDATION.md) for purge and migration evidence and remaining measurement gates, [M1A validation](docs/M1A-VALIDATION.md) for observed native behavior, tests and remaining gates, and the [implementation forecast](docs/IMPLEMENTATION-FORECAST.md) for the revised work estimate. M1A is complete within its documented disposable scope; M0 remains open and no supported release is implied by a successful demo.
 
 The native synthetic pilot workspace includes opt-in **Review pilot recording** controls. Enter an anonymous code, start before the tasks, then finish to inspect the local aggregate JSON report. Manually preserve it before closing the tab if needed. No report is sent or saved automatically. A moderator must separately assess preservation, comprehension, confusion and assistance; the recorder does not certify a pilot pass.
+
+## Initial folder explorer
+
+In the macOS desktop app, Explore folder opens a native folder picker and shows immediate entry names, kinds and exact logical byte sizes. Sort by name or logical size. The observation is bounded to 512 entries and cooperative two-second checks between OS calls; slow OS calls can exceed that interval. It does not descend into folders, follow entry links or read file contents. Nested sizes, allocated/reclaimable space and changes after inspection remain unknown. Hard links are counted per name, incomplete coverage is explicit, and all entries remain unavailable for cleanup. Canceling or failing a new observation preserves the previous result with a status message.
+
+This is an initial inventory contribution, not resumable recursive scanning, detector eligibility, M2A completion or MVP acceptance. Delivery now prioritizes the usable MVP flow; once the roadmap MVP is produced, the automation must perform an adversarial review, fix findings and validate, then disable itself and stop. See [.autonomous/disk-steward/mvp-delivery-priority.md](.autonomous/disk-steward/mvp-delivery-priority.md).
+
+The folder explorer also supports explicit drill-down into observed child folders and Back navigation, with display-only breadcrumbs. Navigation is confined to a backend-held native selection: the renderer supplies observation/entry IDs, not filesystem paths. Child identities are rechecked and links, volume crossings, hidden folders, recognized package/library boundaries and excessive depth are blocked. Navigation refreshes the immediate-entry observation; it does not recursively calculate folder sizes. Failed navigation keeps the previous observation. Sessions are memory-only and do not authorize file changes.
+
+A local name filter narrows only the displayed entries. Subtle size bars retain the full observation's per-name regular-file logical-byte denominator when filtering/sorting, with exact byte labels always available. They do not represent allocated or recoverable space.
+
+Navigation sessions are bounded to 16 held directory levels and 512 observed immediate entries. Boundary detection currently recognizes specific package/library name suffixes; it is not complete platform library/cloud-placeholder classification. Binding checks before and after scans are conservative race detection, not an atomic guarantee against another process continuously renaming directories. No file contents are read, and observations cannot authorize cleanup.
+
+## Review observed entries
+
+After exploring a folder, explicitly add the observed file/folder entries to Your plan. This saves bounded names and historical metadata locally in a separate initially empty workspace; pilot/stress examples stay separate. Filtering the explorer does not narrow the import. The whole batch is one undo step, and decisions, redo and saved review snapshots survive reopening. Reimporting the same observation is refused atomically.
+
+Imported entries default to Keep and remain blocked from cleanup, including when Include is requested. There is no source-path binding or execution approval. Different observations may overlap or describe hard links: plan totals count per-entry logical metadata, not occupied or recoverable space. Unsafe integer sizes or cumulative totals are refused rather than rounded. Refreshing the explorer does not overwrite saved decisions.
