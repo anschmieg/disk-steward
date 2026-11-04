@@ -543,6 +543,21 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     )
     .unwrap();
     assert_eq!(decoded_pack.objects().len(), 4);
+    let advertised_closure = decode_advertised_pack(
+        &fetch_report,
+        &pack,
+        4096,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(advertised_closure.decoded().objects().len(), 4);
+    assert_eq!(advertised_closure.graph().reachable_objects(), 4);
+    assert_eq!(
+        advertised_closure.advertised_ref_count(),
+        fetch_report.advertised_refs().unwrap().len()
+    );
+
     let closure = check_pack_graph_closure(
         &decoded_pack,
         &[

@@ -11,13 +11,13 @@ use std::{
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
-fn oid(kind: K, bytes: &[u8]) -> [u8; 20] {
+pub(super) fn oid(kind: K, bytes: &[u8]) -> [u8; 20] {
     git_sha1_object_id(kind, bytes, &CancellationHandle::new(), deadline()).unwrap()
 }
-fn hex(id: &[u8; 20]) -> String {
+pub(super) fn hex(id: &[u8; 20]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn pack(objects: &[(K, Vec<u8>)]) -> DecodedPack {
+pub(super) fn pack_bytes(objects: &[(K, Vec<u8>)]) -> Vec<u8> {
     let mut out = b"PACK\0\0\0\x02".to_vec();
     out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
     for (kind, content) in objects {
@@ -42,20 +42,23 @@ fn pack(objects: &[(K, Vec<u8>)]) -> DecodedPack {
     }
     let digest = Sha1::digest(&out);
     out.extend_from_slice(&digest);
+    out
+}
+fn pack(objects: &[(K, Vec<u8>)]) -> DecodedPack {
     decode_sha1_pack(
-        &out,
+        &pack_bytes(objects),
         16 * 1024 * 1024,
         &CancellationHandle::new(),
         deadline(),
     )
     .unwrap()
 }
-fn tree(mode: &str, id: [u8; 20]) -> Vec<u8> {
+pub(super) fn tree(mode: &str, id: [u8; 20]) -> Vec<u8> {
     let mut b = format!("{mode} file\0").into_bytes();
     b.extend(id);
     b
 }
-fn commit(tree: [u8; 20], parents: &[[u8; 20]]) -> Vec<u8> {
+pub(super) fn commit(tree: [u8; 20], parents: &[[u8; 20]]) -> Vec<u8> {
     let mut b = format!("tree {}\n", hex(&tree));
     for parent in parents {
         b.push_str(&format!("parent {}\n", hex(parent)));
