@@ -1,6 +1,6 @@
 # Disk Steward
 
-Working name; no naming or trademark research performed. Implementation is in progress at 0.0.16. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore/permanent-removal cycle for five disposable files it creates itself. Native file and folder selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. User-file scanning and cleanup are not enabled.
+Working name; no naming or trademark research performed. Implementation is in progress at 0.0.17. The current desktop app demonstrates an editable synthetic plan and a review/confirmation/stage/restore/permanent-removal cycle for five disposable files it creates itself. Native file and folder selection can add a blocked metadata-only observation; separately confirmed folder exclusions can be saved for future scans. The desktop Explore folder view can inspect up to 512 immediate entries of a natively selected folder using metadata only; recursive scanning and user-file cleanup are not enabled.
 
 ## Product
 
@@ -62,3 +62,9 @@ The current UI edits a backend-owned five-action synthetic plan, saves immutable
 See [M1C validation](docs/M1C-VALIDATION.md) for purge and migration evidence and remaining measurement gates, [M1A validation](docs/M1A-VALIDATION.md) for observed native behavior, tests and remaining gates, and the [implementation forecast](docs/IMPLEMENTATION-FORECAST.md) for the revised work estimate. M1A is complete within its documented disposable scope; M0 remains open and no supported release is implied by a successful demo.
 
 The native synthetic pilot workspace includes opt-in **Review pilot recording** controls. Enter an anonymous code, start before the tasks, then finish to inspect the local aggregate JSON report. Manually preserve it before closing the tab if needed. No report is sent or saved automatically. A moderator must separately assess preservation, comprehension, confusion and assistance; the recorder does not certify a pilot pass.
+
+## Initial folder explorer
+
+In the macOS desktop app, Explore folder opens a native folder picker and shows immediate entry names, kinds and exact logical byte sizes. Sort by name or logical size. The observation is bounded to 512 entries and cooperative two-second checks between OS calls; slow OS calls can exceed that interval. It does not descend into folders, follow entry links or read file contents. Nested sizes, allocated/reclaimable space and changes after inspection remain unknown. Hard links are counted per name, incomplete coverage is explicit, and all entries remain unavailable for cleanup. Canceling or failing a new observation preserves the previous result with a status message.
+
+This is an initial inventory contribution, not resumable recursive scanning, detector eligibility, M2A completion or MVP acceptance. Delivery now prioritizes the usable MVP flow; once the roadmap MVP is produced, the automation must perform an adversarial review, fix findings and validate, then disable itself and stop. See [.autonomous/disk-steward/mvp-delivery-priority.md](.autonomous/disk-steward/mvp-delivery-priority.md).
