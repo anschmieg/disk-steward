@@ -460,15 +460,15 @@ cooperative controls still require an outer supervised worker.
 
 `decode_advertised_pack` composes a completed pack-transfer report with decoding
 and graph closure of caller-supplied bytes. It requires an exact accepted-byte
-count, resolves every advertised tip, requires commit objects for HEAD and branch
+count and SHA-256 digest match, resolves every advertised tip, requires commit objects for HEAD and branch
 refs, and uses decoded kinds for other namespaces. Symref targets must appear in
 the same advertisement with the same ID. Peeled tag claims must match the terminal
 non-tag object reached through typed tag links. Repeated peel claims share a
 16,384-step budget. Existing decoder, graph and parser caps remain in force;
 there are at most 1,024 advertised refs and 64 distinct roots.
 
-The caller must provide bytes actually captured from that report's sink. Length
-and matching roots do not prove stream provenance. The operation remains inactive
+The SHA-256 digest binds supplied bytes to the stream the sink reported accepting.
+It does not prove physical persistence or authenticate a remote source. The operation remains inactive
 and does not establish an atomic remote snapshot, required local-state coverage,
 full fsck, signatures, practical private authentication, production worker/RSS
 limits or cleanup eligibility. Strict supported-subset refusals remain incomplete
@@ -487,7 +487,7 @@ is checked. The result reports request and graph counts, with no cleanup flag.
 This relation does not discover or attest local repository state. Callers still
 need a complete, stable local inventory, local ref-name preservation/disposition,
 receipt freshness and revalidation, and treatment of working files, hooks,
-configuration, stashes and recoverable state. The earlier stream-provenance,
+configuration, stashes and recoverable state. The earlier persistence,
 full-fsck, authentication, worker/RSS and cleanup limits remain. Traversal reuses
 existing fallible allocation and cooperative controls without cloning payloads.
 Tests distinguish an unreachable packed object from a reachable ancestor and
@@ -512,3 +512,20 @@ the parent does not infer deletion authority or remove paths from child output.
 Private GitHub credentials, stable local inventory, preservation, receipt expiry
 and integrated store lifecycle gates remain open. Production app/renderer and
 worker-probe interfaces are unchanged.
+
+### Accepted-byte stream binding
+
+The transfer report exposes `accepted_pack_sha256` only after the pack operation
+and HTTP finalization both succeed. The constant-memory digest observes exactly
+the prefix each sink write reports accepting, including short writes; interrupted
+or failed calls contribute no bytes. Partial failures retain accepted byte counts
+but expose no digest. This uses pinned `sha2` 0.10.9, already present in the lockfile.
+
+Before decoding, the advertised-pack operation checks length and compares this
+digest against the supplied bytes in cooperative 8 KiB chunks. The existing
+16 MiB experimental input cap is checked before hashing. A valid same-size pack
+with the same roots and different unrelated contents is rejected. Digest equality
+binds content under SHA-256; it does not validate a sink's persistence claims,
+replace native file identity/revalidation, authenticate a server or authorize
+cleanup. Tests include an independent Python hashlib vector, short/interrupted
+writes, withheld failure digests and same-size valid-pack substitution.

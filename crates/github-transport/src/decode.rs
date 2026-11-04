@@ -21,7 +21,7 @@ use crate::{
     GitObjectKind, PackEntryKind,
 };
 
-const MAX_PACK_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_PACK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OBJECTS: u32 = 1024;
 const MAX_DELTA_DEPTH: u8 = 32;
