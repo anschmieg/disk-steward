@@ -15,7 +15,7 @@ const MAX_GIT_OUT: usize = 65_536;
 const MAX_PACK: usize = 512;
 // Setup and receiver verification run outside the HTTP attempt. Shared CI can
 // take longer to start a cold system Git; keep RPC supervision at three seconds.
-const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(10);
+const GIT_SETUP_DEADLINE: Duration = Duration::from_secs(30);
 const GIT_RPC_DEADLINE: Duration = Duration::from_secs(3);
 const AUTHOR_DATE: &str = "2001-02-03T04:05:06+0000";
 
@@ -431,8 +431,30 @@ fn git_upload_pack(root: &PrivateRoot, args: &[&str], input: &[u8]) -> io::Resul
     Ok(result.stdout)
 }
 
+const VERIFICATION_COMPLETE: &[u8] = b"DISK_STEWARD_GIT_VERIFICATION_COMPLETE\n";
+
 #[test]
 fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
+    let receipt = super::completion_supervision::supervise(
+        "tests::git_interop::real_git_verification_child",
+        VERIFICATION_COMPLETE,
+        Duration::from_secs(30),
+    )
+    .expect("bounded real-Git verification child must complete");
+    assert!(receipt.reader_joined);
+    assert!(receipt.bytes > VERIFICATION_COMPLETE.len() && receipt.bytes <= 1024);
+}
+
+#[test]
+#[ignore = "selected only by the exact real-Git verification supervisor"]
+fn real_git_verification_child() {
+    run_real_git_verification();
+    let mut stdout = io::stdout();
+    stdout.write_all(VERIFICATION_COMPLETE).unwrap();
+    stdout.flush().unwrap();
+}
+
+fn run_real_git_verification() {
     let root = PrivateRoot::create().unwrap();
     let (repo, blob, tree, commit, tag_object) = make_repository(&root).unwrap();
     let peeled = object_id(
@@ -524,7 +546,9 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     let root = server.join().expect("fixture server panicked").unwrap();
     let report = report_result.unwrap();
     let fetch_report = fetch_result.unwrap();
-    pack_sink.sync_and_observe().unwrap();
+    let advertised_closure = pack_sink
+        .decode_download(&fetch_report, 4096, Instant::now() + Duration::from_secs(5))
+        .unwrap();
     let pack = pack_sink.contents().unwrap();
     let checksum = check_sha1_pack_checksum(
         &mut std::io::Cursor::new(&pack),
@@ -535,6 +559,51 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     .unwrap();
     assert_eq!(checksum.version(), 2);
     assert_eq!(checksum.declared_object_count(), 4);
+    let decoded_pack = decode_sha1_pack(
+        &pack,
+        4096,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(decoded_pack.objects().len(), 4);
+
+    assert_eq!(advertised_closure.decoded().objects().len(), 4);
+    assert_eq!(advertised_closure.graph().reachable_objects(), 4);
+    assert_eq!(
+        advertised_closure.advertised_ref_count(),
+        fetch_report.advertised_refs().unwrap().len()
+    );
+
+    let coverage = advertised_closure
+        .check_required_objects(
+            &[
+                (hex_oid(&commit), GitObjectKind::Commit),
+                (hex_oid(&tree), GitObjectKind::Tree),
+                (hex_oid(&blob), GitObjectKind::Blob),
+                (hex_oid(&tag_object), GitObjectKind::Tag),
+            ],
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(coverage.required_object_count(), 4);
+    assert_eq!(coverage.graph().reachable_objects(), 4);
+
+    let closure = check_pack_graph_closure(
+        &decoded_pack,
+        &[
+            (hex_oid(&commit), GitObjectKind::Commit),
+            (hex_oid(&tag_object), GitObjectKind::Tag),
+        ],
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(closure.root_count(), 2);
+    assert_eq!(closure.reachable_objects(), 4);
+    assert_eq!(closure.checked_edges(), 3);
+
     assert_eq!(checksum.checksum().as_slice(), &pack[pack.len() - 20..]);
     let entry = parse_sha1_pack_entry_header(&pack[12..], 12, 512).unwrap();
     let first_object = match entry.kind() {
@@ -607,6 +676,50 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
         )
         .unwrap();
         assert_eq!(actual, hex_oid(oid));
+        let decoded = decoded_pack
+            .objects()
+            .iter()
+            .find(|object| object.oid() == &actual)
+            .unwrap();
+        assert_eq!(decoded.kind(), kind);
+        assert_eq!(decoded.content(), raw);
+        if kind == GitObjectKind::Tag {
+            let link = parse_sha1_tag(
+                decoded.content(),
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(link.target(), &hex_oid(&commit));
+            assert_eq!(link.target_kind(), GitObjectKind::Commit);
+            assert_eq!(link.name(), b"fixture");
+        }
+
+        if kind == GitObjectKind::Commit {
+            let links = parse_sha1_commit(
+                decoded.content(),
+                1024,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(links.tree(), &hex_oid(&tree));
+            assert!(links.parents().is_empty());
+        }
+
+        if kind == GitObjectKind::Tree {
+            let links = parse_sha1_tree(
+                decoded.content(),
+                4096,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].mode(), GitTreeMode::Regular);
+            assert_eq!(links[0].name(), b"fixture.txt");
+            assert_eq!(links[0].oid(), &hex_oid(&blob));
+        }
     }
 
     let mut damaged_pack = pack.clone();
@@ -912,6 +1025,20 @@ fn delta_reconstruction_matches_independent_strict_git_import() {
     .unwrap();
     assert_eq!(git_result, b"hello braveworld!");
     assert_eq!(reconstructed, git_result);
+    let decoded = decode_sha1_pack(
+        pack,
+        1024,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(decoded.objects().len(), 2);
+    assert_eq!(decoded.objects()[1].content(), git_result);
+    assert_eq!(
+        decoded.objects()[1].oid(),
+        &hex_oid("799d6e2806898251c4b4be06ec68ca7a32bb8c31")
+    );
+
     assert_eq!(
         git_sha1_object_id(
             GitObjectKind::Blob,
@@ -933,4 +1060,141 @@ fn delta_reconstruction_matches_independent_strict_git_import() {
         delta_header.kind(),
         PackEntryKind::ReferenceDelta { base_oid }
     );
+}
+
+#[test]
+fn real_git_tree_modes_and_directory_order_match_parser() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, blob, tree, commit, _) = make_repository(&root).unwrap();
+    // Git sorts this deliberately unordered input and canonicalizes 040000.
+    let input = format!("040000 tree {tree}\tfoo\n100755 blob {blob}\tfoo0\n100644 blob {blob}\tfoo.bar\n160000 commit {commit}\tb-module\n120000 blob {blob}\ta-link\n");
+    let tree_oid =
+        object_id(&checked_git(&root, &["-C", &repo, "mktree"], input.as_bytes()).unwrap())
+            .unwrap();
+    let raw = checked_git(&root, &["-C", &repo, "cat-file", "tree", &tree_oid], b"").unwrap();
+    let links = parse_sha1_tree(
+        &raw,
+        5,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        links.iter().map(|link| link.name()).collect::<Vec<_>>(),
+        [
+            b"a-link".as_slice(),
+            b"b-module",
+            b"foo.bar",
+            b"foo",
+            b"foo0"
+        ]
+    );
+    assert_eq!(
+        links.iter().map(|link| link.mode()).collect::<Vec<_>>(),
+        [
+            GitTreeMode::Symlink,
+            GitTreeMode::Gitlink,
+            GitTreeMode::Regular,
+            GitTreeMode::Directory,
+            GitTreeMode::Executable
+        ]
+    );
+    assert_eq!(links[1].oid(), &hex_oid(&commit));
+    assert_eq!(links[3].oid(), &hex_oid(&tree));
+    for index in [0, 2, 4] {
+        assert_eq!(links[index].oid(), &hex_oid(&blob));
+    }
+}
+
+#[test]
+fn real_git_merge_commit_preserves_ordered_parent_links() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, _, tree, commit, _) = make_repository(&root).unwrap();
+    let child = object_id(
+        &checked_git(
+            &root,
+            &["-C", &repo, "commit-tree", &tree, "-p", &commit],
+            b"child\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let merge = object_id(
+        &checked_git(
+            &root,
+            &[
+                "-C",
+                &repo,
+                "commit-tree",
+                &tree,
+                "-p",
+                &child,
+                "-p",
+                &commit,
+            ],
+            b"merge\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let raw = checked_git(&root, &["-C", &repo, "cat-file", "commit", &merge], b"").unwrap();
+    let links = parse_sha1_commit(
+        &raw,
+        2,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(links.tree(), &hex_oid(&tree));
+    assert_eq!(links.parents(), &[hex_oid(&child), hex_oid(&commit)]);
+    assert_eq!(&raw[links.header_bytes()..], b"merge\n");
+    assert_eq!(
+        git_sha1_object_id(
+            GitObjectKind::Commit,
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .unwrap(),
+        hex_oid(&merge)
+    );
+}
+
+#[test]
+fn real_git_mktag_matches_all_declared_target_kinds() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, blob, tree, commit, tag) = make_repository(&root).unwrap();
+    for (kind, expected, target) in [
+        ("blob", GitObjectKind::Blob, &blob),
+        ("tree", GitObjectKind::Tree, &tree),
+        ("commit", GitObjectKind::Commit, &commit),
+        ("tag", GitObjectKind::Tag, &tag),
+    ] {
+        let name = format!("v-{kind}");
+        let input=format!("object {target}\ntype {kind}\ntag {name}\ntagger P <p@e> 1234567890 +0000\n\nfixture\n");
+        let oid =
+            object_id(&checked_git(&root, &["-C", &repo, "mktag"], input.as_bytes()).unwrap())
+                .unwrap();
+        let raw = checked_git(&root, &["-C", &repo, "cat-file", "tag", &oid], b"").unwrap();
+        let link = parse_sha1_tag(
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(link.target(), &hex_oid(target));
+        assert_eq!(link.target_kind(), expected);
+        assert_eq!(link.name(), name.as_bytes());
+        assert_eq!(&raw[link.header_bytes()..], b"fixture\n");
+        assert_eq!(
+            git_sha1_object_id(
+                GitObjectKind::Tag,
+                &raw,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap(),
+            hex_oid(&oid)
+        );
+    }
 }
