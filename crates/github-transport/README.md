@@ -627,3 +627,23 @@ allocation. Each of at most 1,024 entries and present links is processed once,
 with binary target lookup and cancellation/deadline checks during traversal
 and completion.
 It cannot establish consistency of refs omitted by the caller or native atomicity.
+
+The closed private pack-file fixture reconciles the completed transfer's
+cumulative raw HTTP ingress into the same `BudgetController` job that charges
+file allocation, before checking cancellation or decoding. Repeating a total
+charges no duplicate bytes. An incomplete transfer still contributes observed
+ingress; a failed/non-running job cannot yield decoded evidence even if late
+accounting itself is accepted. Counter regressions cancel the fixture without
+reducing prior usage. Tests retain the durable reservation and require
+reconciliation on reopen after refusal, including a synthetic over-limit counter.
+Transport-bound fixture constructors also sample that attempt's cumulative raw
+ingress before each payload write and require the same attempt context before
+accounting a final report. Same-byte reports from another attempt are refused
+without charging their counter or cancelling that other attempt. The counter
+mutex is released before controller accounting or filesystem work.
+
+These are write checkpoints and completion-time accounting in a task-owned
+fixture, not a per-read controller callback, durable usage receipt, production
+worker/store integration or multi-gigabyte network enforcement demonstration.
+Unbound constructors remain for file-only tests; this is not a public
+report-adoption API.

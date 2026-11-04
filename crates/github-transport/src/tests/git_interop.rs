@@ -534,7 +534,7 @@ fn run_real_git_verification() {
     let server_tls = tls.server.clone();
     let fetch_repository = RepositoryUrl::parse("https://github.com/example/repo.git").unwrap();
     let fetch_transport = candidate_transport(fetch_repository, &tls, address);
-    let mut pack_sink = BudgetFileSink::new(&root, fetch_transport.cancellation_handle()).unwrap();
+    let mut pack_sink = BudgetFileSink::new_for_transport(&root, &fetch_transport).unwrap();
     let inspection_repo = repo.clone();
     let expected_commit = commit.clone();
     let expected_tag = tag_object.clone();
@@ -612,6 +612,10 @@ fn run_real_git_verification() {
     let advertised_closure = pack_sink
         .decode_download(&fetch_report, 4096, Instant::now() + Duration::from_secs(5))
         .unwrap();
+    assert_eq!(
+        pack_sink.ingress_bytes_charged(),
+        fetch_report.finalization().observed_ingress_bytes()
+    );
     let pack = pack_sink.contents().unwrap();
     let checksum = check_sha1_pack_checksum(
         &mut std::io::Cursor::new(&pack),
@@ -1142,14 +1146,21 @@ fn budgeted_file_refusal_stops_candidate_and_retains_partial_charge() {
     body.extend(super::ref_packet(b"\x01PACKfixture"));
     body.extend_from_slice(b"0000");
     let (transport, server) = super::pack_tests::pack_fixture(body);
-    let mut sink =
-        BudgetFileSink::new_with_limit(&root, transport.cancellation_handle(), 5).unwrap();
+    let mut sink = BudgetFileSink::new_with_limit_for_transport(&root, &transport, 5).unwrap();
     let report = transport.download_advertised_pack(&mut sink).unwrap();
     server.join().unwrap();
     assert!(!report.is_complete_transfer());
     assert!(report.advertised_refs().is_none());
     assert_eq!(sink.contents().unwrap(), b"PACKf");
     assert_eq!(report.bytes_written(), 5);
+    assert!(sink
+        .decode_download(&report, 4096, Instant::now() + Duration::from_secs(5))
+        .is_err());
+    assert_eq!(
+        sink.ingress_bytes_charged(),
+        report.finalization().observed_ingress_bytes()
+    );
+    assert!(sink.ingress_bytes_charged() > report.bytes_written());
     let partial_metadata = fs::metadata(root.path.join("pack.download")).unwrap();
     assert!(
         sink.bytes_charged()
