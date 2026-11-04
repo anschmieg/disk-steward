@@ -127,8 +127,9 @@ fn run_parent(args: &[String]) -> Result<(), String> {
         }
         [flag] if flag == "--run-store-worker" => run_store_worker(),
         [flag] if flag == "--run-store-reinspect" => run_store_reinspect(),
-        [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(false),
-        [flag] if flag == "--run-indexed-store-handoff" => run_indexed_store_worker(true),
+        [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(IndexedWorkerMode::Stall),
+        [flag] if flag == "--run-indexed-store-handoff" => run_indexed_store_worker(IndexedWorkerMode::DescriptorOnly),
+        [flag] if flag == "--run-indexed-store-payload" => run_indexed_store_worker(IndexedWorkerMode::Payload),
         [flag, confirm] if flag == "--run-store-cleanup" && confirm == "--confirm-own-store-cleanup" => run_store_worker_with_cleanup(true),
         [flag] if flag == "--run-store-cleanup" => Err("refusing store cleanup without --confirm-own-store-cleanup".into()),
         [flag] if flag == "--run" => {
@@ -161,11 +162,19 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, --run-indexed-store-handoff, or --run-store-cleanup --confirm-own-store-cleanup".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, --run-indexed-store-handoff, --run-indexed-store-payload, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
 }
 
-fn run_indexed_store_worker(descriptor_handoff: bool) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexedWorkerMode {
+    Stall,
+    DescriptorOnly,
+    Payload,
+}
+
+fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
+    let descriptor_handoff = mode != IndexedWorkerMode::Stall;
     use verification_store_registry::{
         RegistryError, StoreState as RState, VerificationStoreRegistry,
     };
@@ -182,7 +191,7 @@ fn run_indexed_store_worker(descriptor_handoff: bool) -> Result<(), String> {
     registry
         .register(FIXTURE_ID, parent.0, parent.1, root.0, root.1)
         .map_err(|e| format!("register store: {e}"))?;
-    // Closed admission-bookkeeping exercise, not a measured store footprint.
+    // Commit admission before child access; directory/index overhead is not measured.
     const RESERVATION: u64 = 128 * 1024;
     let reserved = registry
         .reserve(FIXTURE_ID, 0, RESERVATION)
@@ -199,10 +208,10 @@ fn run_indexed_store_worker(descriptor_handoff: bool) -> Result<(), String> {
     } else {
         Stdio::null()
     };
-    let child_mode = if descriptor_handoff {
-        "store-handoff"
-    } else {
-        "stall"
+    let child_mode = match mode {
+        IndexedWorkerMode::Stall => "stall",
+        IndexedWorkerMode::DescriptorOnly => "store-handoff",
+        IndexedWorkerMode::Payload => "store-payload",
     };
     let mut child = Command::new(exe)
         .env_clear()
@@ -273,6 +282,17 @@ fn run_indexed_store_worker(descriptor_handoff: bool) -> Result<(), String> {
     let live_state = store
         .inspect_state()
         .map_err(|e| format!("inspect store: {e}"))?;
+    let payload_observation = if mode == IndexedWorkerMode::Payload {
+        let observation = store
+            .inspect_stopped_worker_payload(&receipt)
+            .map_err(|_| "stopped worker payload validation refused".to_owned())?;
+        if observation.high_water_bytes > RESERVATION || observation.written_bytes != 32 * 1024 {
+            return Err("worker payload exceeds fixed admission".into());
+        }
+        Some(observation)
+    } else {
+        None
+    };
     drop(registry);
     drop(store);
     let mut reopened = VerificationStoreRegistry::open(&registry_path)
@@ -311,7 +331,11 @@ fn run_indexed_store_worker(descriptor_handoff: bool) -> Result<(), String> {
         }
         Ok(_) => return Err("reopened reconciliation row unexpectedly became active".into()),
     }
-    if descriptor_handoff {
+    if let Some(observation) = payload_observation {
+        let written = observation.written_bytes;
+        let high_water = observation.high_water_bytes;
+        println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+    } else if descriptor_handoff {
         println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
     } else {
         println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
@@ -447,6 +471,20 @@ fn run_child(args: &[String]) -> Result<(), String> {
         [mode] if mode == "store-handoff" => {
             store::OwnedStore::validate_worker_stdin_handoff()
                 .map_err(|_| "store handoff refused".to_owned())?;
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(b"R")
+                .map_err(|_| "child readiness write failed")?;
+            stdout.flush().map_err(|_| "child readiness flush failed")?;
+            thread::sleep(CHILD_HOLD);
+            Ok(())
+        }
+        [mode] if mode == "store-payload" => {
+            let report = store::write_worker_stdin_payload()
+                .map_err(|_| "worker payload incomplete; retain store".to_owned())?;
+            if report.written_bytes != 32 * 1024 || !report.cap_reached {
+                return Err("worker payload limit not established".into());
+            }
             let mut stdout = io::stdout().lock();
             stdout
                 .write_all(b"R")

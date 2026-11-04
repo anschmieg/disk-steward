@@ -95,6 +95,18 @@ enum Phase {
 
 pub(crate) type ControlIdentity = ((u64, u64), (u64, u64));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerPayloadObservation {
+    pub(crate) written_bytes: u64,
+    pub(crate) high_water_bytes: u64,
+}
+
+/// Run the fixed synthetic payload writer against the validated worker stdin
+/// directory capability. No paths or payload parameters are accepted.
+pub(crate) fn write_worker_stdin_payload() -> Result<payload::PayloadReport, StoreError> {
+    handoff::write_stdin_payload()
+}
+
 impl OwnedStore {
     /// Return the verified store-root descriptor for the single fixed worker
     /// stdin handoff. The child receives only this directory capability.
@@ -104,6 +116,13 @@ impl OwnedStore {
 
     pub(crate) fn validate_worker_stdin_handoff() -> Result<(), StoreError> {
         handoff::validate_stdin()
+    }
+
+    pub(crate) fn inspect_stopped_worker_payload(
+        &self,
+        receipt: &crate::StopReceipt,
+    ) -> Result<WorkerPayloadObservation, StoreError> {
+        handoff::inspect_stopped_worker_payload(self, receipt)
     }
 
     pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {

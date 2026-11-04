@@ -303,3 +303,61 @@ fn indexed_store_descriptor_handoff_requires_exact_capability_and_arguments() {
     assert!(!report.contains("synthetic-handoff-parent-only"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-handoff-parent-only"));
 }
+
+#[test]
+fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() {
+    for args in [
+        vec!["--run-indexed-store-payload", "/tmp/caller-path"],
+        vec!["--run-indexed-store-payload", "--confirm-own-store-cleanup"],
+        vec!["--child", "store-payload", "extra"],
+    ] {
+        let output = probe().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    let missing = probe()
+        .args(["--child", "store-payload"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+
+    let output = probe()
+        .arg("--run-indexed-store-payload")
+        .env(
+            "DISK_STEWARD_WORKER_ENV_SENTINEL",
+            "synthetic-payload-parent-only",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(report.lines().count(), 1);
+    for evidence in [
+        "worker_joined=true",
+        "registered_stopped=true",
+        "reopened_reconciliation=true",
+        "prior_stopped=true",
+        "reserved_bytes=131072",
+        "descriptor_handoff=true",
+        "payload_validated=true",
+        "payload_written=32768",
+        "cleanup=not_authorized",
+    ] {
+        assert!(report.contains(evidence), "{report}");
+    }
+    let high_water = report
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("payload_high_water_bytes="))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((32768..=131072).contains(&high_water));
+    assert!(!report.contains("synthetic-payload-parent-only"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-payload-parent-only"));
+}
