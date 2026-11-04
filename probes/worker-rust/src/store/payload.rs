@@ -4,13 +4,15 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::{identity, open_parent, require_entries, validate_private_directory};
 use super::{OwnedStore, Phase, StoreError};
+use std::fs::File;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::{fs::File, io::Write, os::fd::AsFd};
+use std::{io::Write, os::fd::AsFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use verification_budget::{BlockReason, BudgetController, Limits};
 
-const NAME: &str = "payload.bin";
-const LIMIT: u64 = 32 * 1024;
+pub(super) const NAME: &str = "payload.bin";
+pub(super) const LIMIT: u64 = 32 * 1024;
+pub(super) const PARTIAL_FIXTURE_BYTES: u64 = 2048;
 const ATTEMPT_LIMIT: u64 = 64 * 1024;
 const CHUNK: usize = 4096;
 const RESERVE_HEADROOM: u64 = 1024 * 1024;
@@ -49,6 +51,75 @@ fn write_payload(store: OwnedStore) -> Result<PayloadReport, StoreError> {
     )
 }
 
+/// Write the same fixed synthetic payload through a validated worker-owned
+/// directory descriptor. The caller supplies only identity checks for this
+/// fixed handoff; filenames, data and byte limits remain closed here.
+pub(super) fn write_worker_payload(
+    root: &File,
+    reservation: u64,
+    verify: impl FnMut(bool, Option<(u64, u64)>) -> Result<(), StoreError>,
+) -> Result<PayloadReport, StoreError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if reservation != super::WORKER_PAYLOAD_RESERVATION {
+            return Err(StoreError::InvalidJournal);
+        }
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        write_payload_accounted_at_root(
+            root,
+            verify,
+            Some(reservation),
+            sampled_free_bytes,
+            |file, bytes| file.write_all(bytes),
+            File::sync_all,
+            &mut budget,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, reservation, verify);
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
+
+/// Fixed failure probe: write exactly one 2 KiB prefix through the same
+/// accounting core, then report an interrupted write. This is not a tunable
+/// writer or a production disk-full simulation.
+pub(super) fn write_worker_payload_partial(
+    root: &File,
+    reservation: u64,
+    verify: impl FnMut(bool, Option<(u64, u64)>) -> Result<(), StoreError>,
+) -> Result<PayloadReport, StoreError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if reservation != super::WORKER_PAYLOAD_RESERVATION {
+            return Err(StoreError::InvalidJournal);
+        }
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        write_payload_accounted_at_root(
+            root,
+            verify,
+            Some(reservation),
+            sampled_free_bytes,
+            |file, bytes| {
+                file.write_all(&bytes[..PARTIAL_FIXTURE_BYTES as usize])?;
+                Err(std::io::Error::other("synthetic interrupted payload write"))
+            },
+            File::sync_all,
+            &mut budget,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, reservation, verify);
+        Err(StoreError::UnsupportedPlatform)
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_payload_with(
     store: OwnedStore,
@@ -65,6 +136,30 @@ fn write_payload_with(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_payload_accounted(
     store: OwnedStore,
+    sample_free: impl FnMut(&File) -> Result<u64, StoreError>,
+    write_bytes: impl FnMut(&mut File, &[u8]) -> std::io::Result<()>,
+    sync_file: impl FnOnce(&File) -> std::io::Result<()>,
+    budget: &mut BudgetController,
+) -> Result<PayloadReport, StoreError> {
+    if store.phase != Phase::Created || store.poisoned || store.cleanup_started {
+        return Err(StoreError::InvalidJournal);
+    }
+    write_payload_accounted_at_root(
+        &store.root,
+        |payload_expected, payload_id| validate_store(&store, payload_expected, payload_id),
+        None,
+        sample_free,
+        write_bytes,
+        sync_file,
+        budget,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_payload_accounted_at_root(
+    root: &File,
+    mut verify: impl FnMut(bool, Option<(u64, u64)>) -> Result<(), StoreError>,
+    store_cap: Option<u64>,
     mut sample_free: impl FnMut(&File) -> Result<u64, StoreError>,
     mut write_bytes: impl FnMut(&mut File, &[u8]) -> std::io::Result<()>,
     sync_file: impl FnOnce(&File) -> std::io::Result<()>,
@@ -72,11 +167,8 @@ fn write_payload_accounted(
 ) -> Result<PayloadReport, StoreError> {
     use rustix::fs::{openat, OFlags};
 
-    if store.phase != Phase::Created || store.poisoned || store.cleanup_started {
-        return Err(StoreError::InvalidJournal);
-    }
-    validate_store(&store, false, None)?;
-    let free_before = sample_free(&store.root)?;
+    verify(false, None)?;
+    let free_before = sample_free(root)?;
     let job = budget
         .start(free_before)
         .map_err(|_| StoreError::InvalidJournal)?;
@@ -84,8 +176,9 @@ fn write_payload_accounted(
         budget
             .check_store_admission(job, LIMIT, free_before)
             .map_err(|_| StoreError::InvalidJournal)?;
+        ensure_payload_cap(store_cap, 0, LIMIT)?;
         let fd = openat(
-            &store.root,
+            root,
             NAME,
             OFlags::RDWR
                 | OFlags::CREATE
@@ -99,7 +192,7 @@ fn write_payload_accounted(
         let metadata = payload.metadata()?;
         validate_payload_metadata(&metadata, None, 0)?;
         let payload_id = identity(&payload)?;
-        validate_store(&store, true, Some(payload_id))?;
+        verify(true, Some(payload_id))?;
         let mut accounted_high_water = 0;
         account_payload_observation(
             job,
@@ -110,8 +203,8 @@ fn write_payload_accounted(
         )?;
 
         let (written, cap_reached) = write_chunks(&mut payload, |file, offset, next| {
-            validate_store(&store, true, Some(payload_id))?;
-            let free_before = sample_free(&store.root)?;
+            verify(true, Some(payload_id))?;
+            let free_before = sample_free(root)?;
             account_payload_observation(
                 job,
                 budget,
@@ -119,11 +212,12 @@ fn write_payload_accounted(
                 free_before,
                 &mut accounted_high_water,
             )?;
+            ensure_payload_cap(store_cap, accounted_high_water, next as u64)?;
             budget
                 .check_store_admission(job, next as u64, free_before)
                 .map_err(|_| StoreError::InvalidJournal)?;
-            validate_store(&store, true, Some(payload_id))?;
-            validate_named_payload(&store, file, payload_id, offset)?;
+            verify(true, Some(payload_id))?;
+            validate_named_payload_at_root(root, file, payload_id, offset)?;
             let mut chunk = [0u8; CHUNK];
             for (index, byte) in chunk[..next].iter_mut().enumerate() {
                 *byte = (((offset as usize + index) * 31 + 17) % 251 + 1) as u8;
@@ -133,7 +227,7 @@ fn write_payload_accounted(
             // left only part of this chunk. Never release a prior allocation
             // charge if the filesystem later reports fewer blocks.
             let actual_high_water = payload_high_water(file)?;
-            let free_after = sample_free(&store.root);
+            let free_after = sample_free(root);
             let charge_result = account_payload_observation(
                 job,
                 budget,
@@ -141,16 +235,18 @@ fn write_payload_accounted(
                 free_after.as_ref().copied().unwrap_or(0),
                 &mut accounted_high_water,
             );
+            let cap_result = ensure_observed_payload_cap(store_cap, accounted_high_water);
             write_result?;
             free_after?;
             charge_result?;
-            validate_store(&store, true, Some(payload_id))?;
-            validate_named_payload(&store, file, payload_id, offset + next as u64)?;
+            cap_result?;
+            verify(true, Some(payload_id))?;
+            validate_named_payload_at_root(root, file, payload_id, offset + next as u64)?;
             Ok(())
         })?;
         let sync_result = sync_payload(&payload, sync_file);
         let sync_high_water = payload_high_water(&payload);
-        let free_after_sync = sample_free(&store.root);
+        let free_after_sync = sample_free(root);
         let sync_charge = match sync_high_water {
             Ok(high_water) => account_payload_observation(
                 job,
@@ -161,12 +257,14 @@ fn write_payload_accounted(
             ),
             Err(error) => Err(error),
         };
+        let sync_cap = ensure_observed_payload_cap(store_cap, accounted_high_water);
         sync_result?;
         free_after_sync?;
         sync_charge?;
-        store.root.sync_all()?;
-        validate_store(&store, true, Some(payload_id))?;
-        validate_named_payload(&store, &payload, payload_id, written)?;
+        sync_cap?;
+        root.sync_all()?;
+        verify(true, Some(payload_id))?;
+        validate_named_payload_at_root(root, &payload, payload_id, written)?;
         Ok(PayloadReport {
             written_bytes: written,
             limit_bytes: LIMIT,
@@ -222,12 +320,14 @@ fn sync_payload(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn payload_high_water(file: &File) -> Result<u64, StoreError> {
+pub(super) fn payload_high_water(file: &File) -> Result<u64, StoreError> {
     payload_high_water_from_metadata(&file.metadata()?)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn payload_high_water_from_metadata(metadata: &std::fs::Metadata) -> Result<u64, StoreError> {
+pub(super) fn payload_high_water_from_metadata(
+    metadata: &std::fs::Metadata,
+) -> Result<u64, StoreError> {
     use std::os::unix::fs::MetadataExt;
     payload_high_water_bytes(metadata.len(), metadata.blocks())
 }
@@ -256,6 +356,32 @@ fn account_payload_observation(
     budget
         .record_store(job, growth, free_bytes)
         .map_err(|_| StoreError::InvalidJournal)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_payload_cap(
+    cap: Option<u64>,
+    current_high_water: u64,
+    next_bytes: u64,
+) -> Result<(), StoreError> {
+    if cap.is_some_and(|cap| {
+        current_high_water
+            .checked_add(next_bytes)
+            .is_none_or(|next| next > cap)
+    }) {
+        Err(StoreError::InvalidJournal)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_observed_payload_cap(cap: Option<u64>, observed: u64) -> Result<(), StoreError> {
+    if cap.is_some_and(|cap| observed > cap) {
+        Err(StoreError::InvalidJournal)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -329,8 +455,8 @@ fn validate_named_identity(root: &impl AsFd, expected: (u64, u64)) -> Result<Fil
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn validate_named_payload(
-    store: &OwnedStore,
+pub(super) fn validate_named_payload_at_root(
+    root: &File,
     payload: &File,
     payload_id: (u64, u64),
     expected_size: u64,
@@ -340,7 +466,7 @@ fn validate_named_payload(
     if identity(payload)? != payload_id {
         return Err(StoreError::InvalidIdentity);
     }
-    let named = validate_named_identity(&store.root, payload_id)?;
+    let named = validate_named_identity(root, payload_id)?;
     if named.metadata()?.len() != expected_size {
         return Err(StoreError::InvalidIdentity);
     }
@@ -348,7 +474,7 @@ fn validate_named_payload(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn validate_payload_metadata(
+pub(super) fn validate_payload_metadata(
     metadata: &std::fs::Metadata,
     expected: Option<(u64, u64)>,
     expected_size: u64,
@@ -368,7 +494,7 @@ fn validate_payload_metadata(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn sampled_free_bytes(root: &impl AsFd) -> Result<u64, StoreError> {
+pub(super) fn sampled_free_bytes(root: &impl AsFd) -> Result<u64, StoreError> {
     use rustix::fs::fstatvfs;
     let stat = fstatvfs(root)?;
     free_bytes(stat.f_bavail, stat.f_frsize)
@@ -476,6 +602,107 @@ mod tests {
         );
         assert!(budget.confirm_cleanup(JobId(1)).is_err());
         assert_eq!(budget.aggregate_stored().unwrap(), actual_high_water);
+    }
+
+    #[test]
+    fn reservation_precheck_refuses_before_creation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = OwnedStore::create().unwrap();
+        let root = store.root.try_clone().unwrap();
+        let writes = AtomicUsize::new(0);
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        let result = write_payload_accounted_at_root(
+            &root,
+            |payload_expected, payload_id| validate_store(&store, payload_expected, payload_id),
+            Some(LIMIT - 1),
+            |_| Ok(u64::MAX),
+            |_, _| {
+                writes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            File::sync_all,
+            &mut budget,
+        );
+        assert!(result.is_err());
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
+        require_entries(&root, &["owner.journal"]).unwrap();
+    }
+
+    #[test]
+    fn late_over_cap_observation_is_charged_and_blocks_another_chunk() {
+        use verification_budget::{JobId, JobState};
+        let store = OwnedStore::create().unwrap();
+        let root = store.root.try_clone().unwrap();
+        let mut write_calls = 0;
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        let result = write_payload_accounted_at_root(
+            &root,
+            |payload_expected, payload_id| validate_store(&store, payload_expected, payload_id),
+            Some(super::super::WORKER_PAYLOAD_RESERVATION),
+            |_| Ok(u64::MAX),
+            |file, bytes| {
+                write_calls += 1;
+                file.write_all(bytes)?;
+                file.set_len(super::super::WORKER_PAYLOAD_RESERVATION + 1)
+            },
+            File::sync_all,
+            &mut budget,
+        );
+        assert!(result.is_err());
+        assert_eq!(write_calls, 1);
+        assert_eq!(
+            payload_length(&root),
+            super::super::WORKER_PAYLOAD_RESERVATION + 1
+        );
+        let job = budget.snapshot(JobId(1)).unwrap();
+        assert!(job.usage.stored_bytes > super::super::WORKER_PAYLOAD_RESERVATION);
+        assert_eq!(
+            job.state,
+            JobState::Failed {
+                reason: BlockReason::StoreIncomplete,
+                worker_stopped: false
+            }
+        );
+    }
+
+    #[test]
+    fn post_sync_over_cap_growth_is_charged_and_fails_the_job() {
+        use verification_budget::{JobId, JobState};
+        let store = OwnedStore::create().unwrap();
+        let root = store.root.try_clone().unwrap();
+        let mut budget = BudgetController::new(Limits {
+            headroom_bytes: RESERVE_HEADROOM,
+        });
+        let result = write_payload_accounted_at_root(
+            &root,
+            |payload_expected, payload_id| validate_store(&store, payload_expected, payload_id),
+            Some(super::super::WORKER_PAYLOAD_RESERVATION),
+            |_| Ok(u64::MAX),
+            |file, bytes| file.write_all(bytes),
+            |file| {
+                file.set_len(super::super::WORKER_PAYLOAD_RESERVATION + 1)?;
+                file.sync_all()
+            },
+            &mut budget,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            payload_length(&root),
+            super::super::WORKER_PAYLOAD_RESERVATION + 1
+        );
+        let job = budget.snapshot(JobId(1)).unwrap();
+        assert!(job.usage.stored_bytes > super::super::WORKER_PAYLOAD_RESERVATION);
+        assert_eq!(
+            job.state,
+            JobState::Failed {
+                reason: BlockReason::StoreIncomplete,
+                worker_stopped: false
+            }
+        );
     }
 
     #[test]
