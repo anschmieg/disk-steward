@@ -17,12 +17,13 @@ use disk_steward_fixture_lifecycle::{
     FixtureLifecycle, FixtureProfile, FixtureSnapshot, FixtureStatus, LifecycleError,
     SessionSnapshot,
 };
-use disk_steward_review_plan::{PlanView, ReviewPlanStore};
+use disk_steward_review_plan::{Category, PlanView, ReviewPlanProfile, ReviewPlanStore};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const APP_ID: i64 = 0x4453_4445; // DSDE
+const PYTEST_APP_ID: i64 = 0x4453_5045; // DSPE
 const SCHEMA_VERSION: i64 = 1;
 const EXEC_DB: &str = "demo-execution-v1.sqlite3";
 const PLAN_DB: &str = "review-example-v1.sqlite3";
@@ -36,6 +37,11 @@ const CLOCK_SCHEMA: &str = "CREATE TABLE clock_guard(singleton INTEGER PRIMARY K
 const REVIEWS_SCHEMA: &str = "CREATE TABLE prepared_reviews(review_id TEXT PRIMARY KEY,manifest_json TEXT NOT NULL,manifest_sha256 TEXT NOT NULL,expires_at_ms INTEGER NOT NULL,claimed INTEGER NOT NULL CHECK(claimed IN (0,1))) STRICT";
 const EXEC_SCHEMA: &str = "CREATE TABLE executions(execution_id TEXT PRIMARY KEY,review_id TEXT NOT NULL UNIQUE,approval_id TEXT NOT NULL,operation TEXT NOT NULL CHECK(operation IN ('stage','restore')),state TEXT NOT NULL CHECK(state IN ('started','finished','partial','uncertain')),batch_json TEXT NOT NULL,started_at_ms INTEGER NOT NULL,finished_at_ms INTEGER) STRICT";
 const ATTEMPTS_SCHEMA: &str = "CREATE TABLE child_attempts(attempt_id TEXT PRIMARY KEY,execution_id TEXT NOT NULL,action_id TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','staged','restored','collision','uncertain')),receipt_id TEXT) STRICT";
+const PYTEST_EXEC_DB: &str = "demo-execution-pytest-920-v1.sqlite3";
+const PYTEST_PLAN_DB: &str = "review-pytest-920-v1.sqlite3";
+const PYTEST_LEDGER_DB: &str = "approval-ledger-pytest-920-v1.sqlite3";
+const PYTEST_ADAPTER_VERSION: &str = "fixture-lifecycle-pytest-920-v1";
+const PYTEST_REVIEW_CONTRACT: &str = "disk-steward-pytest-corpus-review-v1";
 
 #[cfg(test)]
 thread_local! {
@@ -231,6 +237,7 @@ struct FileManifest {
 }
 
 pub struct DemoExecutionService {
+    profile: DemoProfile,
     root: PathBuf,
     lease: Option<std::fs::File>,
     poisoned: bool,
@@ -242,6 +249,98 @@ pub struct DemoExecutionService {
     now: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoProfile {
+    SyntheticV1,
+    Pytest920V1,
+}
+
+fn lifecycle_profile(profile: DemoProfile) -> FixtureProfile {
+    match profile {
+        DemoProfile::SyntheticV1 => FixtureProfile::SyntheticV1,
+        DemoProfile::Pytest920V1 => FixtureProfile::Pytest920V1,
+    }
+}
+fn expected_plan_profile(profile: DemoProfile) -> ReviewPlanProfile {
+    match profile {
+        DemoProfile::SyntheticV1 => ReviewPlanProfile::SyntheticV1,
+        DemoProfile::Pytest920V1 => ReviewPlanProfile::Pytest920V1,
+    }
+}
+fn ensure_plan_profile(profile: DemoProfile, actual: ReviewPlanProfile) -> DemoResult<()> {
+    if actual == expected_plan_profile(profile) {
+        Ok(())
+    } else {
+        Err(DemoError::NeedsInspection)
+    }
+}
+fn expected_fixture_count(profile: DemoProfile) -> usize {
+    expected_plan_registry(profile).len()
+}
+fn expected_plan_registry(profile: DemoProfile) -> &'static [(&'static str, Category, u64)] {
+    match profile {
+        DemoProfile::SyntheticV1 => &[
+            ("Compiler output", Category::Build, 3_145_728),
+            ("Test cache", Category::Cache, 1_048_576),
+            ("Preview cache", Category::Cache, 524_288),
+            ("Package index", Category::Cache, 262_144),
+            ("Incremental output", Category::Build, 131_072),
+        ],
+        DemoProfile::Pytest920V1 => &[
+            ("pytest nodeids corpus", Category::Cache, 70),
+            ("pytest lastfailed corpus", Category::Cache, 42),
+        ],
+    }
+}
+fn plan_matches_profile(plan: &PlanView, profile: DemoProfile) -> bool {
+    let expected = expected_plan_registry(profile);
+    plan.kind == expected_plan_kind(profile)
+        && plan.actions.len() == expected.len()
+        && plan
+            .actions
+            .iter()
+            .zip(expected.iter())
+            .all(|(action, (label, category, bytes))| {
+                action.label == *label && action.category == *category && action.bytes == *bytes
+            })
+}
+fn expected_plan_kind(profile: DemoProfile) -> &'static str {
+    match profile {
+        DemoProfile::SyntheticV1 => "non_executable_example",
+        DemoProfile::Pytest920V1 => "non_executable_pytest_corpus",
+    }
+}
+fn demo_review_kind(profile: DemoProfile) -> &'static str {
+    match profile {
+        DemoProfile::SyntheticV1 => "disposable_file_review",
+        DemoProfile::Pytest920V1 => "disposable_pytest_corpus_review",
+    }
+}
+fn demo_status_kind(profile: DemoProfile) -> &'static str {
+    match profile {
+        DemoProfile::SyntheticV1 => "disposable_file_demo",
+        DemoProfile::Pytest920V1 => "disposable_pytest_corpus_demo",
+    }
+}
+fn purge_review_kind(profile: DemoProfile) -> &'static str {
+    match profile {
+        DemoProfile::SyntheticV1 => "disposable_fixture_purge_review",
+        DemoProfile::Pytest920V1 => "pytest_corpus_purge_review",
+    }
+}
+fn review_contract(profile: DemoProfile) -> &'static str {
+    match profile {
+        DemoProfile::SyntheticV1 => "disk-steward-disposable-file-review-v1",
+        DemoProfile::Pytest920V1 => PYTEST_REVIEW_CONTRACT,
+    }
+}
+fn profile_adapter_version(profile: DemoProfile) -> &'static str {
+    match profile {
+        DemoProfile::SyntheticV1 => ADAPTER_VERSION,
+        DemoProfile::Pytest920V1 => PYTEST_ADAPTER_VERSION,
+    }
+}
+
 impl DemoExecutionService {
     pub fn open(app_owned_root: &Path) -> DemoResult<Self> {
         Self::open_with_clock(app_owned_root, wall_now_ms)
@@ -251,27 +350,71 @@ impl DemoExecutionService {
         app_owned_root: &Path,
         now: impl Fn() -> i64 + Send + Sync + Clone + 'static,
     ) -> DemoResult<Self> {
+        Self::open_profile_with_clock(app_owned_root, DemoProfile::SyntheticV1, now)
+    }
+
+    /// Open the closed app-owned pytest 9.2.0 reference-corpus coordinator.
+    /// Its stores are separate from the synthetic coordinator's stores.
+    pub fn open_pytest_corpus(app_owned_root: &Path) -> DemoResult<Self> {
+        Self::open_pytest_corpus_with_clock(app_owned_root, wall_now_ms)
+    }
+
+    fn open_pytest_corpus_with_clock(
+        app_owned_root: &Path,
+        now: impl Fn() -> i64 + Send + Sync + Clone + 'static,
+    ) -> DemoResult<Self> {
+        Self::open_profile_with_clock(app_owned_root, DemoProfile::Pytest920V1, now)
+    }
+
+    fn open_profile_with_clock(
+        app_owned_root: &Path,
+        profile: DemoProfile,
+        now: impl Fn() -> i64 + Send + Sync + Clone + 'static,
+    ) -> DemoResult<Self> {
         let root = fs::canonicalize(app_owned_root).map_err(|_| DemoError::Storage)?;
         if !root.is_dir() {
             return Err(DemoError::Storage);
         }
         let lease = acquire_lease(&root)?;
-        let control = open_db(&root.join(EXEC_DB)).map_err(map_sql)?;
-        initialize_control(&control).map_err(map_sql)?;
-        let plan =
-            ReviewPlanStore::open(root.join(PLAN_DB)).map_err(|_| DemoError::PlanUnavailable)?;
+        let (exec_db, plan_db, ledger_db, app_id) = match profile {
+            DemoProfile::SyntheticV1 => (EXEC_DB, PLAN_DB, LEDGER_DB, APP_ID),
+            DemoProfile::Pytest920V1 => (
+                PYTEST_EXEC_DB,
+                PYTEST_PLAN_DB,
+                PYTEST_LEDGER_DB,
+                PYTEST_APP_ID,
+            ),
+        };
+        let control = open_db(&root.join(exec_db)).map_err(map_sql)?;
+        initialize_control(&control, app_id).map_err(map_sql)?;
+        let plan = match profile {
+            DemoProfile::SyntheticV1 => ReviewPlanStore::open(root.join(plan_db)),
+            DemoProfile::Pytest920V1 => ReviewPlanStore::open_pytest_corpus(root.join(plan_db)),
+        }
+        .map_err(|_| DemoError::PlanUnavailable)?;
         let ledger =
-            ApprovalLedger::open(root.join(LEDGER_DB)).map_err(|_| DemoError::LedgerUnavailable)?;
+            ApprovalLedger::open(root.join(ledger_db)).map_err(|_| DemoError::LedgerUnavailable)?;
         // The purge control store lives in the same app-owned root and is
         // opened by this lease-owning coordinator (contract: never a second
         // independently leased service). Its recovery pass runs here.
         let now_for_purge = now.clone();
-        let purge = disk_steward_fixture_purge::FixturePurgeService::open_with_clock(
-            &root,
-            Box::new(now_for_purge),
-        )
+        let purge = match profile {
+            DemoProfile::SyntheticV1 => {
+                disk_steward_fixture_purge::FixturePurgeService::open_with_clock(
+                    &root,
+                    Box::new(now_for_purge),
+                )
+            }
+            DemoProfile::Pytest920V1 => {
+                disk_steward_fixture_purge::FixturePurgeService::open_pytest_corpus_with_clock(
+                    &root,
+                    Box::new(now_for_purge),
+                )
+            }
+        }
         .map_err(map_purge)?;
         let mut service = Self {
+            profile,
             root,
             lease: Some(lease),
             poisoned: false,
@@ -287,6 +430,7 @@ impl DemoExecutionService {
     }
 
     pub fn status(&mut self) -> DemoResult<DemoStatus> {
+        self.ensure_control_identity()?;
         let state: String = self
             .control
             .query_row(
@@ -339,7 +483,7 @@ impl DemoExecutionService {
         }
         Ok(DemoStatus {
             schema_version: 1,
-            kind: "disposable_file_demo".into(),
+            kind: demo_status_kind(self.profile).into(),
             state: effective_state,
             session_id,
             fixtures,
@@ -367,13 +511,10 @@ impl DemoExecutionService {
             .plan
             .get_plan()
             .map_err(|_| DemoError::PlanUnavailable)?;
-        let actions: [ActionId; 5] = plan
-            .actions
-            .iter()
-            .map(|a| a.id)
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|_| DemoError::PlanUnavailable)?;
+        ensure_plan_profile(self.profile, self.plan.profile())?;
+        if !plan_matches_profile(&plan, self.profile) {
+            return Err(DemoError::NeedsInspection);
+        }
         let session_id = SessionId::new();
         let wire = serde_json::to_string(&session_id).map_err(|_| DemoError::CorruptData)?;
         let tx = self.control.unchecked_transaction().map_err(map_sql)?;
@@ -382,8 +523,30 @@ impl DemoExecutionService {
             return Err(DemoError::NeedsInspection);
         }
         tx.commit().map_err(map_sql)?;
-        let (lifecycle, _) = FixtureLifecycle::create_for_session(&self.root, session_id, actions)
-            .map_err(|_| DemoError::NeedsInspection)?;
+        let lifecycle = match self.profile {
+            DemoProfile::SyntheticV1 => {
+                let actions: [ActionId; 5] = plan
+                    .actions
+                    .iter()
+                    .map(|a| a.id)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .map_err(|_| DemoError::PlanUnavailable)?;
+                FixtureLifecycle::create_for_session(&self.root, session_id, actions)
+            }
+            DemoProfile::Pytest920V1 => {
+                let actions: [ActionId; 2] = plan
+                    .actions
+                    .iter()
+                    .map(|a| a.id)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .map_err(|_| DemoError::PlanUnavailable)?;
+                FixtureLifecycle::create_pytest_corpus_for_session(&self.root, session_id, actions)
+            }
+        }
+        .map_err(|_| DemoError::NeedsInspection)?;
+        let (lifecycle, _) = lifecycle;
         self.control.execute("UPDATE control SET creation_state='ready' WHERE singleton=1 AND session_id=?1 AND creation_state='started'", [&wire]).map_err(map_sql)?;
         self.lifecycle = Some(lifecycle);
         self.status()
@@ -433,7 +596,7 @@ impl DemoExecutionService {
             .plan
             .get_plan()
             .map_err(|_| DemoError::PlanUnavailable)?;
-        let snapshot = make_core_snapshot(&manifest, &prepared, &current_plan)?;
+        let snapshot = make_core_snapshot(&manifest, &prepared, &current_plan, self.profile)?;
         let approval = Approval::issue(&snapshot, after as u64, prepared.expires_at_ms as u64)
             .ok_or(DemoError::InvalidReview)?;
         approval
@@ -540,6 +703,7 @@ impl DemoExecutionService {
             return Err(DemoError::NeedsInspection);
         }
         self.ready_session()?;
+        ensure_plan_profile(self.profile, self.plan.profile())?;
         let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
         self.purge
             .prepare_purge_review(lifecycle, &self.plan, expected_revision, targets)
@@ -561,10 +725,15 @@ impl DemoExecutionService {
         if self.uncertainty_across_stores()? {
             return Err(DemoError::NeedsInspection);
         }
+        self.ready_session()?;
+        ensure_plan_profile(self.profile, self.plan.profile())?;
         let prepared = self
             .purge
             .read_stored_review(&review_id)
             .map_err(map_purge)?;
+        if prepared.kind != purge_review_kind(self.profile) {
+            return Err(DemoError::InvalidReview);
+        }
         let now = self.checked_now()?;
         if now >= prepared.expires_at_ms {
             return Err(DemoError::ReviewExpired);
@@ -581,6 +750,9 @@ impl DemoExecutionService {
         let after = self.checked_now()?;
         if after >= prepared.expires_at_ms {
             return Err(DemoError::ReviewExpired);
+        }
+        if self.ready_session()? != prepared.session_id {
+            return Err(DemoError::InvalidReview);
         }
         {
             let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
@@ -610,7 +782,8 @@ impl DemoExecutionService {
             let lifecycle = self.lifecycle.as_mut().ok_or(DemoError::NeedsInspection)?;
             lifecycle.snapshot().map_err(map_lifecycle)?
         };
-        let snapshot = make_purge_core_snapshot(&prepared, &current_plan, &session_snapshot)?;
+        let snapshot =
+            make_purge_core_snapshot(&prepared, &current_plan, &session_snapshot, self.profile)?;
         let approval = Approval::issue(&snapshot, after as u64, prepared.expires_at_ms as u64)
             .ok_or(DemoError::InvalidReview)?;
         approval
@@ -736,6 +909,10 @@ impl DemoExecutionService {
             .plan
             .get_plan()
             .map_err(|_| DemoError::PlanUnavailable)?;
+        ensure_plan_profile(self.profile, self.plan.profile())?;
+        if !plan_matches_profile(&plan, self.profile) {
+            return Err(DemoError::NeedsInspection);
+        }
         if plan.revision_id != expected {
             return Err(DemoError::StaleRevision);
         }
@@ -744,10 +921,17 @@ impl DemoExecutionService {
             disk_steward_review_plan::StoreError::NothingSelected => DemoError::NothingSelected,
             _ => DemoError::PlanUnavailable,
         })?;
-        if frozen.kind != "non_executable_example" || frozen.execution_available {
+        if frozen.kind != expected_plan_kind(self.profile) || frozen.execution_available {
             return Err(DemoError::InvalidReview);
         }
         let snapshot = self.snapshot()?;
+        if self
+            .lifecycle
+            .as_ref()
+            .is_none_or(|lifecycle| lifecycle.profile() != lifecycle_profile(self.profile))
+        {
+            return Err(DemoError::NeedsInspection);
+        }
         let selected: Vec<&FixtureSnapshot> = if operation == "stage" {
             snapshot
                 .fixtures
@@ -809,9 +993,9 @@ impl DemoExecutionService {
         let review_id = ReviewId::new();
         let frozen_hash = frozen.manifest_sha256.clone();
         let manifest = FileManifest {
-            contract: "disk-steward-disposable-file-review-v1".into(),
+            contract: review_contract(self.profile).into(),
             manifest_version: MANIFEST_VERSION,
-            adapter_version: ADAPTER_VERSION.into(),
+            adapter_version: profile_adapter_version(self.profile).into(),
             session_id: session,
             scope_id: ScopeId::new(),
             plan_id: plan.plan_id,
@@ -829,7 +1013,7 @@ impl DemoExecutionService {
         let digest = hash_json(&manifest)?;
         let prepared = PreparedDemoReview {
             schema_version: 1,
-            kind: "disposable_file_review".into(),
+            kind: demo_review_kind(self.profile).into(),
             review_id,
             plan_id: plan.plan_id,
             revision_id: expected,
@@ -869,6 +1053,10 @@ impl DemoExecutionService {
             .plan
             .get_plan()
             .map_err(|_| DemoError::PlanUnavailable)?;
+        ensure_plan_profile(self.profile, self.plan.profile())?;
+        if !plan_matches_profile(&plan, self.profile) {
+            return Err(DemoError::NeedsInspection);
+        }
         let items = manifest
             .selected
             .iter()
@@ -895,7 +1083,7 @@ impl DemoExecutionService {
         })?;
         let prepared = PreparedDemoReview {
             schema_version: 1,
-            kind: "disposable_file_review".into(),
+            kind: demo_review_kind(self.profile).into(),
             review_id: id,
             plan_id: manifest.plan_id,
             revision_id: manifest.revision_id,
@@ -916,7 +1104,7 @@ impl DemoExecutionService {
         digest: &str,
         now: i64,
     ) -> DemoResult<()> {
-        if prepared.kind != "disposable_file_review"
+        if prepared.kind != demo_review_kind(self.profile)
             || prepared.schema_version != 1
             || prepared.manifest_sha256 != digest
             || hash_json(manifest)? != digest
@@ -931,6 +1119,7 @@ impl DemoExecutionService {
             .plan
             .get_plan()
             .map_err(|_| DemoError::PlanUnavailable)?;
+        ensure_plan_profile(self.profile, self.plan.profile())?;
         if plan.revision_id != prepared.revision_id || plan.plan_id != prepared.plan_id {
             return Err(DemoError::StaleRevision);
         }
@@ -938,14 +1127,14 @@ impl DemoExecutionService {
             .plan
             .freeze_review(plan.revision_id)
             .map_err(|_| DemoError::PlanUnavailable)?;
-        if frozen.kind != "non_executable_example"
+        if frozen.kind != expected_plan_kind(self.profile)
             || frozen.execution_available
             || frozen.review_id != manifest.frozen_review_id
             || frozen.manifest_sha256 != manifest.frozen_review_sha256
         {
             return Err(DemoError::StaleRevision);
         }
-        validate_file_manifest(manifest, prepared, &plan, &frozen)?;
+        validate_file_manifest(manifest, prepared, &plan, &frozen, self.profile)?;
         if self.ready_session()? != manifest.session_id
             || manifest.operation != prepared.operation
             || prepared.expires_at_ms <= now
@@ -1189,8 +1378,26 @@ impl DemoExecutionService {
         if self.poisoned || self.lease.is_none() {
             Err(DemoError::NeedsInspection)
         } else {
-            Ok(())
+            self.ensure_control_identity()
         }
+    }
+    fn ensure_control_identity(&self) -> DemoResult<()> {
+        let expected = match self.profile {
+            DemoProfile::SyntheticV1 => APP_ID,
+            DemoProfile::Pytest920V1 => PYTEST_APP_ID,
+        };
+        let application_id: i64 = self
+            .control
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .map_err(|_| DemoError::NeedsInspection)?;
+        let schema_version: i64 = self
+            .control
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|_| DemoError::NeedsInspection)?;
+        if application_id != expected || schema_version != SCHEMA_VERSION {
+            return Err(DemoError::NeedsInspection);
+        }
+        Ok(())
     }
     fn snapshot(&mut self) -> DemoResult<SessionSnapshot> {
         self.lifecycle
@@ -1200,6 +1407,8 @@ impl DemoExecutionService {
             .map_err(map_lifecycle)
     }
     fn ready_session(&mut self) -> DemoResult<SessionId> {
+        self.ensure_control_identity()?;
+        ensure_plan_profile(self.profile, self.plan.profile())?;
         let (state, sid): (String, Option<String>) = self
             .control
             .query_row(
@@ -1215,6 +1424,15 @@ impl DemoExecutionService {
                 DemoError::NeedsInspection
             });
         }
+        let stored_session: SessionId = serde_json::from_str(&sid.ok_or(DemoError::CorruptData)?)
+            .map_err(|_| DemoError::CorruptData)?;
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.session_id() != stored_session)
+        {
+            return Err(DemoError::NeedsInspection);
+        }
         if self.lifecycle.is_none() {
             // Contract fixture-runtime-schema-v2: the owner lease must be held
             // for the complete reopen, since reopen may perform the v1->v2
@@ -1222,24 +1440,29 @@ impl DemoExecutionService {
             // refuse instead of migrating leaseless. (With the lifecycle
             // handle still held, status() stays usable after a poison.)
             self.ensure_active()?;
-            let id: SessionId = serde_json::from_str(&sid.ok_or(DemoError::CorruptData)?)
-                .map_err(|_| DemoError::CorruptData)?;
-            let (lifecycle, _) = FixtureLifecycle::reopen(&self.root, id).map_err(map_lifecycle)?;
+            let id = stored_session;
+            let (lifecycle, _) = match self.profile {
+                DemoProfile::SyntheticV1 => FixtureLifecycle::reopen(&self.root, id),
+                DemoProfile::Pytest920V1 => FixtureLifecycle::reopen_pytest_corpus(&self.root, id),
+            }
+            .map_err(map_lifecycle)?;
             self.lifecycle = Some(lifecycle);
         }
         if self
             .lifecycle
             .as_ref()
-            .is_some_and(|lifecycle| lifecycle.profile() != FixtureProfile::SyntheticV1)
+            .is_some_and(|lifecycle| lifecycle.profile() != lifecycle_profile(self.profile))
         {
             return Err(DemoError::NeedsInspection);
         }
+        ensure_plan_profile(self.profile, self.plan.profile())?;
         self.lifecycle
             .as_ref()
             .map(FixtureLifecycle::session_id)
             .ok_or(DemoError::NeedsInspection)
     }
     fn checked_now(&mut self) -> DemoResult<i64> {
+        self.ensure_control_identity()?;
         let now = (self.now)();
         let tx = self
             .control
@@ -1333,7 +1556,7 @@ impl DemoExecutionService {
             || binding.review_id != review_id
             || binding.approval_id != approval_id
             || binding.attempts.is_empty()
-            || binding.attempts.len() > 5
+            || binding.attempts.len() > expected_fixture_count(self.profile)
             || !is_lower_sha256(&binding.digest)
         {
             return Err(DemoError::CorruptData);
@@ -1477,7 +1700,11 @@ fn make_purge_core_snapshot(
     prepared: &disk_steward_fixture_purge::PreparedPurgeReview,
     plan: &PlanView,
     snapshot: &SessionSnapshot,
+    profile: DemoProfile,
 ) -> DemoResult<PlanSnapshot> {
+    if prepared.kind != purge_review_kind(profile) || !plan_matches_profile(plan, profile) {
+        return Err(DemoError::InvalidReview);
+    }
     let scope = ScopeId::new();
     let mut selected = Vec::new();
     for target in &prepared.targets {
@@ -1528,10 +1755,16 @@ fn make_purge_core_snapshot(
         manifest: Digest::from_bytes(manifest_digest),
         preconditions: Digest::from_bytes(preconditions),
         scopes: vec![ScopeSnapshot::new(scope, 1, ScopeAccess::Granted)],
-        adapter_versions: vec![
-            ("fixture-lifecycle".into(), "2".into()),
-            ("fixture-purge".into(), "1".into()),
-        ],
+        adapter_versions: match profile {
+            DemoProfile::SyntheticV1 => vec![
+                ("fixture-lifecycle".into(), "2".into()),
+                ("fixture-purge".into(), "1".into()),
+            ],
+            DemoProfile::Pytest920V1 => vec![
+                ("fixture-lifecycle".into(), PYTEST_ADAPTER_VERSION.into()),
+                ("fixture-purge".into(), "pytest-corpus-purge-v1".into()),
+            ],
+        },
         actions: selected,
     }))
 }
@@ -1540,7 +1773,15 @@ fn make_core_snapshot(
     manifest: &FileManifest,
     prepared: &PreparedDemoReview,
     plan: &PlanView,
+    profile: DemoProfile,
 ) -> DemoResult<PlanSnapshot> {
+    if manifest.contract != review_contract(profile)
+        || manifest.adapter_version != profile_adapter_version(profile)
+        || prepared.kind != demo_review_kind(profile)
+        || !plan_matches_profile(plan, profile)
+    {
+        return Err(DemoError::InvalidReview);
+    }
     let mut selected = Vec::new();
     for item in &prepared.items {
         let fixture = manifest
@@ -1596,7 +1837,10 @@ fn make_core_snapshot(
             1,
             ScopeAccess::Granted,
         )],
-        adapter_versions: vec![("fixture-lifecycle".into(), ADAPTER_VERSION.into())],
+        adapter_versions: vec![(
+            "fixture-lifecycle".into(),
+            profile_adapter_version(profile).into(),
+        )],
         actions: selected,
     }))
 }
@@ -1606,10 +1850,15 @@ fn validate_file_manifest(
     prepared: &PreparedDemoReview,
     plan: &PlanView,
     frozen: &disk_steward_review_plan::FrozenReview,
+    profile: DemoProfile,
 ) -> DemoResult<()> {
-    if manifest.contract != "disk-steward-disposable-file-review-v1"
+    if manifest.contract != review_contract(profile)
         || manifest.manifest_version != MANIFEST_VERSION
-        || manifest.adapter_version != ADAPTER_VERSION
+        || manifest.adapter_version != profile_adapter_version(profile)
+        || prepared.kind != demo_review_kind(profile)
+        || plan.kind != expected_plan_kind(profile)
+        || frozen.kind != expected_plan_kind(profile)
+        || !plan_matches_profile(plan, profile)
         || manifest.session_id != prepared.session_id
         || manifest.plan_id != prepared.plan_id
         || manifest.revision_id != prepared.revision_id
@@ -1617,8 +1866,8 @@ fn validate_file_manifest(
         || manifest.frozen_review_id != frozen.review_id
         || manifest.frozen_review_sha256 != frozen.manifest_sha256
         || manifest.operation != prepared.operation
-        || plan.actions.len() != 5
-        || manifest.fixtures.len() != 5
+        || plan.actions.len() != expected_fixture_count(profile)
+        || manifest.fixtures.len() != expected_fixture_count(profile)
     {
         return Err(DemoError::InvalidReview);
     }
@@ -1745,7 +1994,7 @@ fn manifest_digest_for_core(
 ) -> DemoResult<String> {
     Ok(hex(&sha_bytes(prepared.manifest_sha256.as_bytes())))
 }
-fn initialize_control(c: &Connection) -> rusqlite::Result<()> {
+fn initialize_control(c: &Connection, expected_app_id: i64) -> rusqlite::Result<()> {
     let app: i64 = c.query_row("PRAGMA application_id", [], |r| r.get(0))?;
     let ver: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let count: i64 = c.query_row(
@@ -1760,11 +2009,11 @@ fn initialize_control(c: &Connection) -> rusqlite::Result<()> {
         c.execute("INSERT INTO control VALUES(1,NULL,'none',NULL)", [])?;
         c.execute("INSERT INTO clock_guard VALUES(1,0)", [])?;
         c.execute_batch(&format!(
-            "PRAGMA application_id={APP_ID};PRAGMA user_version={SCHEMA_VERSION};"
+            "PRAGMA application_id={expected_app_id};PRAGMA user_version={SCHEMA_VERSION};"
         ))?;
         return Ok(());
     }
-    if app != APP_ID || ver != SCHEMA_VERSION || count != 5 {
+    if app != expected_app_id || ver != SCHEMA_VERSION || count != 5 {
         return Err(rusqlite::Error::InvalidQuery);
     }
     for (name, sql) in [
@@ -1985,6 +2234,333 @@ mod tests {
         service.start_demo().expect("create disposable fixture");
         let plan = service.plan.get_plan().expect("plan");
         (dir, service, plan)
+    }
+
+    fn pytest_fixture_service() -> (tempfile::TempDir, DemoExecutionService, PlanView) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("owned test root");
+        let mut permissions = fs::metadata(dir.path())
+            .expect("root metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(dir.path(), permissions).expect("root permissions");
+        let mut service =
+            DemoExecutionService::open_pytest_corpus_with_clock(dir.path(), || 1_700_000_000_000)
+                .expect("open pytest corpus coordinator");
+        service.start_demo().expect("create owned pytest corpus");
+        let plan = service.plan.get_plan().expect("pytest plan");
+        (dir, service, plan)
+    }
+
+    fn pytest_fixture_root(dir: &Path) -> PathBuf {
+        fs::read_dir(dir)
+            .expect("fixture parent")
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                name.starts_with(".disk-steward-pytest-fixtures-")
+                    .then(|| dir.join(name))
+            })
+            .expect("pytest profile root")
+    }
+
+    #[test]
+    fn pytest_profile_uses_closed_stores_and_drives_selective_stage_restore_and_purge() {
+        let (dir, mut service, mut plan) = pytest_fixture_service();
+        assert_eq!(service.profile, DemoProfile::Pytest920V1);
+        assert_eq!(service.plan.profile(), ReviewPlanProfile::Pytest920V1);
+        assert_eq!(plan.kind, "non_executable_pytest_corpus");
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(plan.actions[0].label, "pytest nodeids corpus");
+        assert_eq!(plan.actions[0].bytes, 70);
+        assert_eq!(plan.actions[1].label, "pytest lastfailed corpus");
+        assert_eq!(plan.actions[1].bytes, 42);
+        let root = pytest_fixture_root(dir.path());
+        fs::write(
+            root.join("source/valuable-local-notes.txt"),
+            b"preserve this note",
+        )
+        .expect("local note sentinel");
+
+        // A stale revision and an explicit decline both leave the source
+        // corpus available and create no execution claim.
+        plan = service
+            .plan
+            .edit(
+                plan.revision_id,
+                plan.actions[1].id,
+                disk_steward_review_plan::Decision::Include,
+            )
+            .unwrap();
+        let stale = service.prepare_stage(plan.revision_id).unwrap();
+        plan = service
+            .plan
+            .edit(
+                plan.revision_id,
+                plan.actions[0].id,
+                disk_steward_review_plan::Decision::Include,
+            )
+            .unwrap();
+        plan = service
+            .plan
+            .edit(
+                plan.revision_id,
+                plan.actions[0].id,
+                disk_steward_review_plan::Decision::Keep,
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .confirm_and_execute(stale.review_id, |_| true)
+                .unwrap_err(),
+            DemoError::StaleRevision
+        );
+        let declined = service.prepare_stage(plan.revision_id).unwrap();
+        assert_eq!(
+            service
+                .confirm_and_execute(declined.review_id, |_| false)
+                .unwrap_err(),
+            DemoError::ConfirmationCancelled
+        );
+        assert!(service
+            .status()
+            .unwrap()
+            .fixtures
+            .iter()
+            .all(|fixture| fixture.status == FixtureStatus::Available));
+
+        // Stage the selected non-prefix record, then verify a single-use
+        // approval and reopen before a receipt-addressed restore.
+        let stage = service.prepare_stage(plan.revision_id).unwrap();
+        assert_eq!(stage.items.len(), 1);
+        assert_eq!(stage.items[0].action_id, plan.actions[1].id);
+        assert_eq!(stage.kind, "disposable_pytest_corpus_review");
+        let staged = service
+            .confirm_and_execute(stage.review_id, |_| true)
+            .unwrap();
+        assert_eq!(staged.state, "finished");
+        assert_eq!(
+            service
+                .confirm_and_execute(stage.review_id, |_| true)
+                .unwrap_err(),
+            DemoError::ReviewReused
+        );
+        drop(service);
+
+        let mut reopened =
+            DemoExecutionService::open_pytest_corpus_with_clock(dir.path(), || 1_700_000_000_000)
+                .expect("reopen pytest coordinator");
+        let status = reopened.status().unwrap();
+        let receipt = status
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.action_id == plan.actions[1].id)
+            .unwrap()
+            .receipt_id
+            .unwrap();
+        let current_plan = reopened.plan.get_plan().unwrap();
+        let restore = reopened
+            .prepare_restore(current_plan.revision_id, receipt)
+            .unwrap();
+        assert_eq!(restore.items.len(), 1);
+        assert_eq!(restore.items[0].action_id, plan.actions[1].id);
+        assert_eq!(
+            reopened
+                .confirm_and_execute(restore.review_id, |_| true)
+                .unwrap()
+                .state,
+            "finished"
+        );
+        assert_eq!(
+            reopened
+                .status()
+                .unwrap()
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.action_id == plan.actions[0].id)
+                .unwrap()
+                .status,
+            FixtureStatus::Available
+        );
+        assert_eq!(
+            reopened
+                .status()
+                .unwrap()
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.action_id == plan.actions[1].id)
+                .unwrap()
+                .status,
+            FixtureStatus::Restored
+        );
+
+        let current_plan = reopened.plan.get_plan().unwrap();
+        let stage_again = reopened.prepare_stage(current_plan.revision_id).unwrap();
+        assert_eq!(stage_again.items.len(), 1);
+        assert_eq!(
+            reopened
+                .confirm_and_execute(stage_again.review_id, |_| true)
+                .unwrap()
+                .state,
+            "finished"
+        );
+        let staged_status = reopened.status().unwrap();
+        let staged_record = staged_status
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.action_id == plan.actions[1].id)
+            .unwrap();
+        let target = disk_steward_fixture_purge::PurgeTarget {
+            action_id: staged_record.action_id,
+            receipt_id: staged_record.receipt_id.unwrap(),
+        };
+        let purge = reopened
+            .prepare_purge_review(current_plan.revision_id, vec![target.clone()])
+            .unwrap();
+        assert_eq!(purge.kind, "pytest_corpus_purge_review");
+        assert_eq!(
+            reopened
+                .confirm_purge_execution(purge.review_id, |_| false)
+                .unwrap_err(),
+            DemoError::ConfirmationCancelled
+        );
+        let purge = reopened
+            .prepare_purge_review(current_plan.revision_id, vec![target.clone()])
+            .unwrap();
+        let purged = reopened
+            .confirm_purge_execution(purge.review_id, |shown| {
+                assert_eq!(shown.targets.len(), 1);
+                assert_eq!(shown.targets[0].action_id, target.action_id);
+                assert_eq!(shown.targets[0].receipt_id, target.receipt_id);
+                true
+            })
+            .unwrap();
+        assert_eq!(purged.state, "finished");
+        assert_eq!(
+            reopened
+                .confirm_purge_execution(purge.review_id, |_| true)
+                .unwrap_err(),
+            DemoError::ReviewReused
+        );
+        drop(reopened);
+
+        let mut final_service =
+            DemoExecutionService::open_pytest_corpus_with_clock(dir.path(), || 1_700_000_000_000)
+                .expect("reopen terminal pytest coordinator");
+        let final_status = final_service.status().unwrap();
+        assert_eq!(
+            final_status
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.action_id == plan.actions[1].id)
+                .unwrap()
+                .status,
+            FixtureStatus::PermanentlyRemoved
+        );
+        assert_eq!(
+            final_status
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.action_id == plan.actions[0].id)
+                .unwrap()
+                .status,
+            FixtureStatus::Available
+        );
+        assert_eq!(
+            fs::read(root.join("source/valuable-local-notes.txt")).unwrap(),
+            b"preserve this note"
+        );
+    }
+
+    #[test]
+    fn pytest_profile_preserves_reordered_purge_selection_and_isolated_plan_store() {
+        let (dir, mut service, mut plan) = pytest_fixture_service();
+        let action_ids: Vec<_> = plan.actions.iter().map(|action| action.id).collect();
+        for action_id in &action_ids {
+            plan = service
+                .plan
+                .edit(
+                    plan.revision_id,
+                    *action_id,
+                    disk_steward_review_plan::Decision::Include,
+                )
+                .unwrap();
+        }
+        let stage = service.prepare_stage(plan.revision_id).unwrap();
+        assert_eq!(stage.items.len(), 2);
+        service
+            .confirm_and_execute(stage.review_id, |_| true)
+            .unwrap();
+        let status = service.status().unwrap();
+        let targets: Vec<_> = [action_ids[1], action_ids[0]]
+            .into_iter()
+            .map(|action_id| {
+                let fixture = status
+                    .fixtures
+                    .iter()
+                    .find(|f| f.action_id == action_id)
+                    .unwrap();
+                disk_steward_fixture_purge::PurgeTarget {
+                    action_id,
+                    receipt_id: fixture.receipt_id.unwrap(),
+                }
+            })
+            .collect();
+        let review = service
+            .prepare_purge_review(plan.revision_id, targets.clone())
+            .unwrap();
+        let result = service
+            .confirm_purge_execution(review.review_id, |shown| {
+                assert_eq!(
+                    shown
+                        .targets
+                        .iter()
+                        .map(|target| (target.action_id, target.receipt_id))
+                        .collect::<Vec<_>>(),
+                    targets
+                        .iter()
+                        .map(|target| (target.action_id, target.receipt_id))
+                        .collect::<Vec<_>>()
+                );
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|item| match &item.outcome {
+                    disk_steward_fixture_lifecycle::PurgeItemOutcome::PermanentlyRemoved {
+                        receipt_id,
+                        ..
+                    } => *receipt_id,
+                    _ => panic!("purge outcome was not permanent removal"),
+                })
+                .collect::<Vec<_>>(),
+            targets
+                .iter()
+                .map(|target| target.receipt_id)
+                .collect::<Vec<_>>()
+        );
+        drop(service);
+
+        // The synthetic coordinator uses its original files and schema and
+        // cannot interpret the pytest plan store as a synthetic plan.
+        assert!(ReviewPlanStore::open(dir.path().join(PYTEST_PLAN_DB)).is_err());
+        let mut synthetic = DemoExecutionService::open_with_clock(dir.path(), || 1_700_000_000_000)
+            .expect("separate synthetic profile");
+        assert_eq!(synthetic.plan.profile(), ReviewPlanProfile::SyntheticV1);
+        assert_eq!(synthetic.status().unwrap().state, "not_started");
+        drop(synthetic);
+        let mut reopened =
+            DemoExecutionService::open_pytest_corpus_with_clock(dir.path(), || 1_700_000_000_000)
+                .unwrap();
+        assert!(reopened
+            .status()
+            .unwrap()
+            .fixtures
+            .iter()
+            .all(|f| f.status == FixtureStatus::PermanentlyRemoved));
     }
 
     #[test]
