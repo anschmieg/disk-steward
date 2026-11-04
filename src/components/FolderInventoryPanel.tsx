@@ -30,6 +30,13 @@ export type FolderInventory = {
   regularFileLogicalBytes: string;
 };
 
+export type FolderCheckpoint = {
+  checkpointId: string;
+  rootLabel: string;
+  pageNumber: number;
+  entriesSeen: string;
+};
+
 export type FolderTreeSummary = {
   observationId: string;
   rootLabel: string;
@@ -80,6 +87,7 @@ export default function FolderInventoryPanel({
   const [treeSummary, setTreeSummary] = useState<FolderTreeSummary | null>(
     null,
   );
+  const [checkpoint, setCheckpoint] = useState<FolderCheckpoint | null>(null);
   const [snapshot, setSnapshot] = useState<FolderInventory | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -159,6 +167,82 @@ export default function FolderInventoryPanel({
           : refreshing
             ? "The current folder could not be refreshed reliably. Its previous page and scope remain unchanged. Choose the folder again if access or identity changed."
             : "The folder could not be inspected. Choose it again to retry. Any previous observation remains below.",
+      );
+    } finally {
+      activeRequest.current = false;
+      setBusy(false);
+      onBusyChange(false);
+    }
+  };
+  const checkpointAction = async (action: "save" | "resume" | "forget") => {
+    if (
+      !native ||
+      activeRequest.current ||
+      (action === "save" && !snapshot?.canContinue)
+    )
+      return;
+    if (action === "forget" && !checkpoint) return;
+    activeRequest.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    setMessage("");
+    try {
+      if (action === "forget") {
+        await invoke("clear_folder_checkpoint", {
+          request: { expectedCheckpointId: checkpoint!.checkpointId },
+        });
+        setCheckpoint(null);
+        setMessage(
+          "Saved checkpoint forgotten. The current folder and saved review metadata are unchanged.",
+        );
+      } else {
+        const saved = await invoke<FolderCheckpoint | null>(
+          "get_folder_checkpoint",
+        );
+        setCheckpoint(saved);
+        if (action === "save") {
+          const next = await invoke<FolderCheckpoint>(
+            "save_folder_checkpoint",
+            {
+              request: {
+                expectedObservationId: snapshot!.observationId,
+                expectedCheckpointId: saved?.checkpointId ?? null,
+              },
+            },
+          );
+          setCheckpoint(next);
+          setMessage(
+            "Folder checkpoint saved locally. Resume requires choosing the same unchanged folder again; your current page remains available.",
+          );
+        } else if (!saved) {
+          setMessage(
+            "No saved folder checkpoint is available. Choose a folder to start a new observation.",
+          );
+        } else {
+          const next = await invoke<FolderInventory | null>(
+            "resume_folder_checkpoint",
+            { request: { expectedCheckpointId: saved.checkpointId } },
+          );
+          if (next) {
+            setTreeSummary(null);
+            inspectorReturnRef.current = null;
+            setSelectedId(null);
+            setImported(false);
+            setSnapshot(next);
+            setQuery("");
+            setMessage(
+              "Resumed at the page after the saved checkpoint. Save again to advance the checkpoint; saved plan decisions are unchanged.",
+            );
+          } else {
+            setMessage(
+              "Resume selection canceled. The saved checkpoint and any current folder are unchanged.",
+            );
+          }
+        }
+      }
+    } catch {
+      setMessage(
+        "The checkpoint operation could not be verified reliably. The current folder view is unchanged. Check the saved checkpoint before trying again; changed folders or exclusions may require a new observation.",
       );
     } finally {
       activeRequest.current = false;
@@ -349,10 +433,58 @@ export default function FolderInventoryPanel({
       >
         {busy ? "Inspecting folder…" : "Choose folder"}
       </button>
+      <button
+        className="button secondary"
+        disabled={busy || !native}
+        onClick={() => void checkpointAction("resume")}
+      >
+        Resume saved folder scan
+      </button>
+      <p>
+        Explicit checkpoints save a private ordered list of observed entry names
+        and directory identity locally, without file contents or an absolute
+        folder path. Resume asks you to select the same folder again, validates
+        its unchanged identity and enumeration prefix, and starts the next page.
+        Changed metadata, entry order or exclusions may refuse resume.
+        Checkpoints cover this folder’s paging, not recursive scans or automatic
+        access after restart.
+      </p>
+      {checkpoint && (
+        <section aria-label="Saved folder checkpoint">
+          <p>
+            Saved checkpoint: {checkpoint.rootLabel} · page{" "}
+            {checkpoint.pageNumber} · {checkpoint.entriesSeen} observed entry
+            records.
+          </p>
+          <button
+            className="button secondary"
+            disabled={busy || !native}
+            onClick={() => void checkpointAction("forget")}
+          >
+            Forget saved checkpoint
+          </button>
+          <p>
+            Forgetting removes only this app’s saved scan checkpoint; source
+            files and saved plan/review metadata remain.
+          </p>
+        </section>
+      )}
       {!native && <p>Folder inspection is available in the desktop app.</p>}
       <p role="status">{message}</p>
       {snapshot && (
         <>
+          <button
+            className="button secondary"
+            disabled={busy || !native || !snapshot.canContinue}
+            onClick={() => void checkpointAction("save")}
+          >
+            Save folder checkpoint
+          </button>
+          <p>
+            Save only an incomplete, stable paging observation. Saving replaces
+            the previous checkpoint after a revision check. It does not add
+            entries to your plan or save subtree summaries.
+          </p>
           <button
             className="button secondary"
             disabled={busy || !native}

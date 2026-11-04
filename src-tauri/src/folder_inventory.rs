@@ -15,11 +15,39 @@ const MAX_LABEL_CHARS: usize = 120;
 const MAX_NAVIGATION_DEPTH: usize = 16;
 const MAX_PAGES_PER_DIRECTORY: u32 = 128;
 const MAX_TREE_SUMMARY_ENTRIES: usize = 4096;
+const MAX_CHECKPOINT_NAMES: usize = 65_536;
+const MAX_CHECKPOINT_NAME_BYTES: usize = 255;
 
 #[cfg(target_os = "macos")]
 // macOS SDK sys/stat.h defines SF_DATALESS as 0x40000000 (Xcode 16 SDK).
 const SF_DATALESS: u32 = 0x4000_0000;
 
+#[cfg(unix)]
+pub(crate) mod checkpoint_commands;
+#[cfg(not(unix))]
+pub(crate) mod checkpoint_commands {
+    #[tauri::command]
+    pub(crate) async fn get_folder_checkpoint() -> Result<(), String> {
+        Err("Folder checkpoints are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn save_folder_checkpoint() -> Result<(), String> {
+        Err("Folder checkpoints are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn resume_folder_checkpoint() -> Result<(), String> {
+        Err("Folder checkpoints are unsupported on this platform.".into())
+    }
+    #[tauri::command]
+    pub(crate) async fn clear_folder_checkpoint() -> Result<(), String> {
+        Err("Folder checkpoints are unsupported on this platform.".into())
+    }
+}
+
+#[cfg(unix)]
+mod checkpoint_replay;
+#[cfg(unix)]
+pub(crate) mod checkpoint_store;
 #[cfg(unix)]
 mod tree_summary;
 
@@ -345,6 +373,9 @@ struct DirectoryCursor {
     identity: DirectoryIdentity,
     page_number: u32,
     entries_seen: u64,
+    /// Exact raw names in the iteration prefix, including entries whose metadata failed.
+    /// Kept only in the native process until the user explicitly saves a checkpoint.
+    replay_names: Vec<Vec<u8>>,
 }
 
 #[cfg(unix)]
@@ -666,6 +697,10 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         .as_ref()
         .map(|cursor| cursor.baseline)
         .unwrap_or(root_before);
+    let mut replay_names = pending_cursor
+        .as_ref()
+        .map(|cursor| cursor.replay_names.clone())
+        .unwrap_or_default();
     if let Some(cursor) = pending_cursor.as_ref() {
         if cursor.identity != expected_identity
             || !root_metadata_matches(&cursor_baseline, &root_before)
@@ -724,6 +759,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         }
         raw_entries += 1;
         entries_seen = entries_seen.saturating_add(1);
+        replay_names.push(raw_name.to_vec());
         if started.elapsed() >= duration {
             snapshot.stop_reason = Some("time_limit");
             break;
@@ -884,6 +920,7 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
         identity: expected_identity,
         page_number,
         entries_seen,
+        replay_names,
     });
     Ok(ScannedDirectory {
         snapshot,
