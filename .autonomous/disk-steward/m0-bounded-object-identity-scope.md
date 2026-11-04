@@ -1,0 +1,5 @@
+# M0 bounded Git SHA-1 object identity
+
+Inactive backend pure canonical SHA-1 identity for one supplied commit/tree/blob/tag representation. Hard 16 MiB content cap, fixed stack canonical type/decimal-length/NUL header, fixed 8 KiB hashing steps using existing collision-checked SHA-1 dependency, cooperative cancellation/deadlines and collision refusal before returning a 20-byte ID. No additional dependencies or app/renderer/file/network interfaces.
+
+Hashing a supplied type and content does not validate syntax, authenticate the supplier, resolve bases/chains, verify pack checksums/counts, prove graph completeness or authorize cleanup. Callers must compare with independently required identities and perform those remaining checks; 16 MiB is experimental, not product scope. Root independent vectors/real-Git commit-tree-blob-tag and reconstructed-delta correspondence/API/source review; Luna new module only. Branch atop64 a9d15b9/main baseline9635f78; preserve local notes/watches/0.0.x/no release/no overlapping builds. Primary format: https://git-scm.com/book/en/v2/Git-Internals-Git-Objects.
