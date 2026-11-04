@@ -1,0 +1,22 @@
+[package]
+name = "generated-lifecycle-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+approval-ledger = { path = "../../crates/approval-ledger" }
+atomic-rename-probe = { path = "../atomic-rename" }
+disk-steward-core = { path = "../../crates/disk-steward-core" }
+disk-steward-generated-evidence = { path = "../../crates/generated-evidence" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "=0.10.9"
+tempfile = "=3.27.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.6", features = ["fs"] }
+
+[lints]
+workspace = true
