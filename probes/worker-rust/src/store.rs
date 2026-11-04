@@ -1,5 +1,9 @@
 //! Private, app-created Git-worker store fixture with bounded live cleanup.
 
+#[path = "store/footprint.rs"]
+mod footprint;
+#[path = "store/handoff.rs"]
+mod handoff;
 #[path = "store/payload.rs"]
 mod payload;
 
@@ -76,9 +80,12 @@ pub struct OwnedStore {
     root_id: (u64, u64),
     token: String,
     journal_id: Option<(u64, u64)>,
+    worker_payload_reservation: Option<u64>,
+    worker_payload_reservation_attempted: bool,
     phase: Phase,
     poisoned: bool,
     cleanup_started: bool,
+    worker_stdin_issued: bool,
     #[cfg(test)]
     fail_after_marker_unlink: bool,
 }
@@ -92,7 +99,64 @@ enum Phase {
 
 pub(crate) type ControlIdentity = ((u64, u64), (u64, u64));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerPayloadObservation {
+    pub(crate) written_bytes: u64,
+    pub(crate) high_water_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FixtureFootprintObservation {
+    pub(crate) object_count: u8,
+    pub(crate) observed_bytes: u64,
+}
+
+pub(crate) const PARTIAL_PAYLOAD_FIXTURE_BYTES: u64 = payload::PARTIAL_FIXTURE_BYTES;
+pub(crate) const WORKER_PAYLOAD_RESERVATION: u64 = 128 * 1024;
+
+/// Run the fixed synthetic payload writer against the validated worker stdin
+/// directory capability. No paths or payload parameters are accepted.
+pub(crate) fn write_worker_stdin_payload() -> Result<payload::PayloadReport, StoreError> {
+    handoff::write_stdin_payload()
+}
+
+pub(crate) fn write_worker_stdin_partial_payload() -> Result<payload::PayloadReport, StoreError> {
+    handoff::write_stdin_payload_partial()
+}
+
 impl OwnedStore {
+    /// Return the verified store-root descriptor for the single fixed worker
+    /// stdin handoff. The child receives only this directory capability.
+    pub(crate) fn worker_stdin_once(&mut self) -> Result<File, StoreError> {
+        handoff::worker_stdin_once(self)
+    }
+
+    pub(crate) fn validate_worker_stdin_handoff() -> Result<(), StoreError> {
+        handoff::validate_stdin()
+    }
+
+    pub(crate) fn inspect_stopped_worker_payload(
+        &self,
+        receipt: &crate::StopReceipt,
+    ) -> Result<WorkerPayloadObservation, StoreError> {
+        handoff::inspect_stopped_worker_payload(self, receipt)
+    }
+
+    pub(crate) fn inspect_stopped_worker_partial_payload(
+        &self,
+        receipt: &crate::StopReceipt,
+    ) -> Result<WorkerPayloadObservation, StoreError> {
+        handoff::inspect_stopped_worker_partial_payload(self, receipt)
+    }
+
+    pub(crate) fn observe_stopped_fixture_footprint(
+        &self,
+        registry: &verification_store_registry::VerificationStoreRegistry,
+        receipt: &crate::StopReceipt,
+    ) -> Result<FixtureFootprintObservation, StoreError> {
+        footprint::observe_stopped_fixture(self, registry, receipt)
+    }
+
     pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {
         self.inspect_state()?;
         Ok(self.parent_path.join("verification-registry.sqlite3"))
@@ -207,9 +271,19 @@ impl OwnedStore {
             Phase::Bound(pid) => format!("bound:{pid}"),
             Phase::Stopped(pid) => format!("stopped:{pid}"),
         };
+        let reservation = self
+            .worker_payload_reservation
+            .map(|bytes| format!("reservation:{bytes}\n"))
+            .unwrap_or_default();
         format!(
-            "disk-steward-worker-store-v1\n{}\n{}:{}\n{}:{}\n{}\n",
-            self.token, self.parent_id.0, self.parent_id.1, self.root_id.0, self.root_id.1, phase
+            "disk-steward-worker-store-v1\n{}\n{}:{}\n{}:{}\n{}{}\n",
+            self.token,
+            self.parent_id.0,
+            self.parent_id.1,
+            self.root_id.0,
+            self.root_id.1,
+            reservation,
+            phase
         )
     }
 
@@ -218,6 +292,32 @@ impl OwnedStore {
             return Err(StoreError::InvalidJournal);
         }
         self.update_journal(Phase::Bound(pid))
+    }
+
+    /// Bind the one closed worker payload admission after the registry has
+    /// committed its matching reservation and before descriptor handoff.
+    pub(crate) fn bind_worker_payload_reservation(&mut self) -> Result<(), StoreError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if self.worker_payload_reservation_attempted {
+                return Err(StoreError::InvalidJournal);
+            }
+            self.worker_payload_reservation_attempted = true;
+            if self.phase != Phase::Created
+                || self.poisoned
+                || self.cleanup_started
+                || self.worker_stdin_issued
+                || self.worker_payload_reservation.is_some()
+            {
+                self.poisoned = true;
+                return Err(StoreError::InvalidJournal);
+            }
+            self.update_journal_fields(self.phase, Some(WORKER_PAYLOAD_RESERVATION))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Err(StoreError::UnsupportedPlatform)
+        }
     }
 
     pub fn record_stopped(&mut self, receipt: &crate::StopReceipt) -> Result<(), StoreError> {
@@ -374,6 +474,15 @@ impl OwnedStore {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn update_journal(&mut self, next: Phase) -> Result<(), StoreError> {
+        self.update_journal_fields(next, self.worker_payload_reservation)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn update_journal_fields(
+        &mut self,
+        next: Phase,
+        next_reservation: Option<u64>,
+    ) -> Result<(), StoreError> {
         use rustix::fs::{openat, OFlags};
         if self.poisoned {
             return Err(StoreError::InvalidJournal);
@@ -423,12 +532,15 @@ impl OwnedStore {
             marker.set_len(0)?;
             marker.rewind()?;
             let old_phase = self.phase;
+            let old_reservation = self.worker_payload_reservation;
             self.phase = next;
+            self.worker_payload_reservation = next_reservation;
             if let Err(error) = marker
                 .write_all(self.journal_contents().as_bytes())
                 .and_then(|_| marker.sync_all())
             {
                 self.phase = old_phase;
+                self.worker_payload_reservation = old_reservation;
                 return Err(StoreError::Io(error));
             }
             self.journal_id = Some(identity(&marker)?);
@@ -514,9 +626,12 @@ fn create_supported() -> Result<OwnedStore, StoreError> {
         root_id,
         token,
         journal_id,
+        worker_payload_reservation: None,
+        worker_payload_reservation_attempted: false,
         phase: Phase::Created,
         poisoned: false,
         cleanup_started: false,
+        worker_stdin_issued: false,
         #[cfg(test)]
         fail_after_marker_unlink: false,
     })
@@ -666,6 +781,51 @@ mod tests {
             store.inspect_state().unwrap(),
             StoreState::NeedsReconciliation
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn payload_reservation_binding_is_once_only_and_immutable() {
+        let mut store = OwnedStore::create().unwrap();
+        let path = store.parent_path.join("store/owner.journal");
+        let before = std::fs::read(&path).unwrap();
+        store.bind_worker_payload_reservation().unwrap();
+        let bound = std::fs::read(&path).unwrap();
+        assert_ne!(bound, before);
+        let text = std::str::from_utf8(&bound).unwrap();
+        assert!(text.contains("reservation:131072\ncreated\n"));
+        assert!(store.bind_worker_payload_reservation().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bound);
+        let _descriptor = store.worker_stdin_once().unwrap();
+        assert!(store.bind_worker_payload_reservation().is_err());
+        assert_eq!(std::fs::read(path).unwrap(), bound);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failed_payload_reservation_binding_poisoned_without_rewriting_journal() {
+        let mut store = OwnedStore::create().unwrap();
+        store.bind_worker(41).unwrap();
+        let path = store.parent_path.join("store/owner.journal");
+        let before = std::fs::read(&path).unwrap();
+        assert!(store.bind_worker_payload_reservation().is_err());
+        assert!(store.poisoned);
+        assert!(store.worker_payload_reservation_attempted);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(store.worker_stdin_once().is_err());
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut fresh = OwnedStore::create().unwrap();
+        let marker = fresh.parent_path.join("store/owner.journal");
+        let original = std::fs::read(&marker).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(fresh.bind_worker_payload_reservation().is_err());
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(fresh.poisoned);
+        assert!(fresh.worker_payload_reservation.is_none());
+        assert!(fresh.bind_worker_payload_reservation().is_err());
+        assert!(fresh.worker_stdin_once().is_err());
+        assert_eq!(std::fs::read(marker).unwrap(), original);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
