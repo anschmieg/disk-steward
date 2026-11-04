@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 const APP_ID: i64 = 0x4453_4643; // DSFC
 const SCHEMA_VERSION: i64 = 1;
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_DATABASE_BYTES: u64 = 32 * 1024 * 1024;
-const RESERVED_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 64 * 1024 * 1024;
+pub(super) const MAX_DATABASE_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const RESERVED_BYTES: u64 = 2 * 1024 * 1024 * 1024 + 64 * 1024 * 1024;
 const SCHEMA: &str = "CREATE TABLE folder_checkpoint(singleton INTEGER PRIMARY KEY CHECK(singleton=1),payload TEXT NOT NULL) STRICT";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -334,7 +334,7 @@ fn is_bidi_control(ch: char) -> bool {
     matches!(ch as u32, 0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069)
 }
 
-fn private_database_path(path: &Path) -> Result<PathBuf, String> {
+pub(super) fn private_database_path(path: &Path) -> Result<PathBuf, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -381,7 +381,7 @@ fn private_database_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn ensure_private_file(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_private_file(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -402,7 +402,7 @@ fn ensure_private_file(path: &Path) -> Result<(), String> {
     }
 }
 
-fn check_sidecars(path: &Path) -> Result<(), String> {
+pub(super) fn check_sidecars(path: &Path) -> Result<(), String> {
     for suffix in ["-journal", "-wal", "-shm"] {
         let mut name = path.as_os_str().to_os_string();
         name.push(suffix);
@@ -421,7 +421,7 @@ fn check_sidecars(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn check_resources(path: &Path) -> Result<(), String> {
+pub(super) fn check_resources(path: &Path) -> Result<(), String> {
     check_database_size(path)?;
     check_resources_with_free_bytes(path, RESERVED_BYTES)
 }
@@ -437,7 +437,7 @@ fn check_database_size(path: &Path) -> Result<(), String> {
 
 // statvfs field widths vary across Unix targets.
 #[allow(clippy::useless_conversion)]
-fn check_resources_with_free_bytes(path: &Path, reserve: u64) -> Result<(), String> {
+pub(super) fn check_resources_with_free_bytes(path: &Path, reserve: u64) -> Result<(), String> {
     #[cfg(unix)]
     {
         use rustix::fs::{fstatvfs, open, Mode, OFlags};

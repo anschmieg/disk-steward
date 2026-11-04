@@ -261,7 +261,7 @@ fn validate_replay_names(names: &[Vec<u8>]) -> Result<(), &'static str> {
 #[cfg(unix)]
 // Native stat field widths differ across Unix targets; checked conversions stay explicit.
 #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
-fn stamp(stat: &rustix::fs::Stat) -> Result<RootStamp, &'static str> {
+pub(super) fn stamp(stat: &rustix::fs::Stat) -> Result<RootStamp, &'static str> {
     let identity = identity(stat);
     #[cfg(target_os = "macos")]
     let (birth_seconds, birth_nanos) = (stat.st_birthtime, stat.st_birthtime_nsec);

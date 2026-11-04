@@ -115,6 +115,13 @@ type SubtreeProgress = FolderTreeSummary & {
   scanReleased?: boolean;
 };
 
+type SubtreeCheckpointInfo = {
+  checkpointId: string;
+  rootLabel: string;
+  entriesObserved: number;
+  batches: number;
+};
+
 export default function FolderInventoryPanel({
   native,
   active = true,
@@ -149,6 +156,8 @@ export default function FolderInventoryPanel({
   const focusChooseAfterClear = useRef(false);
   const [treeSummary, setTreeSummary] = useState<SubtreeProgress | null>(null);
   const [checkpoint, setCheckpoint] = useState<FolderCheckpoint | null>(null);
+  const [subtreeCheckpoint, setSubtreeCheckpoint] =
+    useState<SubtreeCheckpointInfo | null>(null);
   const [snapshot, setSnapshot] = useState<FolderInventory | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -318,6 +327,105 @@ export default function FolderInventoryPanel({
     } catch {
       setMessage(
         "The checkpoint operation could not be verified reliably. The current folder view is unchanged. Check the saved checkpoint before trying again; changed folders or exclusions may require a new observation.",
+      );
+    } finally {
+      activeRequest.current = false;
+      setBusy(false);
+      onBusyChange(false);
+    }
+  };
+  const subtreeCheckpointAction = async (
+    action: "save" | "resume" | "forget" | "inspect",
+  ) => {
+    if (!native || activeRequest.current) return;
+    if (
+      action === "save" &&
+      (!snapshot ||
+        !treeSummary?.canContinue ||
+        summaryRunning ||
+        treeSummary.observationId !== snapshot.observationId)
+    )
+      return;
+    if (action === "forget" && !subtreeCheckpoint) return;
+    activeRequest.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    setMessage("");
+    try {
+      if (action === "inspect" || action === "resume" || action === "save") {
+        const saved = await invoke<SubtreeCheckpointInfo | null>(
+          "get_subtree_checkpoint",
+        );
+        setSubtreeCheckpoint(saved);
+        if (action === "inspect") {
+          setMessage(
+            saved
+              ? "Saved recursive checkpoint inspected. No folder access was requested."
+              : "No saved recursive checkpoint is available.",
+          );
+        } else if (action === "save") {
+          const next = await invoke<SubtreeCheckpointInfo>(
+            "save_subtree_checkpoint",
+            {
+              request: {
+                expectedObservationId: snapshot!.observationId,
+                scanId: treeSummary!.scanId,
+                expectedCheckpointId: saved?.checkpointId ?? null,
+              },
+            },
+          );
+          setSubtreeCheckpoint(next);
+          setMessage(
+            "Paused recursive scan checkpoint saved. The current folder view is unchanged.",
+          );
+        } else if (!saved) {
+          setMessage("No saved recursive checkpoint is available.");
+        } else {
+          const resumed = await invoke<{
+            snapshot: FolderInventory;
+            progress: SubtreeProgress;
+          } | null>("resume_subtree_checkpoint", {
+            request: { expectedCheckpointId: saved.checkpointId },
+          });
+          if (!resumed) {
+            setMessage(
+              "Recursive resume selection canceled. The saved checkpoint and current folder are unchanged.",
+            );
+          } else if (
+            resumed.progress.observationId !== resumed.snapshot.observationId ||
+            !resumed.progress.canContinue ||
+            !resumed.progress.scanId
+          ) {
+            setMessage(
+              "The returned recursive scan references could not be matched reliably. This historical view is retained; choose the folder again before continuing.",
+            );
+          } else {
+            setTreeSummary(resumed.progress);
+            inspectorReturnRef.current = null;
+            setSelectedId(null);
+            setImported(false);
+            setSnapshot(resumed.snapshot);
+            setQuery("");
+            setNameCategory(null);
+            setMessage(
+              "Recursive scan resumed paused. Review its coverage, then explicitly continue scanning when ready.",
+            );
+          }
+        }
+      } else {
+        await invoke<void>("clear_subtree_checkpoint", {
+          request: { expectedCheckpointId: subtreeCheckpoint!.checkpointId },
+        });
+        setSubtreeCheckpoint(null);
+        setMessage(
+          "Saved recursive checkpoint forgotten. The current folder and source files are unchanged.",
+        );
+      }
+    } catch {
+      setMessage(
+        action === "save"
+          ? "The recursive checkpoint save could not be verified. The current folder view is unchanged; inspect the saved checkpoint before trying again."
+          : "The recursive checkpoint operation could not be verified. The current folder view is unchanged; inspect the saved checkpoint before retrying.",
       );
     } finally {
       activeRequest.current = false;
@@ -587,6 +695,51 @@ export default function FolderInventoryPanel({
         Checkpoints cover this folder’s paging, not recursive scans or automatic
         access after restart.
       </p>
+      <section aria-label="Recursive scan checkpoint">
+        <button
+          className="button secondary"
+          disabled={busy || !native}
+          onClick={() => void subtreeCheckpointAction("inspect")}
+        >
+          Inspect saved recursive checkpoint
+        </button>
+        <button
+          className="button secondary"
+          disabled={busy || !native}
+          onClick={() => void subtreeCheckpointAction("resume")}
+        >
+          Resume saved recursive scan
+        </button>
+        {subtreeCheckpoint && (
+          <>
+            <p>
+              Saved recursive checkpoint: {subtreeCheckpoint.rootLabel} ·{" "}
+              {subtreeCheckpoint.entriesObserved} entries across{" "}
+              {subtreeCheckpoint.batches} batches.
+            </p>
+            <button
+              className="button secondary"
+              disabled={busy || !native}
+              onClick={() => void subtreeCheckpointAction("forget")}
+            >
+              Forget saved recursive checkpoint
+            </button>
+            <p>
+              Forgetting removes only this app’s checkpoint metadata. It does
+              not erase source files or change the separate paging checkpoint.
+              Forgotten metadata is not securely erased from local storage.
+            </p>
+          </>
+        )}
+        <p>
+          Resume replays and rechecks the entire saved prefix within a
+          cooperative two second limit. It may refuse a changed, reordered, or
+          too large tree. The metadata fingerprint does not prove file contents
+          or a consistent filesystem snapshot, and it is not cleanup approval.
+          The checkpoint stores no source paths. Saving explicitly advances this
+          separate recursive checkpoint.
+        </p>
+      </section>
       {checkpoint && (
         <section aria-label="Saved folder checkpoint">
           <p>
@@ -733,6 +886,19 @@ export default function FolderInventoryPanel({
                     ? "Traversal finished within its policy; coverage gaps may remain."
                     : "Scan stopped or ended without resumable progress."}
               </p>
+              <button
+                className="button secondary"
+                disabled={
+                  busy ||
+                  !native ||
+                  !treeSummary.canContinue ||
+                  summaryRunning ||
+                  treeSummary.observationId !== snapshot.observationId
+                }
+                onClick={() => void subtreeCheckpointAction("save")}
+              >
+                Save paused recursive scan
+              </button>
               {treeSummary.canContinue && !summaryRunning && (
                 <button
                   className="button secondary"
