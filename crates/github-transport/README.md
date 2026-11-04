@@ -529,3 +529,22 @@ binds content under SHA-256; it does not validate a sink's persistence claims,
 replace native file identity/revalidation, authenticate a server or authorize
 cleanup. Tests include an independent Python hashlib vector, short/interrupted
 writes, withheld failure digests and same-size valid-pack substitution.
+
+### Identity-bound private-file readback fixture
+
+The Linux/macOS private pack-file fixture now composes sync and allocation
+observation, native reservation/root/file identity checks, bounded descriptor
+readback, accepted-stream digest matching and decoding. It compares length,
+identity, permissions, link count and modification/change timestamps around
+readback and decode. A one-byte EOF probe rejects growth beyond the sampled
+length; allocation is fallible and interrupted reads are bounded. Raw bounded
+contents remain inspectable after a partial attempt is canceled.
+
+Tests change only task-owned files: growth, truncation, equal-length timestamp
+change, content tampering, hard links, symlink replacement, malformed read counts,
+read interruptions and deadline refusal. The supervised real-Git flow uses the
+composed operation before required-object and independent strict receiver checks.
+This remains test-only and detects observable changes, not an atomic snapshot or
+all races. Later mutation still requires revalidation. Sync success is not a
+power-loss guarantee; production worker, crash/reconciliation, persistence and
+cleanup acceptance remain open.
