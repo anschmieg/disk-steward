@@ -163,3 +163,13 @@ stop and registry reopen. Reopen must refuse further reservation growth until
 reconciliation. This is an admission-bookkeeping exercise, not a measurement of
 the fixture's footprint or proof of global aggregate enforcement. The probe
 retains its per-store private control layout and grants no cleanup authority.
+
+All four fixed current-executable child launch paths clear the caller environment
+before spawning. They need no ambient PATH, Git configuration, credentials or
+caller-selected temporary directory. A fixed synthetic sentinel is rejected by
+the private child dispatcher without printing its value. Integration tests first
+prove that direct inheritance is detected, then run stdout supervision, store
+worker, creator-death reinspection and indexed store worker with that sentinel
+set in their parent. This checks the actual launch boundary, not OS-level process
+isolation or production transport integration. Local evidence is macOS; other
+supported-platform behavior requires its current-head CI.
