@@ -131,7 +131,11 @@ test("folder navigation sends opaque observed IDs, updates breadcrumbs and uses 
   expect(
     screen.getByRole("button", { name: "Back to parent folder" }),
   ).toBeDisabled();
-  expect(screen.getByRole("heading", { name: "Chosen folder" })).toHaveFocus();
+  await waitFor(() => {
+    expect(
+      screen.getByRole("heading", { name: "Chosen folder" }),
+    ).toHaveFocus();
+  });
   fireEvent.click(screen.getByRole("button", { name: "Open folder Nested" }));
   await screen.findByRole("heading", { name: "Nested" });
   expect(invoke).toHaveBeenNthCalledWith(2, "navigate_folder_inventory", {
@@ -142,7 +146,9 @@ test("folder navigation sends opaque observed IDs, updates breadcrumbs and uses 
       screen.getByRole("navigation", { name: "Folder location" }),
     ).getAllByRole("listitem"),
   ).toHaveLength(2);
-  expect(screen.getByRole("heading", { name: "Nested" })).toHaveFocus();
+  await waitFor(() => {
+    expect(screen.getByRole("heading", { name: "Nested" })).toHaveFocus();
+  });
   fireEvent.click(
     screen.getByRole("button", { name: "Back to parent folder" }),
   );
@@ -455,7 +461,9 @@ test("clear releases the current scope only after exact backend success and retu
   });
   expect(screen.queryByRole("table")).not.toBeInTheDocument();
   expect(screen.queryByText("Zeta")).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Choose folder" })).toHaveFocus();
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: "Choose folder" })).toHaveFocus();
+  });
   expect(screen.getByText(/Folder scope cleared/)).toHaveTextContent(
     "Saved plan and review metadata remain",
   );
