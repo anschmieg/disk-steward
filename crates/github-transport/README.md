@@ -647,3 +647,24 @@ fixture, not a per-read controller callback, durable usage receipt, production
 worker/store integration or multi-gigabyte network enforcement demonstration.
 Unbound constructors remain for file-only tests; this is not a public
 report-adoption API.
+
+`GitHubTransport::ingress_observer()` returns a cloneable, read-only
+`TransportIngressObserver` for that attempt. `observed_bytes()` reads cumulative
+raw socket bytes, including after cancellation or transport consumption;
+`matches_transfer()` compares historical attempt identity with a pack report.
+The observer retains only the shared counter and context, without the full
+transport budget, credentials or mutation controls. The private file fixture
+now uses this interface instead of accessing budget/context internals.
+
+These are observations, not transfer completion, evidence freshness, resource
+admission or cleanup approval. Counter snapshots may wait on the in-flight read
+mutex; they are not nonblocking and provide no OS latency guarantee. Poisoned
+locks return a sanitized error. This backend API adds no renderer command,
+network execution, filesystem access, worker handoff or persisted receipt.
+
+For supervisor sampling, `try_observed_bytes()` uses a single nonblocking mutex
+attempt: `Some(total)` is an observation, `None` means busy, and a poisoned lock
+is an error. Busy is neither zero usage nor completion. The method does not
+retry, change counters, or suppress observations after cancellation. It provides
+no operating-system scheduling guarantee; callers still own attempt deadlines
+and final accounting.
