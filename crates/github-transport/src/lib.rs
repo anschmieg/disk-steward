@@ -4,6 +4,12 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod tag;
+pub use tag::{parse_sha1_tag, GitTagLink};
+mod commit;
+pub use commit::{parse_sha1_commit, GitCommitLinks};
+mod tree;
+pub use tree::{parse_sha1_tree, GitTreeEntry, GitTreeMode};
 mod decode;
 pub use decode::{decode_sha1_pack, DecodedPack, DecodedPackObject};
 mod object_identity;
@@ -2115,6 +2121,7 @@ fn parse_headers(raw: &[u8]) -> io::Result<Parsed> {
 #[cfg(test)]
 mod tests {
     mod checksum_tests;
+    mod commit_tests;
     mod decode_tests;
     mod delta_tests;
     mod entry_header_tests;
@@ -2124,6 +2131,8 @@ mod tests {
     mod inflate_tests;
     mod object_identity_tests;
     mod pack_tests;
+    mod tag_tests;
+    mod tree_tests;
 
     use super::*;
     use gix_transport::bstr::ByteSlice as _;
