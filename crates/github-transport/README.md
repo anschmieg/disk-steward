@@ -245,7 +245,7 @@ is gated to the registry adapter's Linux/macOS targets. No application or
 renderer calls this test sink.
 
 The fixed system-Git fixture supervises repository setup and local receiver
-verification with a ten-second per-command budget, while upload-pack RPC
+verification with a thirty-second per-command budget, while upload-pack RPC
 commands retain a three-second budget. Shared macOS CI exceeded the earlier
 three-second setup budget; the failing child was reaped. These are test-fixture
 limits, not changes to transport or product attempt deadlines.
@@ -337,3 +337,313 @@ must account for aggregate memory. Successful inflation does not validate object
 type/ID/count, delta bases or chains, graph completeness, or cleanup eligibility.
 Tests use independently encoded zlib/raw/gzip/dictionary vectors and compare
 inflated real Git objects plus a reconstructed REF_DELTA with strict Git import.
+
+### Canonical SHA-1 object identity
+
+`git_sha1_object_id` hashes one caller-supplied commit, tree, blob or tag using
+Git's canonical type, decimal length, NUL and content encoding. It reuses the
+pinned collision-checking SHA-1 implementation, refuses detected collisions,
+bounds content to 16 MiB, builds its header on the stack, and checks cancellation
+and deadlines around 8 KiB hash steps. This is an experimental implementation
+limit, not a product object-size commitment.
+
+The ID binds the supplied type and exact bytes. It does not validate commit,
+tree or tag syntax, authenticate the supplier, resolve delta chains, verify pack
+counts or graph completeness, or authorize cleanup. Callers must compare it with
+required identities and perform the remaining checks. Tests cover independent
+hash vectors and size/chunk boundaries, plus Git's own IDs for all four kinds
+and the reconstructed REF_DELTA result and its base reference.
+
+### Bounded pack decoder
+
+`decode_sha1_pack` composes the checksum, header, inflation, reconstruction and
+identity stages for a complete in-memory SHA-1 pack. It returns decoded objects
+only after the declared count, stream boundaries and checksum trailer agree.
+Each object includes its canonical ID, kind, content, entry offset and selected
+delta depth. Offset bases must be exact earlier entry boundaries; reference
+bases must match an earlier decoded object's computed ID. Missing, forward and
+external bases are explicitly unsupported in this experimental implementation.
+
+Limits are 16 MiB input, 1,024 entries, depth 32, and at most 16 MiB cumulative
+decoded work, with a caller-lowered work ceiling. Work includes each inflated
+representation and each reconstructed delta result, so discarded instruction
+streams still count. This is logical byte accounting, not total process RSS;
+input storage, decoder state, object metadata and allocation overhead remain
+separate. Controls are cooperative and require an outer worker for hard limits.
+
+Successful decoding still does not validate commit/tree/tag syntax, bind all
+required remote tips, prove graph completeness or authenticity, persist evidence,
+or authorize cleanup. These limits and backward-only resolution do not establish
+product Git support. Tests cover real Git object correspondence, independent
+REF/OFS vectors, depth and cumulative limits, unsupported bases, exact object
+counts, corruption, truncation and extra data.
+
+### Structural tree links
+
+`parse_sha1_tree` parses one raw SHA-1 tree body into borrowed raw names,
+canonical mode classes and nonzero object IDs. It checks exact entry framing,
+Git's directory-aware ordering and duplicate basenames, including duplicates
+separated by other names. Mode and name searches are bounded; metadata allocation
+is fallible. Experimental limits are 16 MiB input, 4,096 entries and 1,024 bytes
+per name, with a caller-lowered entry ceiling and cooperative attempt controls.
+
+Names are neither converted into paths nor extracted. Slash, dot, dot-dot and
+ASCII-case-insensitive `.git` are refused, but this is not comprehensive platform
+path validation or full Git fsck. Gitlink mode is reported as external commit
+metadata and never followed; complex-layout product gates remain. Callers must
+bind the body to its tree type and object ID, verify referenced object types and
+presence, and validate relevant graphs before making any product decision.
+Tests cover raw non-UTF-8 names, every canonical mode, malformed/truncated entries,
+ordering/duplicate traps, limits, and Git-generated tree correspondence.
+
+### Structural commit links
+
+`parse_sha1_commit` extracts a tree ID and ordered parent IDs from one supplied
+SHA-1 commit body. It requires canonical link headers, nonempty author/committer
+headers in the supported order, optional-header framing, and a blank separator.
+Optional signature and mergetag continuations remain uninterpreted; the message
+after the separator is opaque. Duplicate/misplaced core headers, malformed IDs,
+NUL/CR header bytes and orphan continuations are refused.
+
+Experimental limits are 16 MiB input, 64 KiB headers, 8,192 bytes per line,
+2,048 physical header lines and 1,024 parents; callers may lower the parent cap.
+Searches and parent allocation are bounded with cooperative attempt controls.
+The parser does not bind object type/hash, validate identity or timestamp syntax,
+verify signatures, perform full fsck, or prove linked-object presence or graph
+completeness. It may reject historical/noncanonical commits. No cleanup authority
+follows from its result. Tests include root and merge objects produced by Git,
+ordered parent correspondence, optional continuations, malformed/core-order
+cases, limits, interruption and opaque binary message boundaries.
+
+The test-only local Git setup/receiver allowance is now thirty seconds after
+macOS CI reaped two cold fixture setup commands at the previous ten-second
+limit. The three-second protocol RPC deadline and production attempt limits
+remain unchanged. This does not turn a timeout into a successful verification;
+commands must still finish successfully within the bounded fixture allowance.
+
+### Structural annotated-tag links
+
+`parse_sha1_tag` extracts a canonical SHA-1 target ID, declared target kind and
+borrowed raw tag name from a supported annotated-tag header. It accepts the
+object/type/tag order, an optional nonempty tagger line and a blank separator.
+Extra headers and continuations are refused. Names use the existing pinned tag
+validator; the message and any signature after the separator remain opaque.
+
+Experimental limits are 16 MiB input, 64 KiB header, 8,192-byte lines and a
+1,024-byte name, with cooperative attempt checks. This parser does not bind the
+tag object's hash/type, verify target presence or type, recursively peel tags,
+validate tagger identity/timestamps, verify signatures, perform full fsck, prove
+graph completeness, or authorize cleanup. Tests compare all four declared target
+kinds with Git mktag and canonical IDs, and cover raw names, tagger-less framing,
+opaque signature bytes, malformed headers, truncation, limits and controls.
+
+### Selected-root pack closure
+
+`check_pack_graph_closure` inspects a decoded pack from explicit typed roots. It
+requires every reachable commit tree/parent, tree entry and annotated-tag target
+to resolve to an object of the expected kind in that pack. Reachable gitlinks
+are unsupported. An iterative traversal visits each object ID once, while every
+repeated edge still consumes the 16,384-edge limit. Roots are limited to 64;
+existing decoder and per-object parser bounds also apply. Index, queue and visit
+storage use fallible bounded allocation. Identical duplicate pack entries share
+one visit; conflicting entries for an ID are refused.
+
+Only selected-root presence and type closure is established. Unreachable entries
+are not syntax-checked. This is not full Git fsck, complete semantic validation,
+platform path validation, signature verification, fresh remote-ref binding or
+local-work preservation evidence. The caller supplies root types; this stage does
+not infer which roots are required. It remains inactive and grants no cleanup
+eligibility. Logical work limits do not establish a total process-memory bound;
+cooperative controls still require an outer supervised worker.
+
+### Advertised-root decode and closure
+
+`decode_advertised_pack` composes a completed pack-transfer report with decoding
+and graph closure of caller-supplied bytes. It requires an exact accepted-byte
+count and SHA-256 digest match, resolves every advertised tip, requires commit objects for HEAD and branch
+refs, and uses decoded kinds for other namespaces. Symref targets must appear in
+the same advertisement with the same ID. Peeled tag claims must match the terminal
+non-tag object reached through typed tag links. Repeated peel claims share a
+16,384-step budget. Existing decoder, graph and parser caps remain in force;
+there are at most 1,024 advertised refs and 64 distinct roots.
+
+The SHA-256 digest binds supplied bytes to the stream the sink reported accepting.
+It does not prove physical persistence or authenticate a remote source. The operation remains inactive
+and does not establish an atomic remote snapshot, required local-state coverage,
+full fsck, signatures, practical private authentication, production worker/RSS
+limits or cleanup eligibility. Strict supported-subset refusals remain incomplete
+verification. Tests use bounded private TLS fixtures and the isolated real-Git
+fetch/strict receiver fixture; no user repository is accessed.
+
+### Required-object reachability
+
+`AdvertisedPackReport::check_required_objects` checks caller-supplied typed IDs
+against the report's privately retained advertised roots. Each requested object
+must be present with the expected kind and visited by the bounded root traversal;
+an unrelated extra pack entry does not count as coverage. The set must contain
+1–1,024 nonzero IDs. Duplicates consume the request count and every supplied kind
+is checked. The result reports request and graph counts, with no cleanup flag.
+
+This relation does not discover or attest local repository state. Callers still
+need a complete, stable local inventory, local ref-name preservation/disposition,
+receipt freshness and revalidation, and treatment of working files, hooks,
+configuration, stashes and recoverable state. The earlier persistence,
+full-fsck, authentication, worker/RSS and cleanup limits remain. Traversal reuses
+existing fallible allocation and cooperative controls without cloning payloads.
+Tests distinguish an unreachable packed object from a reachable ancestor and
+check all four fixture object kinds through the real-Git private TLS flow.
+
+### Outer supervision of the composed fixture
+
+On Linux/macOS the real-Git private TLS verification flow runs in an exactly
+selected ignored child test of the current test executable. The parent clears
+the child environment and requires a successful exit, a unique completion marker,
+no more than 1,024 stdout bytes and a joined collector within a 30-second fixture
+deadline. The marker follows the entire existing reserved-file fetch, decode,
+advertised closure, required-object coverage and independent strict receiver
+assertions. Four negative child fixtures exercise deadline, output overflow,
+missing-marker and unsuccessful-exit handling. Collection uses a fixed buffer
+and bounded interruption handling; cleanup precedes evidence assertions.
+
+This is test supervision of that disposable flow, not the production worker or
+an OS-level wait/kill latency, descendant-process, memory or crash-cleanup proof.
+A forcibly interrupted child may retain its private fixture for reconciliation;
+the parent does not infer deletion authority or remove paths from child output.
+Private GitHub credentials, stable local inventory, preservation, receipt expiry
+and integrated store lifecycle gates remain open. Production app/renderer and
+worker-probe interfaces are unchanged.
+
+### Accepted-byte stream binding
+
+The transfer report exposes `accepted_pack_sha256` only after the pack operation
+and HTTP finalization both succeed. The constant-memory digest observes exactly
+the prefix each sink write reports accepting, including short writes; interrupted
+or failed calls contribute no bytes. Partial failures retain accepted byte counts
+but expose no digest. This uses pinned `sha2` 0.10.9, already present in the lockfile.
+
+Before decoding, the advertised-pack operation checks length and compares this
+digest against the supplied bytes in cooperative 8 KiB chunks. The existing
+16 MiB experimental input cap is checked before hashing. A valid same-size pack
+with the same roots and different unrelated contents is rejected. Digest equality
+binds content under SHA-256; it does not validate a sink's persistence claims,
+replace native file identity/revalidation, authenticate a server or authorize
+cleanup. Tests include an independent Python hashlib vector, short/interrupted
+writes, withheld failure digests and same-size valid-pack substitution.
+
+### Identity-bound private-file readback fixture
+
+The Linux/macOS private pack-file fixture now composes sync and allocation
+observation, native reservation/root/file identity checks, bounded descriptor
+readback, accepted-stream digest matching and decoding. It compares length,
+identity, permissions, link count and modification/change timestamps around
+readback and decode. A one-byte EOF probe rejects growth beyond the sampled
+length; allocation is fallible and interrupted reads are bounded. Raw bounded
+contents remain inspectable after a partial attempt is canceled.
+
+Tests change only task-owned files: growth, truncation, equal-length timestamp
+change, content tampering, hard links, symlink replacement, malformed read counts,
+read interruptions and deadline refusal. The supervised real-Git flow uses the
+composed operation before required-object and independent strict receiver checks.
+This remains test-only and detects observable changes, not an atomic snapshot or
+all races. Later mutation still requires revalidation. Sync success is not a
+power-loss guarantee; production worker, crash/reconciliation, persistence and
+cleanup acceptance remain open.
+
+### Repository context and in-process expiry
+
+Pack transfer and decoded reports retain the exact validated repository URL used
+to construct the transport and its original monotonic and wall-clock start times.
+`decode_advertised_pack` and `check_required_objects` require an explicit expected
+repository; both check context before and after their work. URL aliases, case or
+`.git` suffix differences are refused rather than normalized. Cloning or decoding
+an old report does not renew its lifetime.
+
+Context checks refuse at 15 minutes on either clock, invalid/backward readings,
+or a repository mismatch. An observed expiry or invalid-clock result is terminal
+for that attempt and shared by existing and future clones; a later clock correction
+cannot revive it. The first terminal clock failure is retained under concurrent
+checks. A wrong expected repository is a per-call mismatch and does not invalidate
+the correctly bound attempt. `is_complete_transfer` still describes historical
+transfer completion; it does not mean evidence is currently usable. Counts-only
+coverage results likewise do not replace a fresh context check at later use.
+The original attempt begins at transport construction, conservatively before ref
+observation, rather than at decoding completion.
+
+This is an in-process guard, not a serialized receipt or a full platform-clock
+acceptance result. Rust does not guarantee consistent suspend accounting for
+`Instant`; the wall-clock guard adds conservative elapsed-time checking but is
+not a clock-tampering guarantee. Persisted receipts, local manifest revalidation,
+ref-name preservation, authentication, remote retention, worker/store lifecycle
+and cleanup eligibility remain separate gates. Tests exercise clock boundaries
+without sleeps and require the expected endpoint through the private TLS flow.
+
+### Required ref names and manifest identity
+
+`RequiredRefManifest` captures caller-supplied raw ref names, typed IDs, optional symbolic targets and a
+canonical SHA-256 digest. It preserves distinct names pointing to the same ID,
+rejects duplicate names and validates the supported Git name subset. Names are
+copied with fallible allocation, sorted byte-for-byte and never converted into
+paths or commands. Bounds are 1–1,024 entries, 1,024 bytes per name and 64 KiB of
+combined name and symbolic-target bytes in total. Symbolic targets use the same
+1,024-byte name cap, must be full `refs/` names, and cannot point to themselves.
+`None` explicitly claims a direct ref. The digest uses the v2 domain and encodes
+target presence and length. `check_unchanged` compares the full canonical entry sequence;
+changed names, targets, kinds or membership require renewed verification.
+
+`check_required_refs` requires a current expected-repository context and the same
+transfer attempt as the decoded report. It checks typed object reachability and
+returns manifest-backed entries whose names are absent remotely or whose remote
+names point elsewhere, including a separate symbolic-target mismatch. A local branch can need preservation even when its commit
+is covered by another remote branch. Matching remote names do not promise future
+retention. The report borrows the immutable manifest and exposes no cleanup flag.
+
+The manifest is a caller claim, not discovery of all local refs or complete HEAD state, working files, configuration, stashes or recoverable objects. It is
+not a backup or an explicit discard decision, and it does not replace native
+source revalidation or a persisted receipt. Existing clock, worker/store,
+authentication, platform and cleanup gates remain. Tests include an independent
+Python hashlib digest, canonical ordering and raw names, limits, changed claims,
+same-attempt binding and an actual Git local alias whose history is covered but
+whose name was not advertised.
+
+Named coverage also retains its original context for `recheck_manifest`. This
+compares a later caller manifest with the immutable verified claims under the
+same repository/expiry checks. Once that named result observes changed claims,
+it stays stale even if an older manifest is later supplied; new analysis and
+evidence are required. Repository mismatch, cancellation and deadline errors
+refuse the call without falsely recording a source change. Getters remain
+historical evidence, not a current-validity flag. The real-Git fixture recaptures
+native refs, accepts an unchanged observation, then rejects a name-only rename
+that leaves the covered object IDs unchanged. These observations are not atomic
+and do not establish a comprehensive user-repository inventory.
+
+The disposable Git fixture also captures HEAD explicitly and detects switching its
+symbolic branch or detaching it at the same commit ID. This does not prove native
+capture completeness, atomicity, unborn-HEAD handling or absence of symref cycles.
+
+Manifest capture also checks links whose targets are present in the same snapshot.
+Their object IDs and kinds must agree, and a bounded walk rejects cycles. Missing
+targets remain external caller claims. This uses fixed state/path arrays (9 KiB on 64-bit targets) without heap graph
+allocation. Each of at most 1,024 entries and present links is processed once,
+with binary target lookup and cancellation/deadline checks during traversal
+and completion.
+It cannot establish consistency of refs omitted by the caller or native atomicity.
+
+The closed private pack-file fixture reconciles the completed transfer's
+cumulative raw HTTP ingress into the same `BudgetController` job that charges
+file allocation, before checking cancellation or decoding. Repeating a total
+charges no duplicate bytes. An incomplete transfer still contributes observed
+ingress; a failed/non-running job cannot yield decoded evidence even if late
+accounting itself is accepted. Counter regressions cancel the fixture without
+reducing prior usage. Tests retain the durable reservation and require
+reconciliation on reopen after refusal, including a synthetic over-limit counter.
+Transport-bound fixture constructors also sample that attempt's cumulative raw
+ingress before each payload write and require the same attempt context before
+accounting a final report. Same-byte reports from another attempt are refused
+without charging their counter or cancelling that other attempt. The counter
+mutex is released before controller accounting or filesystem work.
+
+These are write checkpoints and completion-time accounting in a task-owned
+fixture, not a per-read controller callback, durable usage receipt, production
+worker/store integration or multi-gigabyte network enforcement demonstration.
+Unbound constructors remain for file-only tests; this is not a public
+report-adoption API.

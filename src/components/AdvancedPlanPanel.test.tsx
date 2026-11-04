@@ -111,6 +111,70 @@ describe("AdvancedPlanPanel decisions", () => {
     });
   });
 
+  it("names each group's batch controls and targets commands to that exact group", () => {
+    const firstItem = editorItem("first-item", { label: "First finding" });
+    const secondItem = editorItem("second-item", { label: "Second finding" });
+    const { onEdit } = mount(
+      editorSnapshot(
+        [firstItem, secondItem],
+        [
+          editorGroup("first-group", [firstItem.itemId], {
+            label: "First finding group",
+          }),
+          editorGroup("second-group", [secondItem.itemId], {
+            label: "Second finding group",
+          }),
+        ],
+      ),
+    );
+
+    const firstActions = screen.getByRole("group", {
+      name: "Set all eligible First finding group items",
+    });
+    const secondActions = screen.getByRole("group", {
+      name: "Set all eligible Second finding group items",
+    });
+    for (const actions of [firstActions, secondActions]) {
+      expect(
+        within(actions).getByRole("button", { name: "Include group" }),
+      ).toBeEnabled();
+      expect(
+        within(actions).getByRole("button", { name: "Keep group" }),
+      ).toBeEnabled();
+      expect(
+        within(actions).getByRole("button", { name: "Investigate" }),
+      ).toBeEnabled();
+    }
+
+    fireEvent.click(
+      within(firstActions).getByRole("button", { name: "Include group" }),
+    );
+    fireEvent.click(
+      within(secondActions).getByRole("button", { name: "Keep group" }),
+    );
+    fireEvent.click(
+      within(firstActions).getByRole("button", { name: "Investigate" }),
+    );
+
+    expect(onEdit.mock.calls.map(([edit]) => edit)).toEqual([
+      {
+        kind: "setGroupChoice",
+        groupId: "first-group",
+        choice: "include",
+      },
+      {
+        kind: "setGroupChoice",
+        groupId: "second-group",
+        choice: "keep",
+      },
+      {
+        kind: "setGroupChoice",
+        groupId: "first-group",
+        choice: "investigate",
+      },
+    ]);
+  });
+
   it("shows preserved user Keep decisions in both the row and inspector", () => {
     const kept = editorItem("keep-me", {
       label: "Personal project",
@@ -294,6 +358,130 @@ describe("AdvancedPlanPanel decisions", () => {
           name: removeGroup ? "Collapse other-group" : "Collapse review-group",
         }),
       ).toHaveFocus();
+    },
+  );
+
+  it("restores a later group toggle after an earlier group expands beyond the window", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const earlyItems = Array.from({ length: 80 }, (_, index) =>
+      editorItem(`early-${index}`, {
+        inPlan: index === 0,
+        effectiveSelected: index === 0,
+        groupIds: ["early-group"],
+      }),
+    );
+    const laterItem = editorItem("later-item", {
+      groupIds: ["later-group"],
+    });
+    const initial = editorSnapshot(
+      [...earlyItems, laterItem],
+      [
+        editorGroup(
+          "early-group",
+          earlyItems.map((item) => item.itemId),
+          { label: "Early findings" },
+        ),
+        editorGroup("later-group", [laterItem.itemId], {
+          label: "Later findings",
+        }),
+      ],
+    );
+    const props = {
+      busy: false,
+      confirmed: false,
+      editsConfirmed: true,
+      readOnly: false,
+      onEdit: vi.fn<(edit: PlanEdit) => Promise<void>>().mockResolvedValue(),
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+      onReview: async () => {},
+    };
+    const { rerender } = render(
+      <AdvancedPlanPanel snapshot={initial} {...props} />,
+    );
+    Object.defineProperty(
+      screen.getByRole("list", { name: "Grouped plan findings" }),
+      "clientHeight",
+      { configurable: true, value: 464 },
+    );
+
+    const laterToggle = screen.getByRole("button", {
+      name: "Collapse Later findings",
+    });
+    act(() => laterToggle.focus());
+    expect(laterToggle).toHaveFocus();
+
+    const next = {
+      ...initial,
+      revisionId: "earlier-group-expanded",
+      revisionNumber: initial.revisionNumber + 1,
+      items: [
+        ...earlyItems.map((item) => ({ ...item, inPlan: true })),
+        laterItem,
+      ],
+    };
+    rerender(<AdvancedPlanPanel snapshot={next} {...props} />);
+    expect(
+      screen.queryByRole("button", { name: "Collapse Later findings" }),
+    ).not.toBeInTheDocument();
+    act(() => frames.splice(0).forEach((callback) => callback(0)));
+
+    const list = screen.getByRole("list", { name: "Grouped plan findings" });
+    const restoredToggle = screen.getByRole("button", {
+      name: "Collapse Later findings",
+    });
+    expect(restoredToggle).toBeInTheDocument();
+    expect(restoredToggle).toHaveFocus();
+    expect(within(list).getAllByRole("listitem").length).toBeLessThan(100);
+  });
+
+  it.each(["Include group", "Keep group", "Investigate"])(
+    "restores the exact %s control after busy clears",
+    (name) => {
+      const frames = stubAnimationFrames();
+      const item = editorItem("group-focus-item");
+      const snapshot = editorSnapshot(
+        [item],
+        [editorGroup("group-focus", [item.itemId])],
+      );
+      const props = {
+        busy: false,
+        confirmed: false,
+        onEdit: async () => {},
+        onUndo: async () => {},
+        onRedo: async () => {},
+        onRefresh: async () => {},
+      };
+      const view = render(<AdvancedPlanPanel snapshot={snapshot} {...props} />);
+      const control = screen.getByRole("button", { name });
+      act(() => control.focus());
+      const next = {
+        ...snapshot,
+        revisionId: "group-focus-next",
+        revisionNumber: 2,
+      };
+      view.rerender(<AdvancedPlanPanel snapshot={next} {...props} busy />);
+      // A disabled control may lose focus in the native WebView. Model that
+      // loss without introducing a newer user-selected focus target.
+      act(() => {
+        const previous = document.body.getAttribute("tabindex");
+        document.body.setAttribute("tabindex", "-1");
+        document.body.focus();
+        if (previous === null) document.body.removeAttribute("tabindex");
+        else document.body.setAttribute("tabindex", previous);
+      });
+      expect(document.body).toHaveFocus();
+      view.rerender(<AdvancedPlanPanel snapshot={next} {...props} />);
+      expect(frames.callbacks).toHaveLength(1);
+      act(() => frames.run(1));
+      expect(screen.getByRole("button", { name })).toHaveFocus();
     },
   );
 
@@ -602,6 +790,112 @@ describe("AdvancedPlanPanel decisions", () => {
       parentId: "project",
       itemIds: ["first-notes"],
     });
+  });
+
+  it("bounds descendant pages after snapshots shrink and does not restore an obsolete page", () => {
+    const folder = editorItem("paged-project", {
+      label: "Paged project",
+      kind: "folder",
+      excludedDescendantIds: ["child-005", "child-050"],
+    });
+    const children = Array.from({ length: 120 }, (_, index) =>
+      editorItem(`child-${String(index).padStart(3, "0")}`, {
+        label: `Child ${String(index).padStart(3, "0")}`,
+        parentId: folder.itemId,
+      }),
+    );
+    const snapshot = (count: number, revision: number) =>
+      editorSnapshot(
+        [
+          {
+            ...folder,
+            excludedDescendantIds: folder.excludedDescendantIds.filter((id) =>
+              children.slice(0, count).some((child) => child.itemId === id),
+            ),
+          },
+          ...children.slice(0, count),
+        ],
+        [],
+        {
+          revisionId: `descendants-${revision}`,
+          revisionNumber: revision,
+        },
+      );
+    const onEdit = vi
+      .fn<(edit: PlanEdit) => Promise<void>>()
+      .mockResolvedValue();
+    const props = {
+      busy: false,
+      confirmed: false,
+      onEdit,
+      onUndo: async () => {},
+      onRedo: async () => {},
+      onRefresh: async () => {},
+    };
+    const view = render(
+      <AdvancedPlanPanel snapshot={snapshot(120, 1)} {...props} />,
+    );
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "Search findings and groups" }),
+      { target: { value: "Paged project" } },
+    );
+    fireEvent.click(screen.getByRole("listitem", { name: /Paged project/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 3 of 3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: /Child 100/ }),
+    ).toBeInTheDocument();
+
+    view.rerender(<AdvancedPlanPanel snapshot={snapshot(20, 2)} {...props} />);
+    expect(screen.getByText("Showing 1–20 of 20")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Next" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /Child 005/ })).toBeChecked();
+
+    view.rerender(<AdvancedPlanPanel snapshot={snapshot(120, 3)} {...props} />);
+    expect(screen.getByText("Page 1 of 3")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: /Child 000/ }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 2 of 3")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 3 of 3")).toBeInTheDocument();
+    view.rerender(<AdvancedPlanPanel snapshot={snapshot(60, 4)} {...props} />);
+    expect(screen.getByText("Showing 51–60 of 60")).toBeInTheDocument();
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Previous" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: /Child 050/ })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Child 050/ }));
+    expect(onEdit).toHaveBeenLastCalledWith({
+      kind: "excludeDescendants",
+      parentId: "paged-project",
+      itemIds: ["child-005"],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Previous" }));
+    expect(screen.getByText("Page 1 of 2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Previous" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    const search = screen.getByRole("searchbox", {
+      name: "Search descendants",
+    });
+    fireEvent.change(search, { target: { value: "not a child" } });
+    expect(screen.getByText("No matching descendants")).toBeInTheDocument();
+    expect(screen.queryAllByRole("checkbox", { name: /^Child / })).toHaveLength(
+      0,
+    );
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.getByText("Showing 1–50 of 60")).toBeInTheDocument();
+    expect(screen.getByText("Page 1 of 2")).toBeInTheDocument();
+    expect(screen.getAllByRole("checkbox", { name: /^Child / })).toHaveLength(
+      50,
+    );
+    expect(onEdit).toHaveBeenCalledTimes(1);
   });
 
   it.each([
