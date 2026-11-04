@@ -62,3 +62,18 @@
 .inventory-size-value {
   position: relative;
 }
+.inventory-evidence {
+  margin-top: 20px;
+  padding-top: 12px;
+  border-top: 1px solid currentColor;
+}
+.inventory-evidence dl {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(100px, 2fr);
+  gap: 8px;
+}
+.inventory-evidence dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}

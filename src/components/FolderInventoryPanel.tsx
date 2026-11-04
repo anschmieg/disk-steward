@@ -13,6 +13,8 @@ export type FolderInventory = {
     name: string;
     kind: string;
     logicalBytes: string | null;
+    allocatedBytes: string | null;
+    linkCount: string | null;
     hardLinked: boolean;
     canOpen: boolean;
   }>;
@@ -35,15 +37,22 @@ export default function FolderInventoryPanel({
   const titleId = useId();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const activeRequest = useRef(false);
+  const evidenceHeadingRef = useRef<HTMLHeadingElement>(null);
+  const inspectorReturnRef = useRef<HTMLButtonElement | null>(null);
+  const queryRef = useRef<HTMLInputElement>(null);
   const [snapshot, setSnapshot] = useState<FolderInventory | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [imported, setImported] = useState(false);
   const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<"name" | "size">("size");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [sort, setSort] = useState<"name" | "size" | "allocated">("size");
   useEffect(() => {
     if (snapshot) headingRef.current?.focus();
   }, [snapshot]);
+  useEffect(() => {
+    if (selectedId !== null) evidenceHeadingRef.current?.focus();
+  }, [selectedId]);
   const inspect = async (entryId?: string | null) => {
     if (activeRequest.current || !native) return;
     if (entryId !== undefined && !snapshot) return;
@@ -64,6 +73,8 @@ export default function FolderInventoryPanel({
               },
             });
       if (next) {
+        inspectorReturnRef.current = null;
+        setSelectedId(null);
         setImported(false);
         setSnapshot(next);
         setQuery("");
@@ -114,15 +125,18 @@ export default function FolderInventoryPanel({
       onBusyChange(false);
     }
   };
+  const selected = snapshot?.entries.find((entry) => entry.id === selectedId);
   const total = BigInt(snapshot?.regularFileLogicalBytes ?? "0");
   const entries = [...(snapshot?.entries ?? [])]
     .filter((entry) =>
       entry.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
     )
     .sort((a, b) => {
-      if (sort === "size") {
-        const left = a.logicalBytes === null ? -1n : BigInt(a.logicalBytes);
-        const right = b.logicalBytes === null ? -1n : BigInt(b.logicalBytes);
+      if (sort !== "name") {
+        const aBytes = sort === "allocated" ? a.allocatedBytes : a.logicalBytes;
+        const bBytes = sort === "allocated" ? b.allocatedBytes : b.logicalBytes;
+        const left = aBytes === null ? -1n : BigInt(aBytes);
+        const right = bBytes === null ? -1n : BigInt(bBytes);
         if (left !== right) return left > right ? -1 : 1;
       }
       return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
@@ -231,6 +245,7 @@ export default function FolderInventoryPanel({
             Filter observed names{" "}
             <input
               type="search"
+              ref={queryRef}
               value={query}
               disabled={busy}
               onChange={(e) => setQuery(e.target.value)}
@@ -246,9 +261,14 @@ export default function FolderInventoryPanel({
             <select
               value={sort}
               disabled={busy}
-              onChange={(e) => setSort(e.target.value as "name" | "size")}
+              onChange={(e) =>
+                setSort(e.target.value as "name" | "size" | "allocated")
+              }
             >
               <option value="size">Logical size, largest first</option>
+              <option value="allocated">
+                Reported allocation, largest first
+              </option>
               <option value="name">Name</option>
             </select>
           </label>
@@ -265,7 +285,9 @@ export default function FolderInventoryPanel({
                   <th scope="col">Name</th>
                   <th scope="col">Kind</th>
                   <th scope="col">Logical bytes</th>
+                  <th scope="col">Reported allocated bytes</th>
                   <th scope="col">Links</th>
+                  <th scope="col">Evidence</th>
                 </tr>
               </thead>
               <tbody>
@@ -298,12 +320,74 @@ export default function FolderInventoryPanel({
                         {entry.logicalBytes ?? "Unknown"}
                       </span>
                     </td>
-                    <td>{entry.hardLinked ? "Multiple hard links" : "—"}</td>
+                    <td>{entry.allocatedBytes ?? "Unknown"}</td>
+                    <td>
+                      {entry.linkCount === null
+                        ? "Unknown"
+                        : `${entry.linkCount}${entry.hardLinked ? " · multiple hard links" : ""}`}
+                    </td>
+                    <td>
+                      <button
+                        className="button secondary"
+                        aria-label={`Inspect ${entry.name}`}
+                        aria-pressed={selectedId === entry.id}
+                        onClick={(event) => {
+                          inspectorReturnRef.current = event.currentTarget;
+                          setSelectedId(entry.id);
+                        }}
+                      >
+                        Inspect
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+          {selected && (
+            <section
+              className="inventory-evidence"
+              aria-label="Entry evidence"
+              aria-live="polite"
+            >
+              <h4 ref={evidenceHeadingRef} tabIndex={-1}>
+                {selected.name}
+              </h4>
+              <button
+                className="button secondary"
+                onClick={() => {
+                  setSelectedId(null);
+                  const target = inspectorReturnRef.current;
+                  if (target?.isConnected) target.focus();
+                  else queryRef.current?.focus();
+                }}
+              >
+                Return to entry list
+              </button>
+              <dl>
+                <dt>Entry kind</dt>
+                <dd>{selected.kind}</dd>
+                <dt>Logical bytes</dt>
+                <dd>{selected.logicalBytes ?? "Unknown"}</dd>
+                <dt>Reported allocated bytes</dt>
+                <dd>{selected.allocatedBytes ?? "Unknown"}</dd>
+                <dt>Link count</dt>
+                <dd>{selected.linkCount ?? "Unknown"}</dd>
+              </dl>
+              <p>
+                Historical no-follow metadata observation. File contents were
+                not read. Folder contents and recursive sizes are unknown.
+                Reported allocation comes from filesystem block metadata; hard
+                links, shared extents, compression and snapshots prevent it from
+                establishing uniquely occupied or reclaimable space.
+              </p>
+              <p>
+                Cleanup blocked: metadata alone establishes neither safe removal
+                nor a recoverable-space estimate. Importing this entry into your
+                plan keeps those blockers.
+              </p>
+            </section>
+          )}
           {entries.length === 0 && query && (
             <p>No observed names match this filter.</p>
           )}

@@ -14,6 +14,15 @@ const MAX_DURATION: Duration = Duration::from_secs(2);
 const MAX_LABEL_CHARS: usize = 120;
 const MAX_NAVIGATION_DEPTH: usize = 16;
 
+#[cfg(unix)]
+// Unix stat reports allocation in 512-byte units, not st_blksize units.
+fn allocated_bytes_from_blocks<T>(blocks: T) -> Option<u64>
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(blocks).ok()?.checked_mul(512)
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderInventoryEntry {
@@ -21,6 +30,8 @@ pub struct FolderInventoryEntry {
     pub name: String,
     pub kind: &'static str,
     pub logical_bytes: Option<String>,
+    pub allocated_bytes: Option<String>,
+    pub link_count: Option<String>,
     pub hard_linked: bool,
     pub can_open: bool,
 }
@@ -163,7 +174,10 @@ impl FolderInventoryState {
                 evidence: vec![EvidenceRef {
                     id: disk_steward_core::EvidenceId::new(),
                     summary: format!(
-                        "Observation {observation} at {breadcrumb_text}. Shallow immediate-entry metadata only; no paths or contents were retained. Per-entry logical sizes may overlap through hard links or aliases."
+                        "Observation {observation} at {breadcrumb_text}. Shallow metadata only; no paths or contents retained. Logical bytes: {}; allocated bytes: {}; link count: {}. Allocation is per-entry st_blocks metadata; hard links or shared storage may overlap, so this is not a unique or reclaimable total.",
+                        entry.logical_bytes.as_deref().unwrap_or("unknown"),
+                        entry.allocated_bytes.as_deref().unwrap_or("unknown"),
+                        entry.link_count.as_deref().unwrap_or("unknown"),
                     ),
                 }],
                 suggestion: Suggestion {
@@ -524,6 +538,8 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
                     name: label,
                     kind: "unreadable",
                     logical_bytes: None,
+                    allocated_bytes: None,
+                    link_count: None,
                     hard_linked: false,
                     can_open: false,
                 });
@@ -567,6 +583,14 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             }
         }
         let hidden = raw_name.first() == Some(&b'.');
+        let (allocated_bytes, link_count) = if kind == "file" {
+            (
+                allocated_bytes_from_blocks(metadata.st_blocks).map(|bytes| bytes.to_string()),
+                Some(metadata.st_nlink.to_string()),
+            )
+        } else {
+            (None, None)
+        };
         let can_open = is_directory
             && entry_identity.device == root_device
             && !hidden
@@ -577,6 +601,8 @@ fn scan_directory_fd(request: ScanRequest<'_>) -> Result<ScannedDirectory, &'sta
             name: label,
             kind,
             logical_bytes: entry_logical_bytes.map(|size| size.to_string()),
+            allocated_bytes,
+            link_count,
             hard_linked: kind == "file" && metadata.st_nlink > 1,
             can_open,
         });
@@ -1091,12 +1117,58 @@ mod tests {
             .iter()
             .filter(|entry| entry.name.starts_with("one"))
             .all(|entry| entry.hard_linked));
+        let regular_files = entries
+            .iter()
+            .filter(|entry| entry.name.starts_with("one"))
+            .collect::<Vec<_>>();
+        assert_eq!(regular_files.len(), 2);
+        assert_eq!(
+            regular_files[0].allocated_bytes,
+            regular_files[1].allocated_bytes
+        );
+        assert_eq!(regular_files[0].link_count, regular_files[1].link_count);
+        assert!(regular_files[0].allocated_bytes.is_some());
+        assert_eq!(regular_files[0].link_count.as_deref(), Some("2"));
+        let folder = entries.iter().find(|entry| entry.kind == "folder").unwrap();
+        let link = entries
+            .iter()
+            .find(|entry| entry.kind == "symlink")
+            .unwrap();
+        assert_eq!(folder.allocated_bytes, None);
+        assert_eq!(folder.link_count, None);
+        assert_eq!(link.allocated_bytes, None);
+        assert_eq!(link.link_count, None);
+
+        let file_json = serde_json::to_value(regular_files[0]).unwrap();
+        assert_eq!(
+            file_json["allocatedBytes"],
+            regular_files[0].allocated_bytes.clone().unwrap()
+        );
+        assert_eq!(file_json["linkCount"], "2");
+        let folder_json = serde_json::to_value(folder).unwrap();
+        assert!(folder_json["allocatedBytes"].is_null());
+        assert!(folder_json["linkCount"].is_null());
         let escaped = entries
             .iter()
             .find(|entry| entry.name.starts_with("odd"))
             .unwrap();
         assert!(escaped.name.contains("\\u{000A}"));
         assert!(escaped.name.contains("\\u{202E}"));
+    }
+
+    #[test]
+    fn allocated_bytes_conversion_is_checked_and_unknown_on_invalid_blocks() {
+        assert_eq!(allocated_bytes_from_blocks(0i64), Some(0));
+        assert_eq!(allocated_bytes_from_blocks(1i64), Some(512));
+        assert_eq!(allocated_bytes_from_blocks(17i64), Some(8_704));
+        assert_eq!(allocated_bytes_from_blocks(-1i64), None);
+        assert_eq!(allocated_bytes_from_blocks(i64::MAX), None);
+        let maximum_blocks = u64::MAX / 512;
+        assert_eq!(
+            allocated_bytes_from_blocks(maximum_blocks),
+            Some(maximum_blocks * 512)
+        );
+        assert_eq!(allocated_bytes_from_blocks(maximum_blocks + 1), None);
     }
 
     #[test]
@@ -1390,6 +1462,22 @@ mod tests {
             .iter()
             .any(|blocker| blocker.code == "folder_children_unknown"));
         let evidence = &imported[0].evidence[0].summary;
+        assert!(imported
+            .iter()
+            .all(|item| item.evidence[0].summary.len() <= 2048));
+        assert!(imported.iter().any(|item| {
+            item.evidence[0]
+                .summary
+                .contains("allocated bytes: unknown")
+                && item.evidence[0].summary.contains("link count: unknown")
+        }));
+        assert!(imported.iter().any(|item| {
+            item.evidence[0].summary.contains("allocated bytes: ")
+                && !item.evidence[0]
+                    .summary
+                    .contains("allocated bytes: unknown")
+                && item.evidence[0].summary.contains("link count: 1")
+        }));
         let observation_id = serde_json::to_value(snapshot.observation_id)
             .unwrap()
             .as_str()

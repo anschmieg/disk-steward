@@ -28,6 +28,8 @@ const sample: FolderInventory = {
       name: "Alpha",
       kind: "file",
       logicalBytes: "7",
+      allocatedBytes: "4096",
+      linkCount: "2",
       hardLinked: true,
       canOpen: false,
     },
@@ -36,6 +38,8 @@ const sample: FolderInventory = {
       name: "Zeta",
       kind: "file",
       logicalBytes: "9007199254740993",
+      allocatedBytes: "0",
+      linkCount: "1",
       hardLinked: false,
       canOpen: false,
     },
@@ -44,6 +48,8 @@ const sample: FolderInventory = {
       name: "Nested",
       kind: "folder",
       logicalBytes: null,
+      allocatedBytes: null,
+      linkCount: null,
       hardLinked: false,
       canOpen: true,
     },
@@ -264,4 +270,62 @@ test("failed import preserves observed entries and does not automatically retry"
   expect(screen.getByText("Zeta")).toBeVisible();
   expect(invoke).toHaveBeenCalledTimes(3);
   expect(screen.queryByText(/private database path/)).not.toBeInTheDocument();
+});
+
+test("allocation sort and inspector distinguish exact logical bytes, allocation and unknown directory sizes", async () => {
+  const observed = {
+    ...sample,
+    entries: sample.entries.map((entry) =>
+      entry.id === "1"
+        ? { ...entry, allocatedBytes: "9007199254740993" }
+        : entry,
+    ),
+  };
+  vi.mocked(invoke).mockResolvedValue(observed);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.change(screen.getByRole("combobox"), {
+    target: { value: "allocated" },
+  });
+  expect(
+    within(screen.getByRole("table")).getAllByRole("row")[1],
+  ).toHaveTextContent("Alpha");
+  const inspect = screen.getByRole("button", { name: "Inspect Alpha" });
+  fireEvent.click(inspect);
+  let evidence = screen.getByRole("region", { name: "Entry evidence" });
+  expect(
+    within(evidence).getByRole("heading", { name: "Alpha" }),
+  ).toHaveFocus();
+  expect(within(evidence).getByText("9007199254740993")).toBeVisible();
+  expect(within(evidence).getByText("7")).toBeVisible();
+  expect(within(evidence).getByText(/Cleanup blocked/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Return to entry list" }));
+  expect(inspect).toHaveFocus();
+  expect(
+    screen.queryByRole("region", { name: "Entry evidence" }),
+  ).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Inspect Nested" }));
+  evidence = screen.getByRole("region", { name: "Entry evidence" });
+  expect(within(evidence).getAllByText("Unknown")).toHaveLength(3);
+  expect(invoke).toHaveBeenCalledTimes(1);
+});
+
+test("filtering does not alter selected evidence and returning falls back to the name filter when row is hidden", async () => {
+  vi.mocked(invoke).mockResolvedValue(sample);
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(screen.getByRole("button", { name: "Inspect Alpha" }));
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "Zeta" },
+  });
+  expect(
+    within(screen.getByRole("region", { name: "Entry evidence" })).getByRole(
+      "heading",
+      { name: "Alpha" },
+    ),
+  ).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Return to entry list" }));
+  expect(screen.getByRole("searchbox")).toHaveFocus();
 });
