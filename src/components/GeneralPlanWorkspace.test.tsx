@@ -263,7 +263,7 @@ describe("GeneralPlanWorkspace revision and review boundaries", () => {
       screen.getByText(/cannot approve or change files/i),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Return to editor" }));
-    const selector = screen.getByLabelText(/example workspace/i);
+    const selector = screen.getByLabelText(/review workspace/i);
     fireEvent.change(selector, { target: { value: "stress" } });
     await screen.findByText("stress-r1");
     expect(mockedInvoke).toHaveBeenCalledWith("get_general_plan", {
@@ -433,7 +433,7 @@ describe("GeneralPlanWorkspace revision and review boundaries", () => {
       target: { value: "P3" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start recording" }));
-    expect(screen.getByLabelText(/example workspace/i)).toBeDisabled();
+    expect(screen.getByLabelText(/review workspace/i)).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Freeze review" }));
     await screen.findByText(/Saved review · revision/);
     fireEvent.click(screen.getByRole("button", { name: "Finish recording" }));
@@ -453,7 +453,7 @@ describe("GeneralPlanWorkspace revision and review boundaries", () => {
     ).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Discard recording" }));
-    fireEvent.change(screen.getByLabelText(/example workspace/i), {
+    fireEvent.change(screen.getByLabelText(/review workspace/i), {
       target: { value: "stress" },
     });
     await screen.findByText("stress-r1");
@@ -466,4 +466,58 @@ describe("GeneralPlanWorkspace revision and review boundaries", () => {
       screen.queryByText("Review pilot recording"),
     ).not.toBeInTheDocument();
   });
+});
+
+it("opens the separate live workspace without seeding or recording synthetic pilot data", async () => {
+  mockedInvoke.mockImplementation(async (command) => {
+    if (command === "get_general_plan")
+      return {
+        ...summary("pilot", "live-empty-r1"),
+        items: [],
+        groups: [],
+        totals: {
+          inPlanLogicalBytes: 0,
+          logicalSelectedBytes: 0,
+          selectedCount: 0,
+        },
+      } as never;
+    if (command === "list_general_reviews") return [] as never;
+    if (command === "get_exclusion_registry")
+      return {
+        schemaVersion: 1,
+        revisionId: "exclusions-1",
+        entries: [],
+      } as never;
+    throw new Error("unexpected command");
+  });
+  const summaryChanged = vi.fn();
+  render(
+    <GeneralPlanWorkspace
+      native
+      initialProfile="live"
+      onBusyChange={noOp}
+      onSummaryChange={summaryChanged}
+    />,
+  );
+  await screen.findByText("live-empty-r1");
+  expect(
+    screen.getByRole("combobox", { name: /review workspace/i }),
+  ).toHaveValue("live");
+  expect(mockedInvoke).toHaveBeenCalledWith("get_general_plan", {
+    request: { profile: "live" },
+  });
+  expect(
+    screen.queryByRole("button", { name: "Start recording" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Add file metadata…" }),
+  ).toBeDisabled();
+  await waitFor(() =>
+    expect(summaryChanged).toHaveBeenCalledWith({
+      count: 0,
+      bytes: 0,
+      selectedBytes: 0,
+      selectedCount: 0,
+    }),
+  );
 });

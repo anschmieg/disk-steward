@@ -1,18 +1,22 @@
 mod example_plan;
 mod exclusion_identity;
 mod fixture_demo;
+mod folder_inventory;
 mod general_plan;
 mod global_exclusions;
 mod selected_metadata;
+mod summary_control;
+#[cfg(unix)]
+mod summary_exclusions;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 static NATIVE_CHECK_ACTIVE: AtomicBool = AtomicBool::new(false);
-struct NativeCheckGuard;
+pub(crate) struct NativeCheckGuard;
 impl NativeCheckGuard {
-    fn acquire() -> Result<Self, String> {
+    pub(crate) fn acquire() -> Result<Self, String> {
         NATIVE_CHECK_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| Self)
@@ -67,11 +71,28 @@ pub fn run() {
             app.manage(fixture_demo::FixtureDemoState::open(app.handle()));
             app.manage(general_plan::GeneralPlanState::open(app.handle()));
             app.manage(global_exclusions::ExclusionState::open(app.handle()));
+            app.manage(folder_inventory::FolderInventoryState::default());
+            #[cfg(unix)]
+            app.manage(
+                folder_inventory::checkpoint_commands::FolderCheckpointState::open(app.handle()),
+            );
+            app.manage(summary_control::SummaryControlState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             foundation_status,
             check_selected_folder_access,
+            folder_inventory::inspect_selected_folder_entries,
+            folder_inventory::navigate_folder_inventory,
+            folder_inventory::continue_folder_inventory,
+            folder_inventory::refresh_folder_inventory,
+            folder_inventory::checkpoint_commands::get_folder_checkpoint,
+            folder_inventory::checkpoint_commands::save_folder_checkpoint,
+            folder_inventory::checkpoint_commands::resume_folder_checkpoint,
+            folder_inventory::checkpoint_commands::clear_folder_checkpoint,
+            folder_inventory::clear_folder_inventory,
+            folder_inventory::inspect_folder_tree_summary,
+            folder_inventory::cancel_folder_tree_summary,
             preview_native_review,
             example_plan::get_example_plan,
             example_plan::edit_example_plan,
@@ -93,6 +114,7 @@ pub fn run() {
             general_plan::list_general_reviews,
             general_plan::add_selected_general_item,
             general_plan::add_selected_general_folder,
+            general_plan::import_observed_review_items,
             global_exclusions::get_exclusion_registry,
             global_exclusions::add_global_exclusion,
             global_exclusions::remove_global_exclusion
