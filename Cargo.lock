@@ -320,6 +320,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-steward-generated-evidence"
+version = "0.0.17"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "disk-steward-gix-byte-probe"
 version = "0.0.17"
 dependencies = [
@@ -470,6 +478,21 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "generated-lifecycle-probe"
+version = "0.0.17"
+dependencies = [
+ "approval-ledger",
+ "atomic-rename-probe",
+ "disk-steward-core",
+ "disk-steward-generated-evidence",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

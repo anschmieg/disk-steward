@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use disk_steward_core::{ReviewId, RevisionId};
+use disk_steward_core::{InventoryItemId, ReviewId, RevisionId};
 use disk_steward_plan_model::{EditOutcome, EditorSnapshot, FrozenReview, InventoryItem, PlanEdit};
 use disk_steward_plan_store::{FixtureScale, GeneralPlanStore, ReviewSummary, StoreError};
 use serde::{Deserialize, Serialize};
@@ -18,18 +18,21 @@ use tauri_plugin_dialog::DialogExt;
 pub(crate) enum Profile {
     Pilot,
     Stress,
+    Live,
 }
 impl Profile {
     fn filename(self) -> &'static str {
         match self {
             Self::Pilot => "editor-pilot-v1.sqlite3",
             Self::Stress => "editor-stress-v1.sqlite3",
+            Self::Live => "editor-live-v1.sqlite3",
         }
     }
     fn scale(self) -> FixtureScale {
         match self {
             Self::Pilot => FixtureScale::Pilot1000,
             Self::Stress => FixtureScale::Stress10000,
+            Self::Live => FixtureScale::EmptyReview,
         }
     }
 }
@@ -84,6 +87,12 @@ pub(crate) struct RevisionRequest {
 pub(crate) struct SavedReviewRequest {
     profile: Profile,
     review_id: ReviewId,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImportObservedReviewItemsRequest {
+    expected_observation_id: InventoryItemId,
+    expected_revision_id: RevisionId,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -165,6 +174,192 @@ pub(crate) async fn get_general_plan(
 ) -> Result<EditorSnapshot, GeneralPlanError> {
     with_store(&state, request.profile, |store| store.get_plan()).await
 }
+
+/// Imports the exact latest backend-held immediate-entry observation into the
+/// separate empty live review workspace as blocked metadata only.
+#[tauri::command]
+pub(crate) async fn import_observed_review_items(
+    request: ImportObservedReviewItemsRequest,
+    state: tauri::State<'_, GeneralPlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
+    inventory: tauri::State<'_, crate::folder_inventory::FolderInventoryState>,
+) -> Result<EditorSnapshot, GeneralPlanError> {
+    let guard = edit_guard(&demo)?;
+    let inventory = inventory.inner().clone();
+    let items = inventory
+        .blocked_items_for_observation(request.expected_observation_id)
+        .map_err(|reason| match reason {
+            "stale_observation" => GeneralPlanError {
+                code: "stale_observation",
+                message: "The folder observation changed. Inspect it again before importing.",
+            },
+            "no_importable_entries" => GeneralPlanError {
+                code: "no_importable_entries",
+                message: "This observation has no supported file or folder entries to import.",
+            },
+            "unsafe_observed_size" => GeneralPlanError {
+                code: "unsafe_observed_size",
+                message: "An observed logical size exceeds the review editor's safe range. Nothing was imported.",
+            },
+            _ => GeneralPlanError {
+                code: "observation_unavailable",
+                message: "The selected-folder observation is unavailable. Inspect it again.",
+            },
+        })?;
+    let expected_revision_id = request.expected_revision_id;
+    with_store(&state, Profile::Live, move |store| {
+        let _guard = guard;
+        append_new_observed_items(store, expected_revision_id, items)
+    })
+    .await
+}
+// A page can be imported after its duplicate subset; never overwrite richer
+// comparison evidence or user decisions merely to add the remaining entries.
+fn append_new_observed_items(
+    store: &mut GeneralPlanStore,
+    expected_revision: RevisionId,
+    items: Vec<InventoryItem>,
+) -> Result<EditorSnapshot, StoreError> {
+    let current = store.get_plan()?;
+    if current.revision_id != expected_revision {
+        return Err(StoreError::DomainEdit(
+            disk_steward_plan_model::EditError::StaleRevision,
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut missing = Vec::new();
+    for item in items {
+        if !seen.insert(item.id) {
+            return Err(StoreError::DomainEdit(
+                disk_steward_plan_model::EditError::InvalidInventory,
+            ));
+        }
+        if let Some(existing) = current.items.iter().find(|row| row.item_id == item.id) {
+            if existing.parent_id != item.parent_id
+                || existing.kind != item.kind
+                || existing.label != item.label
+                || existing.logical_bytes != item.logical_bytes
+            {
+                return Err(StoreError::DomainEdit(
+                    disk_steward_plan_model::EditError::InvalidInventory,
+                ));
+            }
+        } else {
+            missing.push(item);
+        }
+    }
+    // append_items rechecks the revision in its IMMEDIATE write transaction.
+    store.append_items(expected_revision, missing)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImportDuplicateReviewItemsRequest {
+    expected_observation_id: InventoryItemId,
+    comparison_id: InventoryItemId,
+    expected_revision_id: RevisionId,
+}
+
+/// Imports only native-retained matching evidence; renderer metadata cannot create groups.
+#[tauri::command]
+pub(crate) async fn import_duplicate_review_items(
+    request: ImportDuplicateReviewItemsRequest,
+    state: tauri::State<'_, GeneralPlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
+    inventory: tauri::State<'_, crate::folder_inventory::FolderInventoryState>,
+    exclusions: tauri::State<'_, crate::global_exclusions::ExclusionState>,
+) -> Result<EditorSnapshot, GeneralPlanError> {
+    let guard = edit_guard(&demo)?;
+    #[cfg(unix)]
+    {
+        let inventory = inventory.inner().clone();
+        let exclusions = exclusions.inner().clone();
+        let expected_revision = request.expected_revision_id;
+        let bundle = tauri::async_runtime::spawn_blocking(move || {
+            let unavailable = || GeneralPlanError {
+                code: "comparison_unavailable",
+                message: "Matching-file evidence changed or is no longer retained. Compare those files again before importing.",
+            };
+            let started = std::time::Instant::now();
+            let duration = std::time::Duration::from_secs(2);
+            let (revision, policy) = exclusions.summary_policy(started, duration).map_err(|_| unavailable())?;
+            let bundle = inventory.duplicate_review_bundle(request.expected_observation_id, request.comparison_id, &policy, revision, started, duration).map_err(|_| unavailable())?;
+            let (after_revision, after_policy) = exclusions.summary_policy(started, duration).map_err(|_| unavailable())?;
+            if revision != after_revision || policy != after_policy || started.elapsed() >= duration { return Err(unavailable()); }
+            Ok(bundle)
+        }).await.map_err(|_| unavailable())??;
+        with_store(&state, Profile::Live, move |store| {
+            let _guard = guard;
+            store.append_duplicate_evidence(expected_revision, bundle.0, bundle.1)
+        })
+        .await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (guard, request, state, inventory, exclusions);
+        Err(GeneralPlanError {
+            code: "comparison_unavailable",
+            message: "Matching-file evidence import is unsupported on this platform.",
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImportPytestReviewItemsRequest {
+    expected_observation_id: InventoryItemId,
+    inspection_id: InventoryItemId,
+    expected_revision_id: RevisionId,
+}
+
+/// Imports only native-retained pytest format evidence as blocked review items.
+#[tauri::command]
+pub(crate) async fn import_pytest_review_items(
+    request: ImportPytestReviewItemsRequest,
+    state: tauri::State<'_, GeneralPlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
+    inventory: tauri::State<'_, crate::folder_inventory::FolderInventoryState>,
+    exclusions: tauri::State<'_, crate::global_exclusions::ExclusionState>,
+) -> Result<EditorSnapshot, GeneralPlanError> {
+    let guard = edit_guard(&demo)?;
+    #[cfg(unix)]
+    {
+        let inventory = inventory.inner().clone();
+        let exclusions = exclusions.inner().clone();
+        let expected_revision = request.expected_revision_id;
+        let bundle = tauri::async_runtime::spawn_blocking(move || {
+            let unavailable = || GeneralPlanError {
+                code: "pytest_evidence_unavailable",
+                message: "Pytest format evidence changed or is no longer retained. Inspect those records again before importing.",
+            };
+            let started = std::time::Instant::now();
+            let duration = std::time::Duration::from_secs(2);
+            let (revision, policy) = exclusions.summary_policy(started, duration).map_err(|_| unavailable())?;
+            let bundle = inventory.pytest_review_bundle(request.expected_observation_id, request.inspection_id, &policy, revision, started, duration).map_err(|_| unavailable())?;
+            let (after_revision, after_policy) = exclusions.summary_policy(started, duration).map_err(|_| unavailable())?;
+            if revision != after_revision || policy != after_policy || started.elapsed() >= duration { return Err(unavailable()); }
+            // Policy loading can perform I/O; validate the retained names again
+            // after it before handing metadata to the plan transaction.
+            let revalidated = inventory.pytest_review_bundle(request.expected_observation_id, request.inspection_id, &after_policy, after_revision, started, duration).map_err(|_| unavailable())?;
+            if revalidated != bundle || started.elapsed() >= duration { return Err(unavailable()); }
+            Ok(revalidated)
+        }).await.map_err(|_| unavailable())??;
+        with_store(&state, Profile::Live, move |store| {
+            let _guard = guard;
+            store.append_pytest_evidence(expected_revision, bundle)
+        })
+        .await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (guard, request, state, inventory, exclusions);
+        Err(GeneralPlanError {
+            code: "pytest_evidence_unavailable",
+            message: "Pytest evidence import is unsupported on this platform.",
+        })
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn edit_general_plan(
     request: EditRequest,
@@ -402,6 +597,56 @@ pub(crate) async fn add_selected_general_folder(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duplicate_import_accepts_only_native_references_and_revision() {
+        let observation = serde_json::to_value(disk_steward_core::InventoryItemId::new()).unwrap();
+        let comparison = serde_json::to_value(disk_steward_core::InventoryItemId::new()).unwrap();
+        let revision = serde_json::to_value(disk_steward_core::RevisionId::new()).unwrap();
+        let valid = serde_json::json!({"expectedObservationId":observation,"comparisonId":comparison,"expectedRevisionId":revision});
+        assert!(
+            serde_json::from_value::<super::ImportDuplicateReviewItemsRequest>(valid.clone())
+                .is_ok()
+        );
+        for (key, value) in [
+            ("path", serde_json::json!("/tmp/untrusted")),
+            ("items", serde_json::json!([])),
+            ("duplicateSets", serde_json::json!([])),
+            ("profile", serde_json::json!("pilot")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(
+                serde_json::from_value::<super::ImportDuplicateReviewItemsRequest>(invalid)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pytest_import_accepts_only_native_references_and_revision() {
+        let observation = serde_json::to_value(disk_steward_core::InventoryItemId::new()).unwrap();
+        let inspection = serde_json::to_value(disk_steward_core::InventoryItemId::new()).unwrap();
+        let revision = serde_json::to_value(disk_steward_core::RevisionId::new()).unwrap();
+        let valid = serde_json::json!({"expectedObservationId":observation,"inspectionId":inspection,"expectedRevisionId":revision});
+        assert!(
+            serde_json::from_value::<super::ImportPytestReviewItemsRequest>(valid.clone()).is_ok()
+        );
+        for (key, value) in [
+            ("path", serde_json::json!("/tmp/untrusted")),
+            ("items", serde_json::json!([])),
+            ("recordCount", serde_json::json!(2)),
+            ("records", serde_json::json!([])),
+            ("detectorVersion", serde_json::json!("forged")),
+            ("profile", serde_json::json!("pilot")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(
+                serde_json::from_value::<super::ImportPytestReviewItemsRequest>(invalid).is_err()
+            );
+        }
+    }
+
     use super::*;
     #[test]
     fn profile_and_edit_requests_cannot_supply_paths_or_approval() {
@@ -421,5 +666,119 @@ mod tests {
         let mut wrong_id = request;
         wrong_id["edit"]["itemId"] = serde_json::json!(ReviewId::new());
         assert!(serde_json::from_value::<EditRequest>(wrong_id).is_err());
+    }
+
+    #[test]
+    fn full_page_import_after_duplicate_subset_preserves_evidence_and_survivor() {
+        use disk_steward_plan_model::{
+            Blocker, Choice, DuplicateSet, EvidenceRef, InventoryItem, ItemKind, Suggestion,
+        };
+        let item = |label: &str| InventoryItem {
+            id: InventoryItemId::new(),
+            parent_id: None,
+            label: label.into(),
+            kind: ItemKind::File,
+            logical_bytes: Some(12),
+            recovery_lower_bytes: None,
+            recovery_upper_bytes: None,
+            storage_identity: None,
+            blockers: vec![Blocker {
+                code: "metadata_only".into(),
+                reason: "Observed metadata only".into(),
+            }],
+            evidence: vec![EvidenceRef {
+                id: disk_steward_core::EvidenceId::new(),
+                summary: "Metadata fixture".into(),
+            }],
+            suggestion: Suggestion {
+                choice: Choice::Keep,
+                rationale: "Keep".into(),
+            },
+        };
+        let first = item("first");
+        let second = item("second");
+        let third = item("third");
+        let mut compared = vec![first.clone(), second.clone()];
+        for item in &mut compared {
+            item.blockers.push(Blocker {
+                code: "read_only_comparison".into(),
+                reason: "Non-executable test comparison".into(),
+            });
+            item.evidence.push(EvidenceRef {
+                id: disk_steward_core::EvidenceId::new(),
+                summary: "Comparison fixture".into(),
+            });
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut store =
+            GeneralPlanStore::open(temp.path().join("plan.sqlite"), FixtureScale::EmptyReview)
+                .unwrap();
+        let empty = store.get_plan().unwrap();
+        let set_id = disk_steward_core::DuplicateGroupId::new();
+        let imported = store
+            .append_duplicate_evidence(
+                empty.revision_id,
+                compared,
+                vec![DuplicateSet {
+                    id: set_id,
+                    item_ids: vec![first.id, second.id],
+                    survivor_id: None,
+                }],
+            )
+            .unwrap();
+        let chosen = store
+            .edit(
+                imported.revision_id,
+                PlanEdit::SetDuplicateSurvivor {
+                    duplicate_set_id: set_id,
+                    survivor_id: first.id,
+                },
+            )
+            .unwrap()
+            .snapshot;
+        let after = append_new_observed_items(
+            &mut store,
+            chosen.revision_id,
+            vec![first.clone(), second.clone(), third.clone()],
+        )
+        .unwrap();
+        assert_eq!(after.items.len(), 3);
+        assert_eq!(after.duplicates, chosen.duplicates);
+        for old in &chosen.items {
+            assert_eq!(
+                after
+                    .items
+                    .iter()
+                    .find(|row| row.item_id == old.item_id)
+                    .unwrap(),
+                old
+            );
+        }
+        let again = append_new_observed_items(
+            &mut store,
+            after.revision_id,
+            vec![first, second, third.clone()],
+        )
+        .unwrap();
+        assert_eq!(again, after);
+        let undo = store.undo(after.revision_id).unwrap();
+        assert_eq!(undo.items, chosen.items);
+        assert_eq!(undo.duplicates, chosen.duplicates);
+        assert!(!undo.items.iter().any(|row| row.item_id == third.id));
+        assert!(!undo.execution_available);
+    }
+
+    #[test]
+    fn observed_import_request_is_only_two_typed_ids() {
+        let valid = serde_json::json!({
+            "expectedObservationId": InventoryItemId::new(),
+            "expectedRevisionId": RevisionId::new()
+        });
+        assert!(serde_json::from_value::<ImportObservedReviewItemsRequest>(valid.clone()).is_ok());
+        for field in ["path", "approved", "profile", "entryIds"] {
+            let mut invalid = valid.clone();
+            invalid[field] = serde_json::json!("forbidden");
+            assert!(serde_json::from_value::<ImportObservedReviewItemsRequest>(invalid).is_err());
+        }
     }
 }

@@ -630,15 +630,18 @@ dependencies = [
  "disk-steward-demo-execution",
  "disk-steward-exclusion-store",
  "disk-steward-fixture-purge",
+ "disk-steward-generated-evidence",
  "disk-steward-plan-model",
  "disk-steward-plan-store",
  "disk-steward-review-plan",
  "libc",
  "objc2",
  "objc2-foundation",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -679,6 +682,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "disk-steward-generated-evidence"
+version = "0.0.17"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

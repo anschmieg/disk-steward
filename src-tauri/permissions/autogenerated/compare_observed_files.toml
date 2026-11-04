@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-compare-observed-files"
+description = "Enables the compare_observed_files command without any pre-configured scope."
+commands.allow = ["compare_observed_files"]
+
+[[permission]]
+identifier = "deny-compare-observed-files"
+description = "Denies the compare_observed_files command without any pre-configured scope."
+commands.deny = ["compare_observed_files"]

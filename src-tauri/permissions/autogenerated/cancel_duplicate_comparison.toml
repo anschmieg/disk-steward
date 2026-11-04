@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cancel-duplicate-comparison"
+description = "Enables the cancel_duplicate_comparison command without any pre-configured scope."
+commands.allow = ["cancel_duplicate_comparison"]
+
+[[permission]]
+identifier = "deny-cancel-duplicate-comparison"
+description = "Denies the cancel_duplicate_comparison command without any pre-configured scope."
+commands.deny = ["cancel_duplicate_comparison"]

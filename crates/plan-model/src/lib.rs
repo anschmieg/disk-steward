@@ -25,6 +25,11 @@ pub const MAX_HISTORY: usize = 64;
 pub const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SERIALIZED_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_STATE_BYTES: usize = 24 * 1024 * 1024;
+const MAX_DUPLICATE_EVIDENCE_ITEMS: usize = 32;
+const MAX_DUPLICATE_EVIDENCE_SETS: usize = 16;
+const MAX_DUPLICATE_EVIDENCE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PYTEST_EVIDENCE_ITEMS: usize = 2;
+const MAX_PYTEST_EVIDENCE_FILE_BYTES: u64 = 64 * 1024;
 const REVIEW_VERSION: &str = "disk-steward-general-review-v1";
 
 /// Builds an isolated synthetic inventory. It never resolves or reads a path.
@@ -833,6 +838,274 @@ impl PlanEditor {
                 duplicate_sets: self.state.duplicate_sets.clone(),
             },
         )
+    }
+
+    /// Imports native-verified, read-only duplicate evidence without replacing
+    /// existing inventory metadata, user choices, membership, or survivor picks.
+    /// This operation is deliberately not representable as a renderer `PlanEdit`.
+    pub fn add_duplicate_evidence(
+        &mut self,
+        expected_revision: RevisionId,
+        incoming: Vec<InventoryItem>,
+        sets: Vec<DuplicateSet>,
+    ) -> Result<EditorSnapshot, EditError> {
+        self.check_revision(expected_revision)?;
+        if incoming.is_empty() && sets.is_empty() {
+            return Ok(self.snapshot());
+        }
+        if incoming.is_empty()
+            || sets.is_empty()
+            || incoming.len() > MAX_DUPLICATE_EVIDENCE_ITEMS
+            || sets.len() > MAX_DUPLICATE_EVIDENCE_SETS
+        {
+            return Err(EditError::InvalidInventory);
+        }
+
+        let mut incoming_ids = BTreeSet::new();
+        for item in &incoming {
+            if !incoming_ids.insert(item.id)
+                || item.kind != ItemKind::File
+                || item.parent_id.is_some()
+                || !item
+                    .logical_bytes
+                    .is_some_and(|bytes| bytes <= MAX_DUPLICATE_EVIDENCE_FILE_BYTES)
+                || item.suggestion.choice != Choice::Keep
+                || item.storage_identity.is_some()
+                || item.recovery_lower_bytes.is_some()
+                || item.recovery_upper_bytes.is_some()
+                || !item
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.code == "read_only_comparison")
+            {
+                return Err(EditError::InvalidInventory);
+            }
+            let mut evidence_ids = BTreeSet::new();
+            if item
+                .evidence
+                .iter()
+                .any(|evidence| !evidence_ids.insert(evidence.id))
+            {
+                return Err(EditError::InvalidInventory);
+            }
+        }
+
+        let mut set_ids = BTreeSet::new();
+        let mut covered_ids = BTreeSet::new();
+        for set in &sets {
+            if !set_ids.insert(set.id)
+                || set.survivor_id.is_some()
+                || set.item_ids.len() < 2
+                || set
+                    .item_ids
+                    .iter()
+                    .any(|id| !incoming_ids.contains(id) || !covered_ids.insert(*id))
+            {
+                return Err(EditError::InvalidInventory);
+            }
+        }
+        if covered_ids != incoming_ids {
+            return Err(EditError::InvalidInventory);
+        }
+
+        let mut next = self.state.clone();
+        for incoming_item in incoming {
+            if let Some(existing) = next
+                .items
+                .iter_mut()
+                .find(|item| item.id == incoming_item.id)
+            {
+                if existing.kind != incoming_item.kind
+                    || existing.parent_id != incoming_item.parent_id
+                    || existing.label != incoming_item.label
+                    || existing.logical_bytes != incoming_item.logical_bytes
+                    || existing.storage_identity.is_some()
+                    || existing.recovery_lower_bytes.is_some()
+                    || existing.recovery_upper_bytes.is_some()
+                {
+                    return Err(EditError::InvalidInventory);
+                }
+                for incoming_evidence in incoming_item.evidence {
+                    match existing
+                        .evidence
+                        .iter()
+                        .find(|evidence| evidence.id == incoming_evidence.id)
+                    {
+                        Some(existing_evidence) if existing_evidence != &incoming_evidence => {
+                            return Err(EditError::InvalidInventory);
+                        }
+                        Some(_) => {}
+                        None => existing.evidence.push(incoming_evidence),
+                    }
+                }
+                for blocker in incoming_item.blockers {
+                    if !existing.blockers.contains(&blocker) {
+                        existing.blockers.push(blocker);
+                    }
+                }
+            } else {
+                next.membership.insert(incoming_item.id, true);
+                next.items.push(incoming_item);
+            }
+        }
+
+        for incoming_set in sets {
+            if let Some(existing) = next
+                .duplicate_sets
+                .iter()
+                .find(|set| set.id == incoming_set.id)
+            {
+                let mut old_members = existing.item_ids.clone();
+                let mut new_members = incoming_set.item_ids.clone();
+                old_members.sort();
+                new_members.sort();
+                if old_members != new_members {
+                    return Err(EditError::InvalidInventory);
+                }
+                // Preserve the established survivor and member ordering.
+                continue;
+            }
+            let already_grouped: BTreeSet<_> = next
+                .duplicate_sets
+                .iter()
+                .flat_map(|set| set.item_ids.iter().copied())
+                .collect();
+            if incoming_set
+                .item_ids
+                .iter()
+                .any(|id| already_grouped.contains(id))
+            {
+                return Err(EditError::InvalidInventory);
+            }
+            next.duplicate_sets.push(incoming_set);
+        }
+
+        next.items.sort_by_key(|item| item.id);
+        next.duplicate_sets.sort_by_key(|set| set.id);
+        validate_state(&next).map_err(|error| match error {
+            ValidationError::SerializedStateTooLarge => EditError::SerializedStateTooLarge,
+            _ => EditError::InvalidInventory,
+        })?;
+        if next == self.state {
+            return Ok(self.snapshot());
+        }
+
+        let mut candidate = self.clone();
+        push_bounded(&mut candidate.undo, self.state.clone());
+        candidate.redo.clear();
+        candidate.state = next;
+        candidate.revision_id = RevisionId::new();
+        candidate.revision_number = candidate.revision_number.saturating_add(1);
+        trim_history(&mut candidate.undo, &mut candidate.redo);
+        candidate
+            .export_document_json()
+            .map_err(|_| EditError::SerializedStateTooLarge)?;
+        *self = candidate;
+        Ok(self.snapshot())
+    }
+
+    /// Additively imports native pytest-cache format evidence without changing
+    /// existing choices, membership, exclusions, or duplicate-set state. This
+    /// native-only operation is not representable as a renderer `PlanEdit`.
+    pub fn add_pytest_evidence(
+        &mut self,
+        expected_revision: RevisionId,
+        incoming: Vec<InventoryItem>,
+    ) -> Result<EditorSnapshot, EditError> {
+        self.check_revision(expected_revision)?;
+        if incoming.is_empty() || incoming.len() > MAX_PYTEST_EVIDENCE_ITEMS {
+            return Err(EditError::InvalidInventory);
+        }
+
+        let mut incoming_ids = BTreeSet::new();
+        for item in &incoming {
+            let mut evidence_ids = BTreeSet::new();
+            if !incoming_ids.insert(item.id)
+                || item.kind != ItemKind::File
+                || item.parent_id.is_some()
+                || !item
+                    .logical_bytes
+                    .is_some_and(|bytes| bytes <= MAX_PYTEST_EVIDENCE_FILE_BYTES)
+                || item.suggestion.choice != Choice::Keep
+                || item.storage_identity.is_some()
+                || item.recovery_lower_bytes.is_some()
+                || item.recovery_upper_bytes.is_some()
+                || item.evidence.is_empty()
+                || !item
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.code == "read_only_pytest")
+                || item
+                    .evidence
+                    .iter()
+                    .any(|evidence| !evidence_ids.insert(evidence.id))
+            {
+                return Err(EditError::InvalidInventory);
+            }
+        }
+
+        let mut next = self.state.clone();
+        for incoming_item in incoming {
+            if let Some(existing) = next
+                .items
+                .iter_mut()
+                .find(|item| item.id == incoming_item.id)
+            {
+                if existing.kind != incoming_item.kind
+                    || existing.parent_id != incoming_item.parent_id
+                    || existing.label != incoming_item.label
+                    || existing.logical_bytes != incoming_item.logical_bytes
+                    || existing.storage_identity.is_some()
+                    || existing.recovery_lower_bytes.is_some()
+                    || existing.recovery_upper_bytes.is_some()
+                {
+                    return Err(EditError::InvalidInventory);
+                }
+                for incoming_evidence in incoming_item.evidence {
+                    match existing
+                        .evidence
+                        .iter()
+                        .find(|evidence| evidence.id == incoming_evidence.id)
+                    {
+                        Some(existing_evidence) if existing_evidence != &incoming_evidence => {
+                            return Err(EditError::InvalidInventory);
+                        }
+                        Some(_) => {}
+                        None => existing.evidence.push(incoming_evidence),
+                    }
+                }
+                for blocker in incoming_item.blockers {
+                    if !existing.blockers.contains(&blocker) {
+                        existing.blockers.push(blocker);
+                    }
+                }
+            } else {
+                next.membership.insert(incoming_item.id, true);
+                next.items.push(incoming_item);
+            }
+        }
+
+        next.items.sort_by_key(|item| item.id);
+        validate_state(&next).map_err(|error| match error {
+            ValidationError::SerializedStateTooLarge => EditError::SerializedStateTooLarge,
+            _ => EditError::InvalidInventory,
+        })?;
+        if next == self.state {
+            return Ok(self.snapshot());
+        }
+
+        let mut candidate = self.clone();
+        push_bounded(&mut candidate.undo, self.state.clone());
+        candidate.redo.clear();
+        candidate.state = next;
+        candidate.revision_id = RevisionId::new();
+        candidate.revision_number = candidate.revision_number.saturating_add(1);
+        trim_history(&mut candidate.undo, &mut candidate.redo);
+        candidate
+            .export_document_json()
+            .map_err(|_| EditError::SerializedStateTooLarge)?;
+        *self = candidate;
+        Ok(self.snapshot())
     }
 
     pub fn freeze_review(&self, expected_revision: RevisionId) -> Result<FrozenReview, EditError> {
@@ -1785,6 +2058,403 @@ mod tests {
 
     fn current(editor: &PlanEditor) -> RevisionId {
         editor.snapshot().revision_id
+    }
+
+    fn comparison_item(mut value: InventoryItem) -> InventoryItem {
+        value.recovery_lower_bytes = None;
+        value.recovery_upper_bytes = None;
+        value.storage_identity = None;
+        value.blockers.push(Blocker {
+            code: "read_only_comparison".into(),
+            reason: "Read-only duplicate comparison evidence".into(),
+        });
+        value.evidence.push(EvidenceRef {
+            id: EvidenceId::new(),
+            summary: "Native exact-content comparison; no cleanup authority".into(),
+        });
+        value.suggestion.choice = Choice::Keep;
+        value
+    }
+
+    fn pytest_evidence_item(mut value: InventoryItem, evidence_id: EvidenceId) -> InventoryItem {
+        value.recovery_lower_bytes = None;
+        value.recovery_upper_bytes = None;
+        value.storage_identity = None;
+        value.blockers.push(Blocker {
+            code: "read_only_pytest".into(),
+            reason: "Read-only pytest cache format evidence; no cleanup authority".into(),
+        });
+        value.evidence.push(EvidenceRef {
+            id: evidence_id,
+            summary: "pytest-cache-format-v1; reference 9.2.0; format only".into(),
+        });
+        value.suggestion.choice = Choice::Keep;
+        value
+    }
+
+    #[test]
+    fn pytest_evidence_enriches_and_adds_items_without_replacing_user_state() {
+        let mut existing = item("nodeids", None, ItemKind::File, Choice::Include, 64);
+        existing.recovery_lower_bytes = None;
+        existing.recovery_upper_bytes = None;
+        let other = item("another", None, ItemKind::File, Choice::Include, 64);
+        let duplicate_id = DuplicateGroupId::new();
+        let set = DuplicateSet {
+            id: duplicate_id,
+            item_ids: vec![existing.id, other.id],
+            survivor_id: None,
+        };
+        let mut editor = PlanEditor::new(PlanInput {
+            plan_id: PlanId::new(),
+            items: vec![existing.clone(), other],
+            groups: vec![],
+            duplicate_sets: vec![set],
+        })
+        .unwrap();
+        editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetChoice {
+                    item_id: existing.id,
+                    choice: Choice::Keep,
+                },
+            )
+            .unwrap();
+        editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetMembership {
+                    item_id: existing.id,
+                    in_plan: false,
+                },
+            )
+            .unwrap();
+        editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetDuplicateSurvivor {
+                    duplicate_set_id: duplicate_id,
+                    survivor_id: existing.id,
+                },
+            )
+            .unwrap();
+        let before = editor.snapshot();
+        let new_item = pytest_evidence_item(
+            item("lastfailed", None, ItemKind::File, Choice::Include, 48),
+            EvidenceId::new(),
+        );
+        let evidence_id = EvidenceId::new();
+        let incoming_existing = pytest_evidence_item(existing.clone(), evidence_id);
+        let incoming = vec![incoming_existing.clone(), new_item.clone()];
+        let enriched = editor
+            .add_pytest_evidence(before.revision_id, incoming.clone())
+            .unwrap();
+        let old_row = enriched
+            .items
+            .iter()
+            .find(|row| row.item_id == existing.id)
+            .unwrap();
+        assert_eq!(
+            old_row.suggestion,
+            before
+                .items
+                .iter()
+                .find(|row| row.item_id == existing.id)
+                .unwrap()
+                .suggestion
+        );
+        assert!(!old_row.in_plan);
+        assert_eq!(old_row.user_choice, Some(Choice::Keep));
+        assert!(old_row
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "read_only_pytest"));
+        assert_eq!(old_row.evidence.len(), existing.evidence.len() + 1);
+        assert_eq!(
+            enriched
+                .duplicates
+                .iter()
+                .find(|row| row.id == duplicate_id)
+                .unwrap()
+                .survivor_id,
+            Some(existing.id)
+        );
+        let new_row = enriched
+            .items
+            .iter()
+            .find(|row| row.item_id == new_item.id)
+            .unwrap();
+        assert!(new_row.in_plan);
+        assert_eq!(new_row.suggestion.choice, Choice::Keep);
+        let idempotent = editor
+            .add_pytest_evidence(enriched.revision_id, incoming)
+            .unwrap();
+        assert_eq!(idempotent.revision_id, enriched.revision_id);
+        let mut conflicting = incoming_existing;
+        conflicting.evidence.last_mut().unwrap().summary = "different evidence for same ID".into();
+        assert_eq!(
+            editor.add_pytest_evidence(idempotent.revision_id, vec![conflicting]),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(editor.snapshot(), idempotent);
+    }
+
+    #[test]
+    fn pytest_evidence_rejects_stale_unsafe_duplicate_and_oversize_batches() {
+        let mut editor = PlanEditor::new(PlanInput {
+            plan_id: PlanId::new(),
+            items: vec![],
+            groups: vec![],
+            duplicate_sets: vec![],
+        })
+        .unwrap();
+        let before = editor.snapshot();
+        let valid = pytest_evidence_item(
+            item("cache", None, ItemKind::File, Choice::Include, 64),
+            EvidenceId::new(),
+        );
+        assert_eq!(
+            editor.add_pytest_evidence(RevisionId::new(), vec![valid.clone()]),
+            Err(EditError::StaleRevision)
+        );
+        let mut unsafe_authority = valid.clone();
+        unsafe_authority.storage_identity = Some("shared".into());
+        assert_eq!(
+            editor.add_pytest_evidence(before.revision_id, vec![unsafe_authority]),
+            Err(EditError::InvalidInventory)
+        );
+        let mut too_large = valid.clone();
+        too_large.logical_bytes = Some(65_537);
+        assert_eq!(
+            editor.add_pytest_evidence(before.revision_id, vec![too_large]),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(
+            editor.add_pytest_evidence(
+                before.revision_id,
+                vec![valid.clone(), valid.clone(), valid]
+            ),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(editor.snapshot(), before);
+    }
+
+    #[test]
+    fn duplicate_evidence_enriches_additively_as_one_undoable_blocked_change() {
+        let mut first = item("first.bin", None, ItemKind::File, Choice::Include, 10);
+        first.recovery_lower_bytes = None;
+        first.recovery_upper_bytes = None;
+        let mut second = item("second.bin", None, ItemKind::File, Choice::Include, 10);
+        second.recovery_lower_bytes = None;
+        second.recovery_upper_bytes = None;
+        let set_id = DuplicateGroupId::new();
+        let set = DuplicateSet {
+            id: set_id,
+            item_ids: vec![first.id, second.id],
+            survivor_id: None,
+        };
+        let input = PlanInput {
+            plan_id: PlanId::new(),
+            items: vec![first.clone(), second.clone()],
+            groups: vec![],
+            duplicate_sets: vec![set.clone()],
+        };
+        let mut editor = PlanEditor::new(input).unwrap();
+        editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetChoice {
+                    item_id: first.id,
+                    choice: Choice::Keep,
+                },
+            )
+            .unwrap();
+        editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetMembership {
+                    item_id: second.id,
+                    in_plan: false,
+                },
+            )
+            .unwrap();
+        editor
+            .edit(
+                current(&editor),
+                PlanEdit::SetDuplicateSurvivor {
+                    duplicate_set_id: set_id,
+                    survivor_id: first.id,
+                },
+            )
+            .unwrap();
+        let before = editor.snapshot();
+        let third = item("third.bin", None, ItemKind::File, Choice::Include, 20);
+        let fourth = item("fourth.bin", None, ItemKind::File, Choice::Include, 20);
+        let new_set = DuplicateSet {
+            id: DuplicateGroupId::new(),
+            item_ids: vec![third.id, fourth.id],
+            survivor_id: None,
+        };
+        let incoming = vec![
+            comparison_item(first.clone()),
+            comparison_item(second.clone()),
+            comparison_item(third.clone()),
+            comparison_item(fourth.clone()),
+        ];
+        let merged = editor
+            .add_duplicate_evidence(
+                before.revision_id,
+                incoming.clone(),
+                vec![set.clone(), new_set.clone()],
+            )
+            .unwrap();
+        assert_eq!(merged.items.len(), 4);
+        assert!(!merged.execution_available);
+        for id in [first.id, second.id, third.id, fourth.id] {
+            let row = merged.items.iter().find(|row| row.item_id == id).unwrap();
+            assert!(row
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "read_only_comparison"));
+            if let Some(previous) = before.items.iter().find(|previous| previous.item_id == id) {
+                assert_eq!(row.suggestion, previous.suggestion);
+            } else {
+                assert_eq!(row.suggestion.choice, Choice::Keep);
+            }
+            assert!(!row.effective_selected);
+        }
+        assert_eq!(
+            merged
+                .items
+                .iter()
+                .find(|row| row.item_id == first.id)
+                .unwrap()
+                .user_choice,
+            Some(Choice::Keep)
+        );
+        assert!(
+            !merged
+                .items
+                .iter()
+                .find(|row| row.item_id == second.id)
+                .unwrap()
+                .in_plan
+        );
+        assert_eq!(
+            merged
+                .duplicates
+                .iter()
+                .find(|row| row.id == set_id)
+                .unwrap()
+                .survivor_id,
+            Some(first.id)
+        );
+        let duplicate_retry = editor
+            .add_duplicate_evidence(merged.revision_id, incoming, vec![set, new_set])
+            .unwrap();
+        assert_eq!(duplicate_retry.revision_id, merged.revision_id);
+        let overlapping = vec![
+            comparison_item(first.clone()),
+            comparison_item(second.clone()),
+            comparison_item(third.clone()),
+            comparison_item(fourth.clone()),
+        ];
+        let overlap_groups = vec![
+            DuplicateSet {
+                id: DuplicateGroupId::new(),
+                item_ids: vec![first.id, third.id],
+                survivor_id: None,
+            },
+            DuplicateSet {
+                id: DuplicateGroupId::new(),
+                item_ids: vec![second.id, fourth.id],
+                survivor_id: None,
+            },
+        ];
+        assert_eq!(
+            editor.add_duplicate_evidence(duplicate_retry.revision_id, overlapping, overlap_groups),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(editor.snapshot(), duplicate_retry);
+        let undone = editor.undo(merged.revision_id).unwrap();
+        assert_eq!(undone.items.len(), before.items.len());
+        assert_eq!(
+            undone
+                .duplicates
+                .iter()
+                .find(|row| row.id == set_id)
+                .unwrap()
+                .survivor_id,
+            Some(first.id)
+        );
+        let redone = editor.redo(undone.revision_id).unwrap();
+        assert_eq!(redone.items.len(), 4);
+        assert_eq!(
+            redone
+                .duplicates
+                .iter()
+                .find(|row| row.id == set_id)
+                .unwrap()
+                .survivor_id,
+            Some(first.id)
+        );
+    }
+
+    #[test]
+    fn duplicate_evidence_rejects_invalid_sets_and_stale_revision_without_mutation() {
+        let mut editor = PlanEditor::new(PlanInput {
+            plan_id: PlanId::new(),
+            items: vec![],
+            groups: vec![],
+            duplicate_sets: vec![],
+        })
+        .unwrap();
+        let before = editor.snapshot();
+        let left = comparison_item(item("left", None, ItemKind::File, Choice::Keep, 5));
+        let right = comparison_item(item("right", None, ItemKind::File, Choice::Keep, 5));
+        let set = DuplicateSet {
+            id: DuplicateGroupId::new(),
+            item_ids: vec![left.id, right.id],
+            survivor_id: None,
+        };
+        assert_eq!(
+            editor.add_duplicate_evidence(
+                RevisionId::new(),
+                vec![left.clone(), right.clone()],
+                vec![set.clone()]
+            ),
+            Err(EditError::StaleRevision)
+        );
+        assert_eq!(
+            editor.add_duplicate_evidence(
+                before.revision_id,
+                vec![left.clone(), right.clone()],
+                vec![]
+            ),
+            Err(EditError::InvalidInventory)
+        );
+        let mut unsafe_item = right.clone();
+        unsafe_item.suggestion.choice = Choice::Include;
+        assert_eq!(
+            editor.add_duplicate_evidence(
+                before.revision_id,
+                vec![left.clone(), unsafe_item],
+                vec![set.clone()]
+            ),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(
+            editor.add_duplicate_evidence(
+                before.revision_id,
+                vec![left.clone(), right.clone()],
+                vec![DuplicateSet {
+                    item_ids: vec![left.id, left.id],
+                    ..set
+                }]
+            ),
+            Err(EditError::InvalidInventory)
+        );
+        assert_eq!(editor.snapshot(), before);
     }
 
     #[test]
