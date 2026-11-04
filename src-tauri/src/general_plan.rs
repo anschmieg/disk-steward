@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use disk_steward_core::{ReviewId, RevisionId};
+use disk_steward_core::{InventoryItemId, ReviewId, RevisionId};
 use disk_steward_plan_model::{EditOutcome, EditorSnapshot, FrozenReview, InventoryItem, PlanEdit};
 use disk_steward_plan_store::{FixtureScale, GeneralPlanStore, ReviewSummary, StoreError};
 use serde::{Deserialize, Serialize};
@@ -18,18 +18,21 @@ use tauri_plugin_dialog::DialogExt;
 pub(crate) enum Profile {
     Pilot,
     Stress,
+    Live,
 }
 impl Profile {
     fn filename(self) -> &'static str {
         match self {
             Self::Pilot => "editor-pilot-v1.sqlite3",
             Self::Stress => "editor-stress-v1.sqlite3",
+            Self::Live => "editor-live-v1.sqlite3",
         }
     }
     fn scale(self) -> FixtureScale {
         match self {
             Self::Pilot => FixtureScale::Pilot1000,
             Self::Stress => FixtureScale::Stress10000,
+            Self::Live => FixtureScale::EmptyReview,
         }
     }
 }
@@ -84,6 +87,12 @@ pub(crate) struct RevisionRequest {
 pub(crate) struct SavedReviewRequest {
     profile: Profile,
     review_id: ReviewId,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ImportObservedReviewItemsRequest {
+    expected_observation_id: InventoryItemId,
+    expected_revision_id: RevisionId,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -164,6 +173,45 @@ pub(crate) async fn get_general_plan(
     state: tauri::State<'_, GeneralPlanState>,
 ) -> Result<EditorSnapshot, GeneralPlanError> {
     with_store(&state, request.profile, |store| store.get_plan()).await
+}
+
+/// Imports the exact latest backend-held immediate-entry observation into the
+/// separate empty live review workspace as blocked metadata only.
+#[tauri::command]
+pub(crate) async fn import_observed_review_items(
+    request: ImportObservedReviewItemsRequest,
+    state: tauri::State<'_, GeneralPlanState>,
+    demo: tauri::State<'_, crate::fixture_demo::FixtureDemoState>,
+    inventory: tauri::State<'_, crate::folder_inventory::FolderInventoryState>,
+) -> Result<EditorSnapshot, GeneralPlanError> {
+    let guard = edit_guard(&demo)?;
+    let inventory = inventory.inner().clone();
+    let items = inventory
+        .blocked_items_for_observation(request.expected_observation_id)
+        .map_err(|reason| match reason {
+            "stale_observation" => GeneralPlanError {
+                code: "stale_observation",
+                message: "The folder observation changed. Inspect it again before importing.",
+            },
+            "no_importable_entries" => GeneralPlanError {
+                code: "no_importable_entries",
+                message: "This observation has no supported file or folder entries to import.",
+            },
+            "unsafe_observed_size" => GeneralPlanError {
+                code: "unsafe_observed_size",
+                message: "An observed logical size exceeds the review editor's safe range. Nothing was imported.",
+            },
+            _ => GeneralPlanError {
+                code: "observation_unavailable",
+                message: "The selected-folder observation is unavailable. Inspect it again.",
+            },
+        })?;
+    let expected_revision_id = request.expected_revision_id;
+    with_store(&state, Profile::Live, move |store| {
+        let _guard = guard;
+        store.append_items(expected_revision_id, items)
+    })
+    .await
 }
 #[tauri::command]
 pub(crate) async fn edit_general_plan(
@@ -421,5 +469,19 @@ mod tests {
         let mut wrong_id = request;
         wrong_id["edit"]["itemId"] = serde_json::json!(ReviewId::new());
         assert!(serde_json::from_value::<EditRequest>(wrong_id).is_err());
+    }
+
+    #[test]
+    fn observed_import_request_is_only_two_typed_ids() {
+        let valid = serde_json::json!({
+            "expectedObservationId": InventoryItemId::new(),
+            "expectedRevisionId": RevisionId::new()
+        });
+        assert!(serde_json::from_value::<ImportObservedReviewItemsRequest>(valid.clone()).is_ok());
+        for field in ["path", "approved", "profile", "entryIds"] {
+            let mut invalid = valid.clone();
+            invalid[field] = serde_json::json!("forbidden");
+            assert!(serde_json::from_value::<ImportObservedReviewItemsRequest>(invalid).is_err());
+        }
     }
 }

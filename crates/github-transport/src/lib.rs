@@ -6,11 +6,13 @@
 
 mod advertised_graph;
 mod attempt_context;
+mod ingress;
 mod required_refs;
 pub use advertised_graph::{
     decode_advertised_pack, AdvertisedPackReport, NamedRefCoverageReport, RemoteRefMismatch,
     RequiredObjectCoverageReport,
 };
+pub use ingress::TransportIngressObserver;
 pub use required_refs::{RequiredRefEntry, RequiredRefInput, RequiredRefManifest};
 mod graph;
 pub use graph::{check_pack_graph_closure, PackGraphReport};
@@ -504,6 +506,13 @@ pub struct GitHubTransport {
 }
 
 impl GitHubTransport {
+    /// Return read-only ingress telemetry bound to this exact attempt.
+    /// The observer retains only the byte counter and attempt identity; it has
+    /// no transport, cancellation, credential, network, or storage controls.
+    pub fn ingress_observer(&self) -> TransportIngressObserver {
+        TransportIngressObserver::new(Arc::clone(&self.budget.used), self.context.clone())
+    }
+
     /// Observe references advertised by Git protocol v2 `ls-refs` and finalize
     /// HTTP framing in the same consuming operation. Returned refs are present
     /// only when both Git protocol parsing and HTTP framing completed. This is
@@ -2157,6 +2166,7 @@ mod tests {
     mod git_interop;
     mod graph_tests;
     mod inflate_tests;
+    mod ingress_observer_tests;
     mod object_identity_tests;
     mod pack_tests;
     mod required_refs_tests;

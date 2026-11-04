@@ -7,10 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use disk_steward_core::{ReviewId, RevisionId};
+use disk_steward_core::{PlanId, ReviewId, RevisionId};
 use disk_steward_plan_model::{
     synthetic_fixture, EditError, EditOutcome, EditorSnapshot, FrozenReview, InventoryItem,
-    PlanEdit, PlanEditor, ValidationError, MAX_SERIALIZED_BYTES,
+    PlanEdit, PlanEditor, PlanInput, ValidationError, MAX_SERIALIZED_BYTES,
 };
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 const APP_ID: i64 = 0x4453_5053; // DSPS
 const SCHEMA_VERSION: i64 = 1;
 const MAX_REVIEWS: i64 = 16;
+const MAX_SAFE_JS_LOGICAL_BYTES: u64 = 9_007_199_254_740_991;
 const OPEN_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REVIEW_CONTRACT: &str = "disk-steward-general-review-v1";
 
@@ -29,18 +30,27 @@ const REVIEW_CONTRACT: &str = "disk-steward-general-review-v1";
 pub enum FixtureScale {
     Pilot1000,
     Stress10000,
+    EmptyReview,
 }
 impl FixtureScale {
     const fn profile(self) -> &'static str {
         match self {
             Self::Pilot1000 => "pilot_1000",
             Self::Stress10000 => "stress_10000",
+            Self::EmptyReview => "live_empty",
         }
     }
     const fn item_count(self) -> usize {
         match self {
             Self::Pilot1000 => 1_000,
             Self::Stress10000 => 10_000,
+            Self::EmptyReview => 0,
+        }
+    }
+    const fn group_count(self) -> usize {
+        match self {
+            Self::Pilot1000 | Self::Stress10000 => 25,
+            Self::EmptyReview => 0,
         }
     }
 }
@@ -196,13 +206,38 @@ impl GeneralPlanStore {
         expected_revision: RevisionId,
         item: InventoryItem,
     ) -> StoreResult<EditorSnapshot> {
+        self.append_items(expected_revision, vec![item])
+    }
+
+    /// Atomically appends a bounded batch of trusted inventory records as one
+    /// editor operation and one undo step. This accepts no paths or execution
+    /// authority.
+    pub fn append_items(
+        &mut self,
+        expected_revision: RevisionId,
+        items: Vec<InventoryItem>,
+    ) -> StoreResult<EditorSnapshot> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (mut editor, _) = load_editor(&tx)?;
         validate_all_reviews(&tx, &editor)?;
         check_revision(editor.snapshot().revision_id, expected_revision)?;
-        let snapshot = editor.add_items(expected_revision, vec![item])?;
+        let current = editor.snapshot();
+        let existing_total = current
+            .items
+            .iter()
+            .filter_map(|item| item.logical_bytes)
+            .try_fold(0u64, u64::checked_add)
+            .filter(|total| *total <= MAX_SAFE_JS_LOGICAL_BYTES)
+            .ok_or(StoreError::DomainEdit(EditError::InvalidInventory))?;
+        items
+            .iter()
+            .filter_map(|item| item.logical_bytes)
+            .try_fold(existing_total, u64::checked_add)
+            .filter(|total| *total <= MAX_SAFE_JS_LOGICAL_BYTES)
+            .ok_or(StoreError::DomainEdit(EditError::InvalidInventory))?;
+        let snapshot = editor.add_items(expected_revision, items)?;
         if snapshot.revision_id != expected_revision {
             save_editor(&tx, &editor)?;
         }
@@ -344,13 +379,28 @@ fn initialize(c: &mut Connection, scale: FixtureScale) -> StoreResult<()> {
     let objects = object_count(&tx)?;
     if app == 0 && version == 0 && objects == 0 {
         tx.execute_batch(&format!("{META};{DOC};{REVIEWS};"))?;
-        let fixture = synthetic_fixture(scale.item_count(), 25)?;
-        let editor = PlanEditor::new(fixture)?;
+        let input = match scale {
+            FixtureScale::EmptyReview => PlanInput {
+                plan_id: PlanId::new(),
+                items: Vec::new(),
+                groups: Vec::new(),
+                duplicate_sets: Vec::new(),
+            },
+            FixtureScale::Pilot1000 => synthetic_fixture(scale.item_count(), scale.group_count())?,
+            FixtureScale::Stress10000 => {
+                synthetic_fixture(scale.item_count(), scale.group_count())?
+            }
+        };
+        let editor = PlanEditor::new(input)?;
         let snapshot = editor.snapshot();
         let archive = editor.export_document_json()?;
         tx.execute(
-            "INSERT INTO store_metadata VALUES(1,?1,?2,25)",
-            params![scale.profile(), scale.item_count() as i64],
+            "INSERT INTO store_metadata VALUES(1,?1,?2,?3)",
+            params![
+                scale.profile(),
+                scale.item_count() as i64,
+                scale.group_count() as i64
+            ],
         )?;
         let archive_hash = sha256(&archive);
         tx.execute(
@@ -374,7 +424,10 @@ fn initialize(c: &mut Connection, scale: FixtureScale) -> StoreResult<()> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    if profile != scale.profile() || items != scale.item_count() as i64 || groups != 25 {
+    if profile != scale.profile()
+        || items != scale.item_count() as i64
+        || groups != scale.group_count() as i64
+    {
         return Err(StoreError::FixtureProfileMismatch);
     }
     let (editor, _) = load_editor(&tx)?;
@@ -439,6 +492,7 @@ fn load_editor(c: &Connection) -> StoreResult<(PlanEditor, StoredDocument)> {
     let expected_profile = match (profile.as_str(), expected_items, expected_groups) {
         ("pilot_1000", 1_000, 25) => FixtureScale::Pilot1000,
         ("stress_10000", 10_000, 25) => FixtureScale::Stress10000,
+        ("live_empty", 0, 0) => FixtureScale::EmptyReview,
         _ => return Err(StoreError::CorruptData),
     };
     let loaded: rusqlite::Result<(String, i64, Vec<u8>, String)> = c.query_row(
@@ -459,7 +513,7 @@ fn load_editor(c: &Connection) -> StoreResult<(PlanEditor, StoredDocument)> {
     if id_string(snap.revision_id)? != revision_id
         || i64::try_from(snap.revision_number).ok() != Some(revision_number)
         || snap.items.len() < expected_profile.item_count()
-        || snap.groups.len() != 25
+        || snap.groups.len() != expected_profile.group_count()
     {
         return Err(StoreError::CorruptData);
     }
@@ -779,6 +833,176 @@ mod tests {
             Err(StoreError::DomainEdit(EditError::InvalidInventory))
         ));
         assert_eq!(full.get_plan().unwrap(), full_before);
+    }
+
+    #[test]
+    fn empty_live_review_seed_reopens_without_resetting_fixture_profiles() {
+        let (_d, path) = db();
+        let empty = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let initial = empty.get_plan().unwrap();
+        assert!(initial.items.is_empty());
+        assert!(initial.groups.is_empty());
+        assert!(initial.duplicates.is_empty());
+        drop(empty);
+
+        let reopened = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), initial);
+        assert!(matches!(
+            GeneralPlanStore::open(&path, FixtureScale::Pilot1000),
+            Err(StoreError::FixtureProfileMismatch)
+        ));
+        assert_eq!(
+            GeneralPlanStore::open(&path, FixtureScale::EmptyReview)
+                .unwrap()
+                .get_plan()
+                .unwrap(),
+            initial
+        );
+
+        let (_d, fixture_path) = db();
+        let fixture = GeneralPlanStore::open(&fixture_path, FixtureScale::Pilot1000).unwrap();
+        let fixture_before = fixture.get_plan().unwrap();
+        drop(fixture);
+        assert!(matches!(
+            GeneralPlanStore::open(&fixture_path, FixtureScale::EmptyReview),
+            Err(StoreError::FixtureProfileMismatch)
+        ));
+        assert_eq!(
+            GeneralPlanStore::open(&fixture_path, FixtureScale::Pilot1000)
+                .unwrap()
+                .get_plan()
+                .unwrap(),
+            fixture_before
+        );
+    }
+
+    #[test]
+    fn batch_append_is_atomic_one_undo_step_and_persists_review_history() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let before = store.get_plan().unwrap();
+
+        let first = metadata_only_item("observed-file-a");
+        let second = metadata_only_item("observed-file-b");
+        let mut duplicate_batch = vec![first.clone(), metadata_only_item("observed-file-c")];
+        duplicate_batch[1].id = first.id;
+        assert!(matches!(
+            store.append_items(before.revision_id, duplicate_batch),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(store.get_plan().unwrap(), before);
+        assert!(matches!(
+            store.append_items(RevisionId::new(), vec![first.clone(), second.clone()]),
+            Err(StoreError::StaleRevision)
+        ));
+        assert_eq!(store.get_plan().unwrap(), before);
+
+        let appended = store
+            .append_items(before.revision_id, vec![first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(appended.items.len(), 2);
+        assert!(appended.items.iter().any(|item| item.item_id == first.id));
+        assert!(appended.items.iter().any(|item| item.item_id == second.id));
+        assert_eq!(appended.revision_number, before.revision_number + 1);
+        let undone = store.undo(appended.revision_id).unwrap();
+        assert!(undone.items.is_empty());
+        drop(store);
+
+        let mut reopened = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), undone);
+        let redone = reopened.redo(undone.revision_id).unwrap();
+        assert_eq!(redone.items, appended.items);
+        assert_eq!(redone.totals, appended.totals);
+        assert_ne!(redone.revision_id, appended.revision_id);
+        assert_eq!(redone.revision_number, appended.revision_number + 2);
+        let review = reopened.freeze_review(redone.revision_id).unwrap();
+        assert!(review.verify_content_hash());
+        drop(reopened);
+        let reopened = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), redone);
+        assert_eq!(reopened.get_saved_review(review.review_id).unwrap(), review);
+    }
+
+    #[test]
+    fn append_batch_enforces_safe_total_across_live_plan_and_keeps_history() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let empty = store.get_plan().unwrap();
+        let mut first = metadata_only_item("near-safe-limit");
+        first.logical_bytes = Some(MAX_SAFE_JS_LOGICAL_BYTES - 1);
+        let one = store.append_items(empty.revision_id, vec![first]).unwrap();
+        let earlier_review = store.freeze_review(one.revision_id).unwrap();
+
+        let mut second = metadata_only_item("last-safe-byte");
+        second.logical_bytes = Some(1);
+        let at_limit = store.append_items(one.revision_id, vec![second]).unwrap();
+        assert_eq!(
+            at_limit
+                .items
+                .iter()
+                .filter_map(|item| item.logical_bytes)
+                .sum::<u64>(),
+            MAX_SAFE_JS_LOGICAL_BYTES
+        );
+        let mut extra = metadata_only_item("one-byte-over");
+        extra.logical_bytes = Some(1);
+        assert!(matches!(
+            store.append_items(at_limit.revision_id, vec![extra]),
+            Err(StoreError::DomainEdit(EditError::InvalidInventory))
+        ));
+        assert_eq!(store.get_plan().unwrap(), at_limit);
+        assert_eq!(
+            store.get_saved_review(earlier_review.review_id).unwrap(),
+            earlier_review
+        );
+
+        let undone = store.undo(at_limit.revision_id).unwrap();
+        assert_eq!(undone.items.len(), 1);
+        drop(store);
+        let mut reopened = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        assert_eq!(reopened.get_plan().unwrap(), undone);
+        let redone = reopened.redo(undone.revision_id).unwrap();
+        assert_eq!(redone.items, at_limit.items);
+        assert_eq!(redone.totals, at_limit.totals);
+        assert_ne!(redone.revision_id, at_limit.revision_id);
+        assert_eq!(redone.revision_number, at_limit.revision_number + 2);
+        assert_eq!(
+            reopened.get_saved_review(earlier_review.review_id).unwrap(),
+            earlier_review
+        );
+    }
+
+    #[test]
+    fn removed_items_still_reserve_safe_integer_headroom_for_future_restore() {
+        let (_d, path) = db();
+        let mut store = GeneralPlanStore::open(&path, FixtureScale::EmptyReview).unwrap();
+        let empty = store.get_plan().unwrap();
+        let mut first = metadata_only_item("retained-logical-headroom");
+        first.logical_bytes = Some(MAX_SAFE_JS_LOGICAL_BYTES);
+        let id = first.id;
+        let added = store.append_items(empty.revision_id, vec![first]).unwrap();
+        let removed = store
+            .edit(
+                added.revision_id,
+                PlanEdit::SetMembership {
+                    item_id: id,
+                    in_plan: false,
+                },
+            )
+            .unwrap()
+            .snapshot;
+        assert_eq!(removed.totals.in_plan_logical_bytes, 0);
+        let mut another = metadata_only_item("one-byte");
+        another.logical_bytes = Some(1);
+        assert!(store
+            .append_items(removed.revision_id, vec![another])
+            .is_err());
+        assert_eq!(store.get_plan().unwrap(), removed);
+        let restored = store.undo(removed.revision_id).unwrap();
+        assert_eq!(
+            restored.totals.in_plan_logical_bytes,
+            MAX_SAFE_JS_LOGICAL_BYTES
+        );
     }
 
     #[test]
