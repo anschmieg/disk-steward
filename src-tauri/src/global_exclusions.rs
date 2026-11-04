@@ -31,6 +31,7 @@ fn store_error(error: disk_steward_exclusion_store::RegistryError) -> ExclusionE
     };
     ExclusionError { code, message }
 }
+#[derive(Clone)]
 pub(crate) struct ExclusionState(Arc<Mutex<Result<Registry, ExclusionError>>>);
 impl ExclusionState {
     pub(crate) fn open(app: &tauri::AppHandle) -> Self {
@@ -250,5 +251,108 @@ mod tests {
         assert!(displayed.contains("\\u{206a}"));
         assert!(!displayed.contains('\u{206a}'));
         assert!(!displayed.contains('\u{202e}'));
+    }
+}
+
+#[cfg(unix)]
+pub(crate) use crate::summary_exclusions::SummaryExclusionPolicy;
+
+impl ExclusionState {
+    /// Caller holds NativeCheckGuard. Private bindings never enter renderer IPC.
+    #[cfg(unix)]
+    pub(crate) fn summary_policy(
+        &self,
+        started: std::time::Instant,
+        duration: std::time::Duration,
+    ) -> Result<(RevisionId, SummaryExclusionPolicy), &'static str> {
+        let fail =
+            "Remembered exclusions could not be verified. Review saved rules before summarizing.";
+        if started.elapsed() >= duration {
+            return Err(fail);
+        }
+        let locked = self.0.lock().map_err(|_| fail)?;
+        if started.elapsed() >= duration {
+            return Err(fail);
+        }
+        let registry = locked.as_ref().map_err(|_| fail)?;
+        let snapshot = registry.snapshot().map_err(|_| fail)?;
+        let mut identities = std::collections::BTreeSet::new();
+        for entry in snapshot.entries {
+            if started.elapsed() >= duration {
+                return Err(fail);
+            }
+            let binding = registry.get_binding(entry.id).map_err(|_| fail)?;
+            let path = path_from_locator(binding.locator_bytes()).map_err(|_| fail)?;
+            if started.elapsed() >= duration {
+                return Err(fail);
+            }
+            let observed = crate::exclusion_identity::observe_directory(&path).map_err(|_| fail)?;
+            if started.elapsed() >= duration
+                || observed.locator_bytes != binding.locator_bytes()
+                || observed.volume_identity != binding.volume_identity()
+                || observed.directory_identity != binding.directory_identity()
+            {
+                return Err(fail);
+            }
+            let bytes = binding.directory_identity();
+            if bytes.len() != 35 || !bytes.starts_with(b"DSXDIR\x01") {
+                return Err(fail);
+            }
+            let device = u64::from_le_bytes(bytes[7..15].try_into().map_err(|_| fail)?);
+            let inode = u64::from_le_bytes(bytes[15..23].try_into().map_err(|_| fail)?);
+            identities.insert((device, inode));
+        }
+        let after = registry.snapshot().map_err(|_| fail)?;
+        if started.elapsed() >= duration || after.revision_id != snapshot.revision_id {
+            return Err(fail);
+        }
+        Ok((
+            snapshot.revision_id,
+            SummaryExclusionPolicy::from_identities(identities),
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod summary_policy_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn saved_rule_is_revalidated_and_stale_or_unavailable_registry_refuses_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let excluded = root.path().join("excluded");
+        std::fs::create_dir(&excluded).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut registry = Registry::open(root.path().join("rules.sqlite3")).unwrap();
+        let observation = crate::exclusion_identity::observe_directory(&excluded).unwrap();
+        let binding = NativeBinding::new(
+            observation.locator_bytes,
+            observation.volume_identity,
+            observation.directory_identity,
+            observation.basename,
+        )
+        .unwrap();
+        let revision = registry.snapshot().unwrap().revision_id;
+        registry.add_confirmed(revision, binding).unwrap();
+        let state = ExclusionState(Arc::new(Mutex::new(Ok(registry))));
+        let (_, policy) = state
+            .summary_policy(Instant::now(), Duration::from_secs(2))
+            .unwrap();
+        let stat = rustix::fs::statat(
+            rustix::fs::CWD,
+            &excluded,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        assert!(policy.excludes(&stat));
+        std::fs::rename(&excluded, root.path().join("moved")).unwrap();
+        assert!(state
+            .summary_policy(Instant::now(), Duration::from_secs(2))
+            .is_err());
+        let unavailable_state = ExclusionState(Arc::new(Mutex::new(Err(unavailable()))));
+        assert!(unavailable_state
+            .summary_policy(Instant::now(), Duration::from_secs(2))
+            .is_err());
     }
 }
