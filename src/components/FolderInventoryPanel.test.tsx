@@ -689,3 +689,74 @@ test("a late cancellation response cannot change a later summary attempt", async
   rejectSecond(new Error("finished"));
   await screen.findByText(/subtree summary could not be completed reliably/);
 });
+
+test("refresh retries the exact current folder without a picker and restarts paging after failed continuation", async () => {
+  vi.mocked(invoke)
+    .mockResolvedValueOnce({ ...sample, pageNumber: 2 })
+    .mockRejectedValueOnce(new Error("directory changed"))
+    .mockResolvedValueOnce({
+      ...sample,
+      observationId: "refreshed",
+      pageNumber: 1,
+      entries: [{ ...sample.entries[0], name: "Fresh name" }],
+    });
+  render(<FolderInventoryPanel native onBusyChange={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  await screen.findByText(/Enumeration could not continue reliably/);
+  expect(screen.getByRole("button", { name: "Next page" })).toBeDisabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Refresh current folder" }),
+  );
+  await screen.findByText(/Folder refreshed\. Paging restarted/);
+  expect(invoke).toHaveBeenNthCalledWith(3, "refresh_folder_inventory", {
+    request: { expectedObservationId: "observation-1" },
+  });
+  expect(screen.getByRole("table")).toHaveTextContent("Fresh name");
+  expect(screen.getByRole("button", { name: "Next page" })).toBeEnabled();
+  expect(
+    vi
+      .mocked(invoke)
+      .mock.calls.filter(
+        ([name]) => name === "inspect_selected_folder_entries",
+      ),
+  ).toHaveLength(1);
+});
+
+test("failed refresh preserves historical page, filter and selected evidence, with no duplicate request", async () => {
+  let rejectRefresh: (error: Error) => void = () => {};
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(sample)
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectRefresh = reject;
+        }),
+    );
+  const busy = vi.fn();
+  render(<FolderInventoryPanel native onBusyChange={busy} />);
+  fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+  await screen.findByRole("heading", { name: "Chosen folder" });
+  fireEvent.change(screen.getByRole("searchbox"), {
+    target: { value: "Alpha" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Inspect Alpha" }));
+  const refresh = screen.getByRole("button", {
+    name: "Refresh current folder",
+  });
+  fireEvent.click(refresh);
+  fireEvent.click(refresh);
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(refresh).toBeDisabled();
+  rejectRefresh(new Error("private path"));
+  await screen.findByText(/current folder could not be refreshed reliably/);
+  expect(screen.getByRole("searchbox")).toHaveValue("Alpha");
+  expect(
+    screen.getByRole("region", { name: "Entry evidence" }),
+  ).toHaveTextContent("Alpha");
+  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
+  expect(screen.queryByText(/private path/)).not.toBeInTheDocument();
+  expect(refresh).toBeEnabled();
+  expect(busy.mock.calls).toEqual([[true], [false], [true], [false]]);
+});

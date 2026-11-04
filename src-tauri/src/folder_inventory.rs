@@ -103,6 +103,12 @@ pub struct ContinueInventoryRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RefreshInventoryRequest {
+    expected_observation_id: InventoryItemId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClearInventoryRequest {
     expected_observation_id: InventoryItemId,
 }
@@ -1300,6 +1306,52 @@ fn continue_session(
     Ok(scanned.snapshot)
 }
 
+#[cfg(unix)]
+fn refresh_session(
+    session: &mut Session,
+    request: RefreshInventoryRequest,
+    max_entries: usize,
+    duration: Duration,
+) -> Result<FolderInventorySnapshot, &'static str> {
+    let started = Instant::now();
+    if request.expected_observation_id != session.observation_id
+        || session.snapshot.observation_id != session.observation_id
+    {
+        return Err("Folder observation is stale. Inspect the current folder again.");
+    }
+    validate_session_bindings(session, started, duration)?;
+    let frame = session
+        .frames
+        .last()
+        .ok_or("Folder observation is unavailable. Choose a folder again.")?;
+    let breadcrumbs = session
+        .frames
+        .iter()
+        .map(|frame| frame.label.clone())
+        .collect();
+    let scanned = scan_directory_fd(ScanRequest {
+        fd: &frame.fd,
+        expected_identity: frame.identity,
+        root_device: session.root_device,
+        root_label: &frame.label,
+        breadcrumbs,
+        can_go_back: session.frames.len() > 1,
+        depth: session.frames.len(),
+        max_entries,
+        duration: duration.saturating_sub(started.elapsed()),
+        cursor: None,
+        page_number: 1,
+        entries_seen: 0,
+    })?;
+    validate_session_bindings(session, started, duration)?;
+
+    session.observation_id = scanned.snapshot.observation_id;
+    session.entries = scanned.entries;
+    session.snapshot = scanned.snapshot.clone();
+    session.cursor = scanned.cursor;
+    Ok(scanned.snapshot)
+}
+
 #[cfg(not(unix))]
 fn navigate_session(
     _: &mut Session,
@@ -1318,6 +1370,16 @@ fn continue_session(
     _: Duration,
 ) -> Result<FolderInventorySnapshot, &'static str> {
     Err("Folder paging is unsupported on this platform.")
+}
+
+#[cfg(not(unix))]
+fn refresh_session(
+    _: &mut Session,
+    _: RefreshInventoryRequest,
+    _: usize,
+    _: Duration,
+) -> Result<FolderInventorySnapshot, &'static str> {
+    Err("Folder refresh is unsupported on this platform.")
 }
 
 #[cfg(not(unix))]
@@ -1405,6 +1467,27 @@ pub async fn continue_folder_inventory(
     })
     .await
     .map_err(|_| "Folder page continuation did not complete.".to_owned())?
+}
+
+#[tauri::command]
+pub async fn refresh_folder_inventory(
+    state: tauri::State<'_, FolderInventoryState>,
+    request: RefreshInventoryRequest,
+) -> Result<FolderInventorySnapshot, String> {
+    let guard = crate::NativeCheckGuard::acquire()?;
+    let sessions = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        let mut current = sessions
+            .lock()
+            .map_err(|_| "Folder inventory state is unavailable.".to_owned())?;
+        let session = current
+            .as_mut()
+            .ok_or_else(|| "Choose a folder before refreshing its inventory.".to_owned())?;
+        refresh_session(session, request, MAX_RAW_ENTRIES, MAX_DURATION).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| "Folder inventory refresh did not complete.".to_owned())?
 }
 
 #[tauri::command]
@@ -1567,6 +1650,21 @@ mod tests {
         continue_session(
             session,
             ContinueInventoryRequest {
+                expected_observation_id,
+            },
+            max_entries,
+            MAX_DURATION,
+        )
+    }
+
+    fn refresh_current_page(
+        session: &mut Session,
+        max_entries: usize,
+    ) -> Result<FolderInventorySnapshot, &'static str> {
+        let expected_observation_id = session.observation_id;
+        refresh_session(
+            session,
+            RefreshInventoryRequest {
                 expected_observation_id,
             },
             max_entries,
@@ -1766,6 +1864,137 @@ mod tests {
     }
 
     #[test]
+    fn refresh_rescans_current_directory_from_page_one_with_fresh_identity() {
+        let root = tempdir().unwrap();
+        for index in 0..4 {
+            fs::write(root.path().join(format!("item-{index}")), b"x").unwrap();
+        }
+        let (mut session, first) = selected_root_session(root.path(), 2, MAX_DURATION).unwrap();
+        let second = continue_current_page(&mut session, 2).unwrap();
+        assert_eq!(second.page_number, 2);
+        assert!(session.cursor.is_some());
+
+        let refreshed = refresh_current_page(&mut session, 2).unwrap();
+        assert_eq!(refreshed.page_number, 1);
+        assert_eq!(refreshed.entries_seen, "2");
+        assert_eq!(refreshed.entries.len(), 2);
+        assert!(!refreshed.enumeration_complete);
+        assert!(refreshed.can_continue);
+        assert!(session.cursor.is_some());
+        assert_ne!(refreshed.observation_id, second.observation_id);
+        assert_ne!(refreshed.observation_id, first.observation_id);
+
+        let next = continue_current_page(&mut session, 2).unwrap();
+        assert_eq!(next.page_number, 2);
+        assert_eq!(next.entries_seen, "4");
+        assert_eq!(next.entries.len(), 2);
+        assert!(next.can_continue);
+        let end = continue_current_page(&mut session, 2).unwrap();
+        assert_eq!(end.page_number, 3);
+        assert!(end.entries.is_empty());
+        assert!(end.enumeration_complete);
+        assert!(!end.can_continue);
+
+        let mut names = refreshed
+            .entries
+            .iter()
+            .chain(next.entries.iter())
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4);
+        assert!(names.iter().all(|name| name.starts_with("item-")));
+    }
+
+    #[test]
+    fn refresh_observes_changes_in_the_same_child_and_keeps_breadcrumbs() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        fs::write(root.path().join("child/old"), b"old").unwrap();
+        let (mut session, _) =
+            selected_root_session(root.path(), MAX_RAW_ENTRIES, MAX_DURATION).unwrap();
+        navigate_into(&mut session, "child").unwrap();
+        let before = session.snapshot.clone();
+        fs::write(root.path().join("child/new"), b"new file").unwrap();
+
+        let refreshed = refresh_current_page(&mut session, MAX_RAW_ENTRIES).unwrap();
+        assert_eq!(refreshed.root_label, before.root_label);
+        assert_eq!(refreshed.breadcrumbs, before.breadcrumbs);
+        assert_eq!(refreshed.breadcrumbs.len(), 2);
+        assert_eq!(refreshed.entries.len(), 2);
+        assert!(refreshed.entries.iter().any(|entry| entry.name == "new"));
+        assert_ne!(refreshed.observation_id, before.observation_id);
+    }
+
+    #[test]
+    fn refresh_refusals_leave_the_old_observation_and_cursor_intact() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        fs::write(root.path().join("child/old"), b"old").unwrap();
+        fs::write(root.path().join("child/older"), b"older").unwrap();
+        let (mut session, _) = selected_root_session(root.path(), 1, MAX_DURATION).unwrap();
+        let child_id = session
+            .entries
+            .iter()
+            .find(|entry| entry.name == b"child")
+            .unwrap()
+            .id;
+        let expected_observation_id = typed_id_string(session.observation_id);
+        navigate_session(
+            &mut session,
+            NavigationRequest {
+                expected_observation_id,
+                entry_id: Some(typed_id_string(child_id)),
+            },
+            1,
+            MAX_DURATION,
+        )
+        .unwrap();
+        let old_snapshot = session.snapshot.clone();
+        let old_names = session
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        let old_cursor = session.cursor.as_ref().map(|cursor| cursor as *const _);
+        assert!(old_cursor.is_some());
+
+        assert!(refresh_session(
+            &mut session,
+            RefreshInventoryRequest {
+                expected_observation_id: InventoryItemId::new(),
+            },
+            MAX_RAW_ENTRIES,
+            MAX_DURATION,
+        )
+        .is_err());
+        assert_eq!(session.snapshot, old_snapshot);
+        assert_eq!(
+            session.cursor.as_ref().map(|cursor| cursor as *const _),
+            old_cursor
+        );
+
+        fs::rename(root.path().join("child"), root.path().join("moved-child")).unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        fs::write(root.path().join("child/replacement"), b"different identity").unwrap();
+        assert!(refresh_current_page(&mut session, MAX_RAW_ENTRIES).is_err());
+        assert_eq!(session.snapshot, old_snapshot);
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>(),
+            old_names
+        );
+        assert_eq!(
+            session.cursor.as_ref().map(|cursor| cursor as *const _),
+            old_cursor
+        );
+    }
+
+    #[test]
     fn changed_directory_invalidates_cursor_and_navigation_replaces_it() {
         let root = tempdir().unwrap();
         for index in 0..4 {
@@ -1872,6 +2101,17 @@ mod tests {
             "path": "/tmp"
         });
         assert!(serde_json::from_value::<ContinueInventoryRequest>(with_path).is_err());
+
+        let valid_refresh = serde_json::json!({
+            "expectedObservationId": typed_id_string(InventoryItemId::new())
+        });
+        assert!(serde_json::from_value::<RefreshInventoryRequest>(valid_refresh).is_ok());
+        let refresh_with_path = serde_json::json!({
+            "expectedObservationId": typed_id_string(InventoryItemId::new()),
+            "path": "/tmp",
+            "entryId": typed_id_string(InventoryItemId::new())
+        });
+        assert!(serde_json::from_value::<RefreshInventoryRequest>(refresh_with_path).is_err());
     }
 
     #[test]

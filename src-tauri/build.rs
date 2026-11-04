@@ -6,6 +6,7 @@ fn main() {
             "inspect_selected_folder_entries",
             "navigate_folder_inventory",
             "continue_folder_inventory",
+            "refresh_folder_inventory",
             "clear_folder_inventory",
             "inspect_folder_tree_summary",
             "cancel_folder_tree_summary",
