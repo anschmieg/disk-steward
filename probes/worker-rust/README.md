@@ -299,7 +299,7 @@ refusal, then requires reopening to preserve the same identity, prior Registered
 state and 128 KiB reservation. `reconciliation_latched=true` reports this
 bookkeeping check; it is not a completed reconciliation or cleanup receipt.
 
-## Fixed six-object footprint observation
+## Fixed fixture footprint observations
 
 The complete and partial indexed payload fixtures observe their known parent/store
 directories, owner journal, payload, registry database and lease after confirmed
@@ -313,7 +313,9 @@ The report includes the six-object byte total and count and checks the snapshot
 against 128 KiB. Both modes charge their observation once into the parent
 budget; the existing reservation still admits the payload. This does not establish
 a whole-store quota or lifetime allocation peak. Descriptor-only and stall modes
-do not claim this observation. Complete and partial observers require their own
+use a separate five-object observer for the same controls without payload. A
+payload entry in those modes refuses the observation. Complete and partial
+observers require their own
 exact payload length and content; neither accepts the other's payload. Files and
 reservations remain retained; no cleanup eligibility,
 recovered-space claim, production aggregate accounting, OS containment or
@@ -331,6 +333,14 @@ payload observation remains visible and is not added again. Partial content is
 still validated as an incomplete 2 KiB prefix, and the complete-payload inspector
 must reject it. The partial snapshot follows its live reconciliation latch.
 
+Descriptor-only and stall modes charge their validated five-object control
+snapshot to their own admission job, reporting
+`parent_accounting_scope=fixed_five_objects` and `fixture_objects=5`. No-payload
+observation requires a stopped receipt and no journal payload-reservation claim;
+it grants no payload-writing authority. It includes both directories, the owner
+journal, registry database and lease, with the same strict roster and metadata
+checks. These jobs also settle as incomplete with confirmed worker stop.
+
 The supervisor samples free space through the owned directory handle after the
 observation, records the observed bytes, then marks verification incomplete and
 acknowledges the already confirmed worker stop. Reports expose
@@ -339,10 +349,9 @@ acknowledges the already confirmed worker stop. Reports expose
 and its original failure reason. Repeating settlement refuses before a second
 charge. The fixed observation-bound check also follows charging.
 
-Both snapshots remain before-registry-reopen checkpoints. Later SQLite writes
-can change allocation, and earlier peaks remain unknown. Descriptor-only and
-stall modes do not claim this settlement. Neither a complete synthetic payload nor a stopped
-child proves remote verification success. The budget retains usage, the registry
+All snapshots remain before-registry-reopen checkpoints. Later SQLite writes
+can change allocation, and earlier peaks remain unknown. Neither a complete
+synthetic payload nor a stopped child proves remote verification success. The budget retains usage, the registry
 retains its reservation and reconciliation blocker, and no cleanup is confirmed
 or authorized. Continuous parent monitoring, app-wide ownership and production
 Git verification remain separate work.
@@ -354,7 +363,7 @@ renewed for settlement. Observed bytes are charged before the elapsed check. A
 timeout retains those bytes and is acknowledged as worker-stopped; an earlier
 storage or free-space refusal keeps its first reason.
 `parent_elapsed_checked=true` identifies the successful elapsed checkpoint in
-complete and partial reports. This is a stopped checkpoint, not continuous parent
+all indexed mode reports. This is a stopped checkpoint, not continuous parent
 monitoring, a bound on noninterruptible system calls, or proof of production
 verification completion.
 

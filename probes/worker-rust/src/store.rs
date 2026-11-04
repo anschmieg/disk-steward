@@ -165,6 +165,14 @@ impl OwnedStore {
         footprint::observe_stopped_partial_fixture(self, registry, receipt)
     }
 
+    pub(crate) fn observe_stopped_control_fixture_footprint(
+        &self,
+        registry: &verification_store_registry::VerificationStoreRegistry,
+        receipt: &crate::StopReceipt,
+    ) -> Result<FixtureFootprintObservation, StoreError> {
+        footprint::observe_stopped_control_fixture(self, registry, receipt)
+    }
+
     pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {
         self.inspect_state()?;
         Ok(self.parent_path.join("verification-registry.sqlite3"))

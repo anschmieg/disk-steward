@@ -12,30 +12,40 @@ use verification_store_registry::VerificationStoreRegistry;
 const REGISTRY_NAME: &str = "verification-registry.sqlite3";
 const REGISTRY_LEASE_NAME: &str = "verification-registry.sqlite3.lease";
 const JOURNAL_NAME: &str = "owner.journal";
-const OBJECT_COUNT: u8 = 6;
+const CONTROL_OBJECT_COUNT: u8 = 5;
+const PAYLOAD_OBJECT_COUNT: u8 = 6;
 
 #[derive(Clone, Copy)]
 enum FixturePayloadKind {
+    NoPayload,
     Complete,
     Partial,
 }
 
 impl FixturePayloadKind {
-    fn expected_bytes(self) -> u64 {
+    fn expected_bytes(self) -> Option<u64> {
         match self {
-            Self::Complete => super::payload::LIMIT,
-            Self::Partial => super::payload::PARTIAL_FIXTURE_BYTES,
+            Self::NoPayload => None,
+            Self::Complete => Some(super::payload::LIMIT),
+            Self::Partial => Some(super::payload::PARTIAL_FIXTURE_BYTES),
         }
     }
 
-    fn inspect(
-        self,
-        store: &OwnedStore,
-        receipt: &StopReceipt,
-    ) -> Result<super::WorkerPayloadObservation, StoreError> {
+    fn inspect(self, store: &OwnedStore, receipt: &StopReceipt) -> Result<(), StoreError> {
         match self {
-            Self::Complete => store.inspect_stopped_worker_payload(receipt),
-            Self::Partial => store.inspect_stopped_worker_partial_payload(receipt),
+            Self::NoPayload => Ok(()),
+            Self::Complete => store.inspect_stopped_worker_payload(receipt).map(|_| ()),
+            Self::Partial => store
+                .inspect_stopped_worker_partial_payload(receipt)
+                .map(|_| ()),
+        }
+    }
+
+    fn object_count(self) -> u8 {
+        if self.expected_bytes().is_some() {
+            PAYLOAD_OBJECT_COUNT
+        } else {
+            CONTROL_OBJECT_COUNT
         }
     }
 }
@@ -102,6 +112,20 @@ pub(super) fn observe_stopped_partial_fixture(
     )
 }
 
+pub(super) fn observe_stopped_control_fixture(
+    store: &OwnedStore,
+    registry: &VerificationStoreRegistry,
+    receipt: &StopReceipt,
+) -> Result<FixtureFootprintObservation, StoreError> {
+    observe_with_checkpoint(
+        store,
+        registry,
+        receipt,
+        FixturePayloadKind::NoPayload,
+        |_| Ok(()),
+    )
+}
+
 // Private checkpoint supports deterministic mutation coverage without races.
 fn observe_with_checkpoint(
     store: &OwnedStore,
@@ -116,10 +140,20 @@ fn observe_with_checkpoint(
         use std::os::unix::fs::MetadataExt;
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        if !store.worker_stdin_issued
+        let reservation_matches = match payload_kind {
+            FixturePayloadKind::NoPayload => store.worker_payload_reservation.is_none(),
+            FixturePayloadKind::Complete | FixturePayloadKind::Partial => {
+                store.worker_payload_reservation == Some(super::WORKER_PAYLOAD_RESERVATION)
+            }
+        };
+        let handoff_matches = match payload_kind {
+            FixturePayloadKind::NoPayload => true,
+            FixturePayloadKind::Complete | FixturePayloadKind::Partial => store.worker_stdin_issued,
+        };
+        if !handoff_matches
             || store.poisoned
             || store.cleanup_started
-            || store.worker_payload_reservation != Some(super::WORKER_PAYLOAD_RESERVATION)
+            || !reservation_matches
             || receipt.pid() == 0
             || receipt.token() != store.token
             || store.phase != Phase::Stopped(receipt.pid())
@@ -167,7 +201,11 @@ fn observe_with_checkpoint(
             &named_parent,
             &[store.name.as_str(), REGISTRY_NAME, REGISTRY_LEASE_NAME],
         )?;
-        super::require_entries(&named_root, &[JOURNAL_NAME, super::payload::NAME])?;
+        if payload_kind.expected_bytes().is_some() {
+            super::require_entries(&named_root, &[JOURNAL_NAME, super::payload::NAME])?;
+        } else {
+            super::require_entries(&named_root, &[JOURNAL_NAME])?;
+        }
         check_deadline(deadline)?;
 
         let db_lease_ids = control_before.file_identities();
@@ -191,12 +229,19 @@ fn observe_with_checkpoint(
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )?);
-        let payload = File::from(openat(
-            &named_root,
-            super::payload::NAME,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?);
+        let payload = payload_kind
+            .expected_bytes()
+            .map(|_| {
+                openat(
+                    &named_root,
+                    super::payload::NAME,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(StoreError::from)
+            })
+            .transpose()?;
 
         let parent_metadata = store.parent.metadata()?;
         let root_metadata = store.root.metadata()?;
@@ -222,41 +267,49 @@ fn observe_with_checkpoint(
         let lease_stamp = validate_regular(&registry_lease, db_lease_ids[1])?;
         let journal_stamp =
             validate_regular(&marker, store.journal_id.ok_or(StoreError::InvalidJournal)?)?;
-        let payload_meta = payload.metadata()?;
-        let payload_stamp = validate_regular(&payload, (payload_meta.dev(), payload_meta.ino()))?;
         let expected_payload_bytes = payload_kind.expected_bytes();
-        if payload_stamp.len != expected_payload_bytes
-            || payload_stamp.uid != rustix::process::geteuid().as_raw()
-        {
-            return Err(StoreError::InvalidIdentity);
-        }
-        super::handoff::read_and_verify_payload(&payload, deadline, expected_payload_bytes)?;
+        let payload_stamp =
+            if let (Some(payload), Some(expected)) = (payload.as_ref(), expected_payload_bytes) {
+                let payload_meta = payload.metadata()?;
+                let stamp = validate_regular(payload, (payload_meta.dev(), payload_meta.ino()))?;
+                if stamp.len != expected || stamp.uid != rustix::process::geteuid().as_raw() {
+                    return Err(StoreError::InvalidIdentity);
+                }
+                super::handoff::read_and_verify_payload(payload, deadline, expected)?;
+                Some(stamp)
+            } else {
+                None
+            };
         let mut marker_copy = marker.try_clone()?;
         let journal_bytes = super::handoff::read_bounded_marker(&mut marker_copy)?;
         if journal_bytes.len() > 512 || journal_bytes != store.journal_contents().as_bytes() {
             return Err(StoreError::InvalidJournal);
         }
 
-        let mut identities = [
-            parent_stamp.identity,
-            root_stamp.identity,
-            journal_stamp.identity,
-            payload_stamp.identity,
-            database_stamp.identity,
-            lease_stamp.identity,
-        ];
-        identities.sort_unstable();
-        if identities.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(StoreError::InvalidIdentity);
+        let mut identities = [None; PAYLOAD_OBJECT_COUNT as usize];
+        identities[0] = Some(parent_stamp.identity);
+        identities[1] = Some(root_stamp.identity);
+        identities[2] = Some(journal_stamp.identity);
+        identities[3] = payload_stamp.map(|stamp| stamp.identity);
+        identities[4] = Some(database_stamp.identity);
+        identities[5] = Some(lease_stamp.identity);
+        for left in 0..identities.len() {
+            for right in (left + 1)..identities.len() {
+                if identities[left].is_some() && identities[left] == identities[right] {
+                    return Err(StoreError::InvalidIdentity);
+                }
+            }
         }
+        let payload_bytes = payload_stamp.map(object_bytes).transpose()?;
         let observed_bytes = [
-            object_bytes(parent_stamp)?,
-            object_bytes(root_stamp)?,
-            object_bytes(journal_stamp)?,
-            object_bytes(payload_stamp)?,
-            control_before.observed_bytes(),
+            Some(object_bytes(parent_stamp)?),
+            Some(object_bytes(root_stamp)?),
+            Some(object_bytes(journal_stamp)?),
+            payload_bytes,
+            Some(control_before.observed_bytes()),
         ]
         .into_iter()
+        .flatten()
         .try_fold(0u64, u64::checked_add)
         .ok_or(StoreError::InvalidJournal)?;
 
@@ -293,19 +346,30 @@ fn observe_with_checkpoint(
             &final_parent,
             &[store.name.as_str(), REGISTRY_NAME, REGISTRY_LEASE_NAME],
         )?;
-        super::require_entries(&final_root, &[JOURNAL_NAME, super::payload::NAME])?;
+        if payload_kind.expected_bytes().is_some() {
+            super::require_entries(&final_root, &[JOURNAL_NAME, super::payload::NAME])?;
+        } else {
+            super::require_entries(&final_root, &[JOURNAL_NAME])?;
+        }
         let named_marker = File::from(openat(
             &final_root,
             JOURNAL_NAME,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )?);
-        let named_payload = File::from(openat(
-            &final_root,
-            super::payload::NAME,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?);
+        let named_payload = payload_kind
+            .expected_bytes()
+            .map(|_| {
+                openat(
+                    &final_root,
+                    super::payload::NAME,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(StoreError::from)
+            })
+            .transpose()?;
         let parent_after = ObjectStamp::from(&store.parent.metadata()?);
         let root_after = ObjectStamp::from(&store.root.metadata()?);
         let named_parent_after = ObjectStamp::from(&final_parent.metadata()?);
@@ -317,10 +381,19 @@ fn observe_with_checkpoint(
             || ObjectStamp::from(&registry_db.metadata()?) != database_stamp
             || ObjectStamp::from(&registry_lease.metadata()?) != lease_stamp
             || ObjectStamp::from(&marker.metadata()?) != journal_stamp
-            || ObjectStamp::from(&payload.metadata()?) != payload_stamp
             || ObjectStamp::from(&named_marker.metadata()?) != journal_stamp
-            || ObjectStamp::from(&named_payload.metadata()?) != payload_stamp
         {
+            return Err(StoreError::InvalidIdentity);
+        }
+        if let (Some(payload), Some(named_payload), Some(expected_stamp)) =
+            (payload.as_ref(), named_payload.as_ref(), payload_stamp)
+        {
+            if ObjectStamp::from(&payload.metadata()?) != expected_stamp
+                || ObjectStamp::from(&named_payload.metadata()?) != expected_stamp
+            {
+                return Err(StoreError::InvalidIdentity);
+            }
+        } else if payload_kind.expected_bytes().is_some() {
             return Err(StoreError::InvalidIdentity);
         }
         let final_state = store.inspect_state()?;
@@ -329,7 +402,7 @@ fn observe_with_checkpoint(
             return Err(StoreError::InvalidIdentity);
         }
         Ok(FixtureFootprintObservation {
-            object_count: OBJECT_COUNT,
+            object_count: payload_kind.object_count(),
             observed_bytes,
         })
     }
@@ -431,13 +504,50 @@ mod tests {
         fixture(true)
     }
 
+    fn control_fixture(
+        descriptor_handoff: bool,
+    ) -> (OwnedStore, VerificationStoreRegistry, StopReceipt) {
+        let mut store = OwnedStore::create().unwrap();
+        let registry_path = store.control_registry_path().unwrap();
+        let (parent, root) = store.control_identity().unwrap();
+        let mut registry = VerificationStoreRegistry::open(registry_path).unwrap();
+        registry
+            .register(FIXTURE_ID, parent.0, parent.1, root.0, root.1)
+            .unwrap();
+        registry
+            .reserve(FIXTURE_ID, 0, super::super::WORKER_PAYLOAD_RESERVATION)
+            .unwrap();
+        registry
+            .transition(
+                FIXTURE_ID,
+                verification_store_registry::StoreState::Registered,
+                verification_store_registry::StoreState::Active,
+            )
+            .unwrap();
+        if descriptor_handoff {
+            drop(store.worker_stdin_once().unwrap());
+        }
+        let pid = std::process::id();
+        store.bind_worker(pid).unwrap();
+        let receipt = StopReceipt::confirmed(store.token(), pid);
+        store.record_stopped(&receipt).unwrap();
+        registry
+            .transition(
+                FIXTURE_ID,
+                verification_store_registry::StoreState::Active,
+                verification_store_registry::StoreState::Stopped,
+            )
+            .unwrap();
+        (store, registry, receipt)
+    }
+
     #[test]
     fn stopped_fixture_footprint_is_a_stable_six_object_observation() {
         let (store, registry, receipt) = completed_fixture();
         let observation = store
             .observe_stopped_fixture_footprint(&registry, &receipt)
             .unwrap();
-        assert_eq!(observation.object_count, OBJECT_COUNT);
+        assert_eq!(observation.object_count, PAYLOAD_OBJECT_COUNT);
         assert!(observation.observed_bytes >= super::super::payload::LIMIT);
         assert!(observation.observed_bytes <= super::super::WORKER_PAYLOAD_RESERVATION);
     }
@@ -547,7 +657,7 @@ mod tests {
         let partial = store
             .observe_stopped_partial_fixture_footprint(&registry, &receipt)
             .unwrap();
-        assert_eq!(partial.object_count, OBJECT_COUNT);
+        assert_eq!(partial.object_count, PAYLOAD_OBJECT_COUNT);
         assert!(partial.observed_bytes >= super::super::payload::PARTIAL_FIXTURE_BYTES);
         assert!(partial.observed_bytes <= super::super::WORKER_PAYLOAD_RESERVATION);
         assert!(store
@@ -557,6 +667,9 @@ mod tests {
         let (store, registry, receipt) = completed_fixture();
         assert!(store
             .observe_stopped_partial_fixture_footprint(&registry, &receipt)
+            .is_err());
+        assert!(store
+            .observe_stopped_control_fixture_footprint(&registry, &receipt)
             .is_err());
     }
 
@@ -615,5 +728,77 @@ mod tests {
             "mutation must happen after the initial snapshot"
         );
         assert!(matches!(result, Err(StoreError::InvalidIdentity)));
+    }
+
+    #[test]
+    fn stopped_control_fixture_measures_exactly_five_objects_without_payload() {
+        for descriptor_handoff in [false, true] {
+            let (store, registry, receipt) = control_fixture(descriptor_handoff);
+            let observation = store
+                .observe_stopped_control_fixture_footprint(&registry, &receipt)
+                .unwrap();
+            assert_eq!(observation.object_count, CONTROL_OBJECT_COUNT);
+            assert!(observation.observed_bytes > 0);
+            assert!(observation.observed_bytes <= super::super::WORKER_PAYLOAD_RESERVATION);
+        }
+    }
+
+    #[test]
+    fn stopped_control_fixture_requires_exact_receipt_and_rejects_payload_or_sidecars() {
+        let (store, registry, receipt) = completed_fixture();
+        assert!(store
+            .observe_stopped_control_fixture_footprint(&registry, &receipt)
+            .is_err());
+
+        let (store, registry, receipt) = control_fixture(false);
+        let wrong = StopReceipt::confirmed("different-token", receipt.pid());
+        assert!(store
+            .observe_stopped_control_fixture_footprint(&registry, &wrong)
+            .is_err());
+
+        let (store, registry, receipt) = control_fixture(true);
+        let wrong_pid =
+            StopReceipt::confirmed(receipt.token(), receipt.pid().wrapping_add(1).max(1));
+        assert!(store
+            .observe_stopped_control_fixture_footprint(&registry, &wrong_pid)
+            .is_err());
+
+        let (store, registry, receipt) = control_fixture(false);
+        fs::write(store.parent_path.join("store/payload.bin"), b"unexpected").unwrap();
+        assert!(store
+            .observe_stopped_control_fixture_footprint(&registry, &receipt)
+            .is_err());
+
+        let (store, registry, receipt) = control_fixture(false);
+        fs::write(
+            store.parent_path.join("verification-registry.sqlite3-wal"),
+            b"unexpected",
+        )
+        .unwrap();
+        assert!(store
+            .observe_stopped_control_fixture_footprint(&registry, &receipt)
+            .is_err());
+    }
+
+    #[test]
+    fn control_fixture_mutation_after_snapshot_refuses_the_observation() {
+        let (store, registry, receipt) = control_fixture(false);
+        let invoked = std::cell::Cell::new(false);
+        let result = observe_with_checkpoint(
+            &store,
+            &registry,
+            &receipt,
+            FixturePayloadKind::NoPayload,
+            |owned| {
+                invoked.set(true);
+                fs::write(
+                    owned.parent_path.join("store/unexpected-after-snapshot"),
+                    b"x",
+                )?;
+                Ok(())
+            },
+        );
+        assert!(invoked.get());
+        assert!(result.is_err());
     }
 }
