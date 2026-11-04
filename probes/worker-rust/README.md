@@ -173,3 +173,33 @@ worker, creator-death reinspection and indexed store worker with that sentinel
 set in their parent. This checks the actual launch boundary, not OS-level process
 isolation or production transport integration. Local evidence is macOS; other
 supported-platform behavior requires its current-head CI.
+
+## Descriptor-only store handoff
+
+`cargo run -p disk-steward-worker-probe -- --run-indexed-store-handoff`
+uses the indexed-store fixture with an additional fixed capability handoff. It
+commits the same identity-bound 128 KiB registry reservation before spawn, then
+passes a one-shot clone of the verified store directory as the exact child’s
+stdin. The child receives no path or descriptor-number argument.
+
+Before emitting its readiness byte, the child checks directory type, private
+owner/mode, root device/inode and a bounded regular ownership journal naming its
+own PID. The initial parent bind may be observed as a created or partial journal;
+only valid prefixes may wait, for at most 256 polls and 500 ms. Reads are bounded
+to 513 bytes with at most 16 interruptions, and the named journal is reopened to
+reject replacement. Changed, malformed or foreign identities refuse readiness.
+A failed handoff attempt cannot be renewed by restoring marker permissions.
+
+The child performs read-only validation and the existing fixed stall. After
+readiness the parent kills/reaps the exact child, joins its reader, records
+stopped state, and checks the reopened registry remains reconciliation-required.
+Only then does the report include `descriptor_handoff=true`. The fixture and
+reservation remain retained; no cleanup, payload write, Git access or credential
+operation is authorized by this mode. Existing fixed modes keep their behavior.
+
+Passing a directory descriptor is not an OS sandbox or process-tree containment.
+Cooperative deadlines and ordinary local kill/wait/join evidence do not prove
+hard latency under OS stalls, atomicity against same-user interference, power-loss
+durability or production verification ownership. Linux/macOS paths are supported
+by the probe; this change was locally exercised on macOS arm64 and still needs
+current-head cross-platform CI.

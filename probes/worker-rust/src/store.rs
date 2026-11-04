@@ -1,5 +1,7 @@
 //! Private, app-created Git-worker store fixture with bounded live cleanup.
 
+#[path = "store/handoff.rs"]
+mod handoff;
 #[path = "store/payload.rs"]
 mod payload;
 
@@ -79,6 +81,7 @@ pub struct OwnedStore {
     phase: Phase,
     poisoned: bool,
     cleanup_started: bool,
+    worker_stdin_issued: bool,
     #[cfg(test)]
     fail_after_marker_unlink: bool,
 }
@@ -93,6 +96,16 @@ enum Phase {
 pub(crate) type ControlIdentity = ((u64, u64), (u64, u64));
 
 impl OwnedStore {
+    /// Return the verified store-root descriptor for the single fixed worker
+    /// stdin handoff. The child receives only this directory capability.
+    pub(crate) fn worker_stdin_once(&mut self) -> Result<File, StoreError> {
+        handoff::worker_stdin_once(self)
+    }
+
+    pub(crate) fn validate_worker_stdin_handoff() -> Result<(), StoreError> {
+        handoff::validate_stdin()
+    }
+
     pub(crate) fn control_registry_path(&self) -> Result<PathBuf, StoreError> {
         self.inspect_state()?;
         Ok(self.parent_path.join("verification-registry.sqlite3"))
@@ -517,6 +530,7 @@ fn create_supported() -> Result<OwnedStore, StoreError> {
         phase: Phase::Created,
         poisoned: false,
         cleanup_started: false,
+        worker_stdin_issued: false,
         #[cfg(test)]
         fail_after_marker_unlink: false,
     })
