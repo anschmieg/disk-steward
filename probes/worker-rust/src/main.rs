@@ -68,7 +68,7 @@ enum StopReason {
     ReaderError,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReaderEvent {
     Ready,
     Finished { bytes: u64, failed: bool },
@@ -127,7 +127,10 @@ fn run_parent(args: &[String]) -> Result<(), String> {
         }
         [flag] if flag == "--run-store-worker" => run_store_worker(),
         [flag] if flag == "--run-store-reinspect" => run_store_reinspect(),
-        [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(),
+        [flag] if flag == "--run-indexed-store-worker" => run_indexed_store_worker(IndexedWorkerMode::Stall),
+        [flag] if flag == "--run-indexed-store-handoff" => run_indexed_store_worker(IndexedWorkerMode::DescriptorOnly),
+        [flag] if flag == "--run-indexed-store-payload" => run_indexed_store_worker(IndexedWorkerMode::Payload),
+        [flag] if flag == "--run-indexed-store-payload-partial" => run_indexed_store_worker(IndexedWorkerMode::PartialPayload),
         [flag, confirm] if flag == "--run-store-cleanup" && confirm == "--confirm-own-store-cleanup" => run_store_worker_with_cleanup(true),
         [flag] if flag == "--run-store-cleanup" => Err("refusing store cleanup without --confirm-own-store-cleanup".into()),
         [flag] if flag == "--run" => {
@@ -160,11 +163,21 @@ fn run_parent(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, or --run-store-cleanup --confirm-own-store-cleanup".into()),
+        _ => Err("accepted arguments: none, --run, --run-store, --run-store-payload-fixture, --run-store-worker, --run-store-reinspect, --run-indexed-store-worker, --run-indexed-store-handoff, --run-indexed-store-payload, --run-indexed-store-payload-partial, or --run-store-cleanup --confirm-own-store-cleanup".into()),
     }
 }
 
-fn run_indexed_store_worker() -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexedWorkerMode {
+    Stall,
+    DescriptorOnly,
+    Payload,
+    PartialPayload,
+}
+
+fn run_indexed_store_worker(mode: IndexedWorkerMode) -> Result<(), String> {
+    let descriptor_handoff = mode != IndexedWorkerMode::Stall;
+    use verification_budget::{BudgetController, JobState, Limits};
     use verification_store_registry::{
         RegistryError, StoreState as RState, VerificationStoreRegistry,
     };
@@ -181,19 +194,65 @@ fn run_indexed_store_worker() -> Result<(), String> {
     registry
         .register(FIXTURE_ID, parent.0, parent.1, root.0, root.1)
         .map_err(|e| format!("register store: {e}"))?;
-    // Closed admission-bookkeeping exercise, not a measured store footprint.
-    const RESERVATION: u64 = 128 * 1024;
-    let reserved = registry
-        .reserve(FIXTURE_ID, 0, RESERVATION)
-        .map_err(|e| format!("reserve indexed fixture: {e}"))?;
-    if reserved.reserved_bytes != RESERVATION {
-        return Err("registry reservation mismatch".into());
+    let free_bytes = store
+        .sample_free_space_bytes()
+        .map_err(|_| "sample owned-store volume free space refused".to_owned())?;
+    let mut admission_budget = BudgetController::new(Limits {
+        headroom_bytes: 1024 * 1024,
+    });
+    let attempt_started = Instant::now();
+    let admission = verification_admission::admit_registered_store(
+        &mut admission_budget,
+        &mut registry,
+        FIXTURE_ID,
+        store::WORKER_PAYLOAD_RESERVATION,
+        free_bytes,
+    )
+    .map_err(|_| "coordinated pre-handoff admission refused".to_owned())?;
+    if admission.record.state != RState::Registered
+        || admission.record.prior_state.is_some()
+        || admission.record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+        || (
+            admission.record.parent_dev,
+            admission.record.parent_ino,
+            admission.record.root_dev,
+            admission.record.root_ino,
+        ) != (parent.0, parent.1, root.0, root.1)
+        || admission_budget
+            .snapshot(admission.job_id)
+            .map(|job| job.state != JobState::Running || job.usage.stored_bytes != 0)
+            .unwrap_or(true)
+    {
+        return Err("coordinated pre-handoff admission record mismatch".into());
+    }
+    if matches!(
+        mode,
+        IndexedWorkerMode::Payload | IndexedWorkerMode::PartialPayload
+    ) {
+        store
+            .bind_worker_payload_reservation()
+            .map_err(|_| "bind worker payload reservation refused".to_owned())?;
     }
     let exe = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
+    let child_stdin = if descriptor_handoff {
+        let root = store
+            .worker_stdin_once()
+            .map_err(|_| "prepare store descriptor handoff refused".to_owned())?;
+        Stdio::from(root)
+    } else {
+        Stdio::null()
+    };
+    let child_mode = match mode {
+        IndexedWorkerMode::Stall => "stall",
+        IndexedWorkerMode::DescriptorOnly => "store-handoff",
+        IndexedWorkerMode::Payload => "store-payload",
+        IndexedWorkerMode::PartialPayload => "store-payload-partial",
+    };
     let mut child = Command::new(exe)
+        .env_clear()
         .arg("--child")
-        .arg("stall")
-        .stdin(Stdio::null())
+        .arg(child_mode)
+        .stdin(child_stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -227,6 +286,181 @@ fn run_indexed_store_worker() -> Result<(), String> {
             }
         }
     };
+    if mode == IndexedWorkerMode::PartialPayload {
+        let failure_deadline = Instant::now() + OUTER_DEADLINE;
+        let receive_time = failure_deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(receive_time) {
+            Ok(ReaderEvent::Finished {
+                bytes: 0,
+                failed: false,
+            }) => {}
+            Ok(event) => {
+                return finish_after_error(
+                    child,
+                    reader,
+                    rx,
+                    format!("partial payload child emitted unexpected stdout event: {event:?}"),
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return finish_after_error(
+                    child,
+                    reader,
+                    rx,
+                    "partial payload child did not finish before deadline".into(),
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return finish_after_error(
+                    child,
+                    reader,
+                    rx,
+                    "partial payload reader stopped without a result".into(),
+                )
+            }
+        }
+        let status = match wait_for_child_exit(&mut child, failure_deadline) {
+            Ok(status) => status,
+            Err(error) => return finish_after_error(child, reader, rx, error),
+        };
+        if let Err(error) = stop_and_reap(&mut child) {
+            let _ = reader.join();
+            return Err(format!(
+                "partial payload child shutdown unconfirmed: {error}"
+            ));
+        }
+        if reader.join().is_err() {
+            return Err("partial payload reader join failed; stop receipt withheld".into());
+        }
+        if status.code() != Some(86) {
+            return Err(
+                "partial payload child did not report the fixed injected write failure".into(),
+            );
+        }
+        let receipt = StopReceipt::confirmed(store.token(), pid);
+        store
+            .record_stopped(&receipt)
+            .map_err(|error| format!("record interrupted worker stop: {error}"))?;
+        let partial = store
+            .inspect_stopped_worker_partial_payload(&receipt)
+            .map_err(|_| "retained partial payload validation refused".to_owned())?;
+        if partial.written_bytes != store::PARTIAL_PAYLOAD_FIXTURE_BYTES
+            || store.inspect_stopped_worker_payload(&receipt).is_ok()
+        {
+            return Err("partial payload observation or complete-payload refusal mismatch".into());
+        }
+        let latched = registry
+            .require_reconciliation(FIXTURE_ID, RState::Registered)
+            .map_err(|error| format!("latch interrupted registry attempt: {error}"))?;
+        if latched.state != RState::NeedsReconciliation
+            || latched.prior_state != Some(RState::Registered)
+            || latched.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+            || (
+                latched.parent_dev,
+                latched.parent_ino,
+                latched.root_dev,
+                latched.root_ino,
+            ) != (parent.0, parent.1, root.0, root.1)
+        {
+            return Err("live reconciliation latch changed store identity or reservation".into());
+        }
+        match registry.reserve(
+            FIXTURE_ID,
+            store::WORKER_PAYLOAD_RESERVATION,
+            store::WORKER_PAYLOAD_RESERVATION * 2,
+        ) {
+            Err(RegistryError::ReconciliationRequired) => {}
+            Err(other) => {
+                return Err(format!(
+                    "partial retry refused for unexpected reason: {other}"
+                ))
+            }
+            Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
+        }
+        match registry.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
+            Err(RegistryError::InvalidTransition) => {}
+            Err(other) => {
+                return Err(format!(
+                    "latched attempt transition refused unexpectedly: {other}"
+                ))
+            }
+            Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+        }
+        let free_after = store
+            .sample_free_space_bytes()
+            .map_err(|_| "sample stopped partial payload free space refused".to_owned())?;
+        let accounted = settle_parent_store_budget(
+            &mut admission_budget,
+            admission.job_id,
+            partial.high_water_bytes,
+            free_after,
+            elapsed_millis(attempt_started),
+        )
+        .map_err(|_| "parent partial-payload accounting refused".to_owned())?;
+        if accounted != partial.high_water_bytes
+            || partial.high_water_bytes > store::WORKER_PAYLOAD_RESERVATION
+            || admission_budget
+                .snapshot(admission.job_id)
+                .map(|job| {
+                    job.usage.stored_bytes != partial.high_water_bytes
+                        || job.state
+                            != (JobState::Failed {
+                                reason: verification_budget::BlockReason::StoreIncomplete,
+                                worker_stopped: true,
+                            })
+                })
+                .unwrap_or(true)
+        {
+            return Err("partial payload accounting or reservation mismatch".into());
+        }
+        let live_state = store
+            .inspect_state()
+            .map_err(|error| format!("inspect interrupted store: {error}"))?;
+        drop(registry);
+        drop(store);
+        let mut reopened = VerificationStoreRegistry::open(&registry_path)
+            .map_err(|error| format!("reopen interrupted registry: {error}"))?;
+        let record = reopened
+            .get(FIXTURE_ID)
+            .map_err(|error| format!("read interrupted registry: {error}"))?
+            .ok_or("interrupted registry row disappeared")?;
+        if record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
+            || record.state != RState::NeedsReconciliation
+            || record.prior_state != Some(RState::Registered)
+            || (
+                record.parent_dev,
+                record.parent_ino,
+                record.root_dev,
+                record.root_ino,
+            ) != (parent.0, parent.1, root.0, root.1)
+        {
+            return Err("interrupted registry identity/state mismatch".into());
+        }
+        match reopened.reserve(
+            FIXTURE_ID,
+            store::WORKER_PAYLOAD_RESERVATION,
+            store::WORKER_PAYLOAD_RESERVATION * 2,
+        ) {
+            Err(RegistryError::ReconciliationRequired) => {}
+            Err(other) => {
+                return Err(format!(
+                    "partial retry refused for unexpected reason: {other}"
+                ))
+            }
+            Ok(_) => return Err("partial retry unexpectedly admitted more storage".into()),
+        }
+        match reopened.transition(FIXTURE_ID, RState::NeedsReconciliation, RState::Active) {
+            Err(RegistryError::InvalidTransition) => {}
+            Err(other) => {
+                return Err(format!(
+                    "partial retry lifecycle refused unexpectedly: {other}"
+                ))
+            }
+            Ok(_) => return Err("incomplete payload unexpectedly became active".into()),
+        }
+        println!("worker_joined=true coordinated_admission=true store_stopped=true partial_payload_validated=true partial_payload_written={} partial_payload_high_water_bytes={} parent_observed_accounted_bytes={accounted} parent_accounting_scope=payload_only parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true complete_payload_refused=true reconciliation_latched=true reopened_reconciliation=true prior_registered=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", partial.written_bytes, partial.high_water_bytes, store::WORKER_PAYLOAD_RESERVATION);
+        return Ok(());
+    }
     if let Err(e) = await_readiness(&rx, Instant::now() + OUTER_DEADLINE) {
         return finish_after_error(child, reader, rx, e);
     }
@@ -258,6 +492,66 @@ fn run_indexed_store_worker() -> Result<(), String> {
     let live_state = store
         .inspect_state()
         .map_err(|e| format!("inspect store: {e}"))?;
+    let payload_observation = if mode == IndexedWorkerMode::Payload {
+        let observation = store
+            .inspect_stopped_worker_payload(&receipt)
+            .map_err(|_| "stopped worker payload validation refused".to_owned())?;
+        if observation.written_bytes != 32 * 1024 {
+            return Err("worker payload exceeds fixed admission".into());
+        }
+        Some(observation)
+    } else {
+        None
+    };
+    let fixture_footprint = if mode == IndexedWorkerMode::Payload {
+        let observation = store
+            .observe_stopped_fixture_footprint(&registry, &receipt)
+            .map_err(|_| "complete stopped fixture footprint observation refused".to_owned())?;
+        if observation.object_count != 6 {
+            return Err("fixed fixture footprint object count mismatch".into());
+        }
+        Some(observation)
+    } else {
+        None
+    };
+    let parent_observed_accounted_bytes = if let Some(observation) = payload_observation {
+        let free_after = store
+            .sample_free_space_bytes()
+            .map_err(|_| "sample stopped fixture free space refused".to_owned())?;
+        let observed_bytes = fixture_footprint
+            .ok_or("complete fixture footprint observation missing")?
+            .observed_bytes;
+        if observed_bytes < observation.high_water_bytes {
+            return Err("fixed fixture observation is below payload high-water".into());
+        }
+        let accounted = settle_parent_store_budget(
+            &mut admission_budget,
+            admission.job_id,
+            observed_bytes,
+            free_after,
+            elapsed_millis(attempt_started),
+        )
+        .map_err(|_| "parent fixture accounting refused".to_owned())?;
+        if accounted != observed_bytes
+            || observed_bytes > store::WORKER_PAYLOAD_RESERVATION
+            || admission_budget
+                .snapshot(admission.job_id)
+                .map(|job| {
+                    job.usage.stored_bytes != observed_bytes
+                        || job.state
+                            != (JobState::Failed {
+                                reason: verification_budget::BlockReason::StoreIncomplete,
+                                worker_stopped: true,
+                            })
+                })
+                .unwrap_or(true)
+        {
+            return Err("fixture accounting or reservation mismatch".into());
+        }
+        Some(accounted)
+    } else {
+        None
+    };
     drop(registry);
     drop(store);
     let mut reopened = VerificationStoreRegistry::open(&registry_path)
@@ -266,7 +560,7 @@ fn run_indexed_store_worker() -> Result<(), String> {
         .get(FIXTURE_ID)
         .map_err(|e| format!("read reopened registry: {e}"))?
         .ok_or("registry row disappeared")?;
-    if record.reserved_bytes != RESERVATION
+    if record.reserved_bytes != store::WORKER_PAYLOAD_RESERVATION
         || record.state != RState::NeedsReconciliation
         || record.prior_state != Some(RState::Stopped)
         || (
@@ -278,7 +572,11 @@ fn run_indexed_store_worker() -> Result<(), String> {
     {
         return Err("reopened registry identity/state mismatch".into());
     }
-    match reopened.reserve(FIXTURE_ID, RESERVATION, RESERVATION * 2) {
+    match reopened.reserve(
+        FIXTURE_ID,
+        store::WORKER_PAYLOAD_RESERVATION,
+        store::WORKER_PAYLOAD_RESERVATION * 2,
+    ) {
         Err(RegistryError::ReconciliationRequired) => {}
         Err(other) => {
             return Err(format!(
@@ -296,8 +594,75 @@ fn run_indexed_store_worker() -> Result<(), String> {
         }
         Ok(_) => return Err("reopened reconciliation row unexpectedly became active".into()),
     }
-    println!("worker_joined=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={RESERVATION} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized");
+    if let Some(observation) = payload_observation {
+        let written = observation.written_bytes;
+        let high_water = observation.high_water_bytes;
+        let footprint =
+            fixture_footprint.ok_or("complete payload footprint observation missing")?;
+        let accounted =
+            parent_observed_accounted_bytes.ok_or("parent fixture accounting missing")?;
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true payload_validated=true payload_written={written} payload_high_water_bytes={high_water} parent_observed_accounted_bytes={accounted} parent_accounting_scope=fixed_six_objects parent_elapsed_checked=true parent_budget_incomplete=true parent_worker_stopped=true fixture_objects={} fixture_observed_bytes={} fixture_snapshot=before_registry_reopen store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION, footprint.object_count, footprint.observed_bytes);
+    } else if descriptor_handoff {
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true descriptor_handoff=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+    } else {
+        println!("worker_joined=true coordinated_admission=true registered_stopped=true reopened_reconciliation=true prior_stopped=true reserved_bytes={} reservation_retry_refused=true store_state={live_state:?} child_exit={status} cleanup=not_authorized", store::WORKER_PAYLOAD_RESERVATION);
+    }
     Ok(())
+}
+
+/// Charge the caller's validated stopped-worker byte observation to the parent
+/// attempt. The elapsed time must come from the same monotonic clock started
+/// immediately before coordinated admission. This grants no cleanup or
+/// completion authority.
+fn settle_parent_store_budget(
+    budget: &mut verification_budget::BudgetController,
+    job_id: verification_budget::JobId,
+    observed_bytes: u64,
+    free_bytes_after: u64,
+    elapsed_millis: u64,
+) -> Result<u64, verification_budget::BudgetError> {
+    use verification_budget::{BlockReason, BudgetError, JobState};
+
+    let snapshot = budget.snapshot(job_id)?;
+    if snapshot.state != JobState::Running
+        || snapshot.usage.stored_bytes != 0
+        || observed_bytes == 0
+    {
+        return Err(BudgetError::Blocked(BlockReason::JobNotRunning));
+    }
+
+    if let Err(source) = budget.record_store(job_id, observed_bytes, free_bytes_after) {
+        if matches!(
+            budget.snapshot(job_id).map(|job| job.state),
+            Ok(JobState::Failed {
+                worker_stopped: false,
+                ..
+            })
+        ) {
+            budget.acknowledge_worker_stopped(job_id)?;
+        }
+        return Err(source);
+    }
+
+    if let Err(source) = budget.check_elapsed(job_id, elapsed_millis) {
+        if matches!(
+            budget.snapshot(job_id).map(|job| job.state),
+            Ok(JobState::Failed {
+                worker_stopped: false,
+                ..
+            })
+        ) {
+            budget.acknowledge_worker_stopped(job_id)?;
+        }
+        return Err(source);
+    }
+    budget.fail(job_id, BlockReason::StoreIncomplete)?;
+    budget.acknowledge_worker_stopped(job_id)?;
+    Ok(observed_bytes)
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn run_store_worker() -> Result<(), String> {
@@ -308,6 +673,7 @@ fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
     let mut store = store::OwnedStore::create().map_err(|e| format!("create owned store: {e}"))?;
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
+        .env_clear()
         .arg("--child")
         .arg("stall")
         .stdin(Stdio::null())
@@ -395,6 +761,10 @@ fn run_store_worker_with_cleanup(cleanup: bool) -> Result<(), String> {
 }
 
 fn run_child(args: &[String]) -> Result<(), String> {
+    // Fixed probe check for the closed launch boundary; this is not process isolation.
+    if env::var_os("DISK_STEWARD_WORKER_ENV_SENTINEL").is_some() {
+        return Err("child environment sentinel present".into());
+    }
     match args {
         [mode] if mode == "flood" => {
             let mut stdout = io::stdout().lock();
@@ -420,6 +790,39 @@ fn run_child(args: &[String]) -> Result<(), String> {
             thread::sleep(CHILD_HOLD);
             Ok(())
         }
+        [mode] if mode == "store-handoff" => {
+            store::OwnedStore::validate_worker_stdin_handoff()
+                .map_err(|_| "store handoff refused".to_owned())?;
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(b"R")
+                .map_err(|_| "child readiness write failed")?;
+            stdout.flush().map_err(|_| "child readiness flush failed")?;
+            thread::sleep(CHILD_HOLD);
+            Ok(())
+        }
+        [mode] if mode == "store-payload" => {
+            let report = store::write_worker_stdin_payload()
+                .map_err(|_| "worker payload incomplete; retain store".to_owned())?;
+            if report.written_bytes != 32 * 1024 || !report.cap_reached {
+                return Err("worker payload limit not established".into());
+            }
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(b"R")
+                .map_err(|_| "child readiness write failed")?;
+            stdout.flush().map_err(|_| "child readiness flush failed")?;
+            thread::sleep(CHILD_HOLD);
+            Ok(())
+        }
+        [mode] if mode == "store-payload-partial" => {
+            if store::write_worker_stdin_partial_payload().is_err() {
+                // Fixed synthetic failure exit after the shared writer charged
+                // the observed partial allocation. Never signal readiness.
+                std::process::exit(86);
+            }
+            Err("fixed partial payload probe unexpectedly completed".into())
+        }
         [mode] if mode == "store-abandon" => run_store_abandon_child(),
         _ => Err("invalid private child mode".into()),
     }
@@ -442,6 +845,7 @@ fn run_store_reinspect() -> Result<(), String> {
     let deadline = start + OUTER_DEADLINE;
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let mut child = Command::new(exe)
+        .env_clear()
         .arg("--child")
         .arg("store-abandon")
         .stdin(Stdio::null())
@@ -559,6 +963,7 @@ fn supervise(case: Case) -> Result<Report, String> {
     let deadline = start + OUTER_DEADLINE;
     let executable = env::current_exe().map_err(|e| format!("locate own executable: {e}"))?;
     let mut child = Command::new(executable)
+        .env_clear()
         .arg("--child")
         .arg(case.child_mode())
         .stdin(Stdio::null())
@@ -715,6 +1120,7 @@ fn read_bounded<R: Read>(mut reader: R, sender: SyncSender<ReaderEvent>) {
     let mut bytes = 0_u64;
     let mut signaled_ready = false;
     let mut failed = false;
+    let mut interruptions = 0_u8;
     let mut buffer = [0_u8; READ_CHUNK];
     while bytes <= OUTPUT_LIMIT {
         let remaining = OUTPUT_LIMIT.saturating_add(1).saturating_sub(bytes) as usize;
@@ -724,13 +1130,23 @@ fn read_bounded<R: Read>(mut reader: R, sender: SyncSender<ReaderEvent>) {
             Ok(count) => {
                 bytes = bytes.saturating_add(count as u64);
                 if !signaled_ready {
+                    if buffer[0] != b'R' {
+                        failed = true;
+                        break;
+                    }
                     if sender.send(ReaderEvent::Ready).is_err() {
                         return;
                     }
                     signaled_ready = true;
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                interruptions = interruptions.saturating_add(1);
+                if interruptions > 16 {
+                    failed = true;
+                    break;
+                }
+            }
             Err(_) => {
                 failed = true;
                 break;
@@ -769,6 +1185,31 @@ fn stop_and_reap(child: &mut Child) -> Result<(), String> {
         })
 }
 
+fn wait_for_child_exit(child: &mut Child, deadline: Instant) -> Result<ExitStatus, String> {
+    const MAX_POLLS: usize = 512;
+    const POLL_INTERVAL: Duration = Duration::from_millis(2);
+    for _ in 0..MAX_POLLS {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll fixed child exit: {error}"))?
+        {
+            if Instant::now() >= deadline {
+                break;
+            }
+            return Ok(status);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(POLL_INTERVAL));
+    }
+    Err("fixed child exit was not observed before deadline".into())
+}
+
 fn finish_after_error<T>(
     mut child: Child,
     reader: JoinHandle<()>,
@@ -785,6 +1226,167 @@ fn finish_after_error<T>(
         (Err(cleanup_error), false) => Err(format!(
             "{error}; cleanup failed: {cleanup_error}; stdout reader thread panicked"
         )),
+    }
+}
+
+#[cfg(test)]
+mod bounded_reader_tests {
+    use super::{await_readiness, read_bounded, ReaderEvent, OUTPUT_LIMIT};
+    use std::collections::VecDeque;
+    use std::io::{self, Read};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    enum Action {
+        Bytes(Vec<u8>),
+        Interrupted,
+        Eof,
+    }
+
+    struct ScriptedReader(VecDeque<Action>);
+
+    impl ScriptedReader {
+        fn new(actions: impl IntoIterator<Item = Action>) -> Self {
+            Self(actions.into_iter().collect())
+        }
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front().unwrap_or(Action::Eof) {
+                Action::Bytes(mut bytes) => {
+                    let count = bytes.len().min(buffer.len());
+                    buffer[..count].copy_from_slice(&bytes[..count]);
+                    if count < bytes.len() {
+                        bytes.drain(..count);
+                        self.0.push_front(Action::Bytes(bytes));
+                    }
+                    Ok(count)
+                }
+                Action::Interrupted => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Action::Eof => Ok(0),
+            }
+        }
+    }
+
+    fn collect(actions: impl IntoIterator<Item = Action>) -> Vec<ReaderEvent> {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        read_bounded(ScriptedReader::new(actions), sender);
+        receiver.try_iter().collect()
+    }
+
+    #[test]
+    fn readiness_requires_exact_first_r_and_counts_rejected_bytes() {
+        let events = collect([Action::Bytes(vec![b'X', b'R']), Action::Eof]);
+        assert_eq!(
+            events,
+            [ReaderEvent::Finished {
+                bytes: 2,
+                failed: true
+            }]
+        );
+        let (sender, receiver) = mpsc::sync_channel(2);
+        read_bounded(
+            ScriptedReader::new([Action::Bytes(vec![b'X']), Action::Eof]),
+            sender,
+        );
+        assert!(await_readiness(&receiver, Instant::now() + Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn readiness_accepts_empty_eof_only_as_completion_and_exact_r() {
+        assert_eq!(
+            collect([Action::Eof]),
+            [ReaderEvent::Finished {
+                bytes: 0,
+                failed: false
+            }]
+        );
+        assert_eq!(
+            collect([Action::Bytes(vec![b'R']), Action::Eof]),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 1,
+                    failed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_accepts_split_r_then_data_and_counts_all_bytes() {
+        assert_eq!(
+            collect([
+                Action::Bytes(vec![b'R']),
+                Action::Bytes(b"data".to_vec()),
+                Action::Eof,
+            ]),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 5,
+                    failed: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_reads_have_a_cumulative_sixteen_retry_bound() {
+        let mut permitted = vec![Action::Interrupted; 16];
+        permitted.extend([Action::Bytes(vec![b'R']), Action::Eof]);
+        assert_eq!(
+            collect(permitted),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 1,
+                    failed: false
+                }
+            ]
+        );
+
+        let mut refused = vec![Action::Interrupted; 17];
+        refused.extend([Action::Bytes(vec![b'R']), Action::Eof]);
+        assert_eq!(
+            collect(refused),
+            [ReaderEvent::Finished {
+                bytes: 0,
+                failed: true
+            }]
+        );
+    }
+
+    #[test]
+    fn interruptions_after_readiness_remain_cumulative_and_output_cap_is_exact() {
+        let mut actions = vec![Action::Interrupted; 8];
+        actions.push(Action::Bytes(vec![b'R', b'x']));
+        actions.extend(vec![Action::Interrupted; 9]);
+        assert_eq!(
+            collect(actions),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: 2,
+                    failed: true
+                }
+            ]
+        );
+
+        let mut allowed = vec![Action::Interrupted; 16];
+        allowed.push(Action::Bytes(vec![b'R'; OUTPUT_LIMIT as usize + 1]));
+        assert_eq!(
+            collect(allowed),
+            [
+                ReaderEvent::Ready,
+                ReaderEvent::Finished {
+                    bytes: OUTPUT_LIMIT + 1,
+                    failed: false
+                }
+            ]
+        );
     }
 }
 
@@ -818,6 +1420,205 @@ mod store_worker_tests {
         second
             .record_stopped(&StopReceipt::confirmed(second.token(), 41))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parent_store_settlement_tests {
+    use super::settle_parent_store_budget;
+    use verification_budget::{
+        BlockReason, BudgetController, BudgetError, JobState, Limits, MINIMUM_FREE_RESERVE,
+        PER_REPOSITORY_TEMP_LIMIT,
+    };
+
+    fn controller() -> BudgetController {
+        BudgetController::new(Limits { headroom_bytes: 0 })
+    }
+
+    #[test]
+    fn successful_charge_preserves_ingress_then_marks_incomplete_and_stopped_once() {
+        let mut budget = controller();
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            settle_parent_store_budget(&mut budget, job, 0, MINIMUM_FREE_RESERVE + 8192, 0,),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(budget.snapshot(job).unwrap().usage.stored_bytes, 0);
+        budget.record_ingress(job, 29).unwrap();
+        assert_eq!(
+            settle_parent_store_budget(&mut budget, job, 4096, MINIMUM_FREE_RESERVE + 8192, 0,),
+            Ok(4096)
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.ingress_bytes, 29);
+        assert_eq!(snapshot.usage.stored_bytes, 4096);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::StoreIncomplete,
+                worker_stopped: true,
+            }
+        );
+        assert_eq!(
+            settle_parent_store_budget(&mut budget, job, 4096, MINIMUM_FREE_RESERVE + 8192, 0,),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(budget.snapshot(job).unwrap().usage.stored_bytes, 4096);
+        assert_eq!(budget.aggregate_stored(), Ok(4096));
+        let next = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_ne!(next, job);
+        assert_eq!(budget.aggregate_stored(), Ok(4096));
+        assert_eq!(budget.retained_job_count(), 2);
+    }
+
+    #[test]
+    fn free_space_refusal_keeps_observed_charge_and_original_reason_after_stop() {
+        let mut budget = controller();
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            settle_parent_store_budget(&mut budget, job, 2048, MINIMUM_FREE_RESERVE - 1, 0),
+            Err(BudgetError::Blocked(BlockReason::FreeSpaceReserve))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, 2048);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::FreeSpaceReserve,
+                worker_stopped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn numeric_storage_overshoot_is_retained_without_large_allocation() {
+        let mut budget = controller();
+        let job = budget
+            .start(MINIMUM_FREE_RESERVE + PER_REPOSITORY_TEMP_LIMIT + 1)
+            .unwrap();
+        let observed = PER_REPOSITORY_TEMP_LIMIT + 1;
+        assert_eq!(
+            settle_parent_store_budget(
+                &mut budget,
+                job,
+                observed,
+                MINIMUM_FREE_RESERVE + PER_REPOSITORY_TEMP_LIMIT + 1,
+                0,
+            ),
+            Err(BudgetError::Blocked(BlockReason::RepositoryStorageLimit))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, observed);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::RepositoryStorageLimit,
+                worker_stopped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_or_already_charged_running_jobs_refuse_before_second_charge() {
+        let mut budget = controller();
+        assert_eq!(
+            settle_parent_store_budget(
+                &mut budget,
+                verification_budget::JobId(99),
+                1024,
+                MINIMUM_FREE_RESERVE + 8192,
+                0,
+            ),
+            Err(BudgetError::UnknownJob(verification_budget::JobId(99)))
+        );
+
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        budget
+            .record_store(job, 17, MINIMUM_FREE_RESERVE + 8192)
+            .unwrap();
+        assert_eq!(
+            settle_parent_store_budget(&mut budget, job, 1024, MINIMUM_FREE_RESERVE + 8192, 0,),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, 17);
+        assert_eq!(snapshot.state, JobState::Running);
+    }
+
+    #[test]
+    fn elapsed_limit_boundary_is_inclusive_and_timeout_keeps_charge_and_stop() {
+        use verification_budget::MAX_ATTEMPT_MILLIS;
+
+        let mut budget = controller();
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            settle_parent_store_budget(
+                &mut budget,
+                job,
+                2048,
+                MINIMUM_FREE_RESERVE + 8192,
+                MAX_ATTEMPT_MILLIS,
+            ),
+            Ok(2048)
+        );
+
+        let mut budget = controller();
+        let job = budget.start(MINIMUM_FREE_RESERVE + 8192).unwrap();
+        assert_eq!(
+            settle_parent_store_budget(
+                &mut budget,
+                job,
+                2048,
+                MINIMUM_FREE_RESERVE + 8192,
+                MAX_ATTEMPT_MILLIS + 1,
+            ),
+            Err(BudgetError::Blocked(BlockReason::AttemptTimedOut))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, 2048);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::AttemptTimedOut,
+                worker_stopped: true,
+            }
+        );
+        let retained = snapshot.clone();
+        assert_eq!(
+            settle_parent_store_budget(&mut budget, job, 2048, MINIMUM_FREE_RESERVE + 8192, 0,),
+            Err(BudgetError::Blocked(BlockReason::JobNotRunning))
+        );
+        assert_eq!(budget.snapshot(job).unwrap(), &retained);
+    }
+
+    #[test]
+    fn storage_refusal_remains_first_when_elapsed_limit_is_also_exceeded() {
+        use verification_budget::MAX_ATTEMPT_MILLIS;
+
+        let mut budget = controller();
+        let job = budget
+            .start(MINIMUM_FREE_RESERVE + PER_REPOSITORY_TEMP_LIMIT + 1)
+            .unwrap();
+        let observed = PER_REPOSITORY_TEMP_LIMIT + 1;
+        assert_eq!(
+            settle_parent_store_budget(
+                &mut budget,
+                job,
+                observed,
+                MINIMUM_FREE_RESERVE + PER_REPOSITORY_TEMP_LIMIT + 1,
+                MAX_ATTEMPT_MILLIS + 1,
+            ),
+            Err(BudgetError::Blocked(BlockReason::RepositoryStorageLimit))
+        );
+        let snapshot = budget.snapshot(job).unwrap();
+        assert_eq!(snapshot.usage.stored_bytes, observed);
+        assert_eq!(
+            snapshot.state,
+            JobState::Failed {
+                reason: BlockReason::RepositoryStorageLimit,
+                worker_stopped: true,
+            }
+        );
     }
 }
 
