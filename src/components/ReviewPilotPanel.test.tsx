@@ -144,6 +144,15 @@ describe("explicit pilot report copying", () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     setClipboard({ writeText });
     const pilot = mountFinished();
+    fireEvent.change(screen.getByLabelText("Preservation"), {
+      target: { value: "correct" },
+    });
+    fireEvent.change(
+      screen.getByLabelText("Reversal count (optional, 0–10,000)"),
+      {
+        target: { value: "3" },
+      },
+    );
     expect(writeText).not.toHaveBeenCalled();
     const shown = (
       screen.getByLabelText("Pilot session report") as HTMLTextAreaElement
@@ -215,5 +224,99 @@ describe("explicit pilot report copying", () => {
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(writeText).not.toHaveBeenCalled();
+  });
+});
+
+describe("moderator observation session isolation", () => {
+  it("resets observations for a new report without changing either metrics report", () => {
+    const first = finishedPilot();
+    const firstMetrics = JSON.stringify(first.report, null, 2);
+    const props = {
+      recorder: first,
+      context,
+      busy: false,
+      canStart: true,
+    };
+    const view = render(<ReviewPilotPanel {...props} />);
+    fireEvent.click(screen.getByText("Review pilot recording"));
+
+    fireEvent.change(screen.getByLabelText("Preservation"), {
+      target: { value: "incorrect" },
+    });
+    const baseReport = screen.getByLabelText(
+      "Pilot session report",
+    ) as HTMLTextAreaElement;
+    expect(baseReport.value).toBe(firstMetrics);
+    expect(JSON.parse(baseReport.value)).toEqual(first.report);
+
+    const secondReport = {
+      ...first.report,
+      participantCode: "P2",
+      elapsedMs: 20,
+    };
+    view.rerender(
+      <ReviewPilotPanel
+        {...props}
+        recorder={{ ...first, report: secondReport }}
+      />,
+    );
+
+    expect(screen.getByLabelText("Preservation")).toHaveValue("not_recorded");
+    const secondBaseReport = screen.getByLabelText(
+      "Pilot session report",
+    ) as HTMLTextAreaElement;
+    expect(JSON.parse(secondBaseReport.value)).toEqual(secondReport);
+    const sidecar = JSON.parse(
+      (
+        screen.getByLabelText(
+          "Moderator observations JSON",
+        ) as HTMLTextAreaElement
+      ).value,
+    );
+    expect(sidecar.metricsReport).toEqual(secondReport);
+    expect(sidecar.metricsReport.humanAssessment).toBe("not_recorded");
+    expect(first.report).toEqual(JSON.parse(firstMetrics));
+  });
+});
+
+describe("moderator observation lifecycle", () => {
+  it("hides observations before finish and discards them when a session is discarded", () => {
+    const pilot = finishedPilot();
+    const props = { context, busy: false, canStart: true };
+    const view = render(
+      <ReviewPilotPanel
+        {...props}
+        recorder={{ ...pilot, phase: "idle", report: null }}
+      />,
+    );
+    fireEvent.click(screen.getByText("Review pilot recording"));
+    expect(screen.queryByLabelText("Preservation")).not.toBeInTheDocument();
+    view.rerender(
+      <ReviewPilotPanel
+        {...props}
+        recorder={{ ...pilot, phase: "recording", report: null }}
+      />,
+    );
+    expect(
+      screen.queryByLabelText("Moderator observations JSON"),
+    ).not.toBeInTheDocument();
+    view.rerender(<ReviewPilotPanel {...props} recorder={pilot} />);
+    fireEvent.change(screen.getByLabelText("Preservation"), {
+      target: { value: "incorrect" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Discard recording" }));
+    expect(pilot.discard).toHaveBeenCalledExactlyOnceWith();
+    view.rerender(
+      <ReviewPilotPanel
+        {...props}
+        recorder={{ ...pilot, phase: "idle", report: null }}
+      />,
+    );
+    expect(
+      screen.queryByLabelText("Moderator observations JSON"),
+    ).not.toBeInTheDocument();
+    // Reusing even the exact previous report cannot revive discarded notes.
+    view.rerender(<ReviewPilotPanel {...props} recorder={pilot} />);
+    expect(screen.getByLabelText("Preservation")).toHaveValue("not_recorded");
   });
 });
