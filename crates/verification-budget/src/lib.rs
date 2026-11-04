@@ -13,6 +13,11 @@ pub const PER_REPOSITORY_TEMP_LIMIT: u64 = 2 * GIB;
 pub const AGGREGATE_STORE_LIMIT: u64 = 4 * GIB;
 pub const MINIMUM_FREE_RESERVE: u64 = 2 * GIB;
 pub const MAX_ATTEMPT_MILLIS: u64 = 5 * 60 * 1000;
+/// Maximum number of job snapshots retained by one controller.
+///
+/// Completed and reconciled history remains available for the lifetime of the
+/// controller; once this bound is reached, new jobs fail closed.
+pub const MAX_RETAINED_JOBS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct JobId(pub u64);
@@ -20,6 +25,8 @@ pub struct JobId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockReason {
     AlreadyAtConcurrencyLimit,
+    /// The controller has retained its maximum number of job snapshots.
+    RetainedJobLimit,
     IngressLimit,
     RepositoryStorageLimit,
     AggregateStorageLimit,
@@ -105,6 +112,9 @@ impl BudgetController {
             JobState::Completed { .. } => false,
         }) {
             return Err(BudgetError::Blocked(BlockReason::AlreadyAtConcurrencyLimit));
+        }
+        if self.jobs.len() >= MAX_RETAINED_JOBS {
+            return Err(BudgetError::Blocked(BlockReason::RetainedJobLimit));
         }
         let protected = MINIMUM_FREE_RESERVE
             .checked_add(self.limits.headroom_bytes)
@@ -479,6 +489,90 @@ mod tests {
             .unwrap();
         assert_eq!(b.aggregate_stored().unwrap(), PER_REPOSITORY_TEMP_LIMIT);
         b.check_elapsed(id, MAX_ATTEMPT_MILLIS).unwrap();
+    }
+
+    #[test]
+    fn retained_job_cap_refuses_after_exact_capacity_without_mutation() {
+        let mut b = controller();
+        let mut first = None;
+        for _ in 0..MAX_RETAINED_JOBS - 1 {
+            let id = b.start(free()).unwrap();
+            first.get_or_insert(id);
+            b.complete(id).unwrap();
+            b.confirm_cleanup(id).unwrap();
+        }
+
+        let last = b.start(free()).unwrap();
+        assert_eq!(last, JobId(MAX_RETAINED_JOBS as u64));
+        assert_eq!(b.jobs.len(), MAX_RETAINED_JOBS);
+
+        // The concurrency gate keeps its historical precedence over capacity.
+        let next_id = b.next_id;
+        assert_eq!(
+            b.start(free()),
+            Err(BudgetError::Blocked(BlockReason::AlreadyAtConcurrencyLimit))
+        );
+        assert_eq!(b.next_id, next_id);
+
+        b.complete(last).unwrap();
+        b.confirm_cleanup(last).unwrap();
+        let retained_before_refusal = b.jobs.clone();
+        let next_id_before_refusal = b.next_id;
+        assert_eq!(
+            b.start(free()),
+            Err(BudgetError::Blocked(BlockReason::RetainedJobLimit))
+        );
+        assert_eq!(b.jobs, retained_before_refusal);
+        assert_eq!(b.next_id, next_id_before_refusal);
+        assert_eq!(b.jobs.len(), MAX_RETAINED_JOBS);
+        assert_eq!(
+            b.snapshot(first.unwrap()).unwrap().state,
+            JobState::Completed {
+                cleanup_confirmed: true
+            }
+        );
+        assert_eq!(b.snapshot(last).unwrap().usage.stored_bytes, 0);
+    }
+
+    #[test]
+    fn retained_job_cap_keeps_canceled_stopped_history_without_cleanup() {
+        let mut b = controller();
+        let mut first = None;
+        let mut last = None;
+        for _ in 0..MAX_RETAINED_JOBS {
+            let id = b.start(free()).unwrap();
+            first.get_or_insert(id);
+            b.record_ingress(id, 7).unwrap();
+            b.record_store(id, 1, free()).unwrap();
+            b.cancel(id).unwrap();
+            b.acknowledge_worker_stopped(id).unwrap();
+            last = Some(id);
+        }
+
+        assert_eq!(b.jobs.len(), MAX_RETAINED_JOBS);
+        assert_eq!(b.aggregate_stored().unwrap(), MAX_RETAINED_JOBS as u64);
+        let retained_before_refusal = b.jobs.clone();
+        let next_id_before_refusal = b.next_id;
+        assert_eq!(
+            b.start(free()),
+            Err(BudgetError::Blocked(BlockReason::RetainedJobLimit))
+        );
+        assert_eq!(b.jobs, retained_before_refusal);
+        assert_eq!(b.next_id, next_id_before_refusal);
+        assert_eq!(
+            b.snapshot(first.unwrap()).unwrap().state,
+            JobState::Canceled {
+                cleanup_confirmed: false,
+                worker_stopped: true
+            }
+        );
+        assert_eq!(
+            b.snapshot(last.unwrap()).unwrap().usage,
+            Usage {
+                ingress_bytes: 7,
+                stored_bytes: 1
+            }
+        );
     }
 
     #[test]

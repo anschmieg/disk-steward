@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-subtree-checkpoint"
+description = "Enables the save_subtree_checkpoint command without any pre-configured scope."
+commands.allow = ["save_subtree_checkpoint"]
+
+[[permission]]
+identifier = "deny-save-subtree-checkpoint"
+description = "Denies the save_subtree_checkpoint command without any pre-configured scope."
+commands.deny = ["save_subtree_checkpoint"]

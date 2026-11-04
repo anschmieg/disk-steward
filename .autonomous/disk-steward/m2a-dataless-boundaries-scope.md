@@ -1,0 +1,7 @@
+# MVP dataless boundaries and traversal explanations
+
+From durable PR11560e11ea/main eventual baseline. macOS SDK sys/stat.h defines SF_DATALESS0x40000000 for dataless objects. Check native-selected root nofollow metadata before opening, recheck held root/child metadata before enumeration, and refuse known dataless directories at selection/navigation/paging. Named child stat is checked before open, held child stat again after; no claim of atomic protection against flag races or complete cloud-provider behavior. Other platforms report unknown availability.
+
+DTO entries add availability dataless|unknown and navigationBlocker optional reason token for known directory exclusions (dataless, cross-device, hidden, managed boundary, depth). Absence of SF_DATALESS means unknown, never fully local. Show explanations in table/evidence inspector. Imported dataless file metadata stays blocked with explicit placeholder reason; no contents/hydration APIs/cleanup authority. Preserve all prior nofollow identity/coverage/cursor invalidation rules.
+
+Use pure flag/policy and private metadata test seams plus disposable normal dirs; do not create real provider placeholders or modify user cloud folders. Record that real iCloud/File Provider hydration behavior is unproven. Root reviews integration and serially runs native/frontend checks. No M2A/MVP acceptance; final MVP adversarial review/fix/validate/disable/stop remains mandatory.
