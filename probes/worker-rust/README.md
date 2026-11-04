@@ -356,3 +356,13 @@ storage or free-space refusal keeps its first reason.
 complete and partial reports. This is a stopped checkpoint, not continuous parent
 monitoring, a bound on noninterruptible system calls, or proof of production
 verification completion.
+
+All indexed modes also latch `NeedsReconciliation` in the live registry before
+fallible post-stop inspection or accounting. For complete, descriptor-only and
+stall modes, the latch follows the confirmed `Active` to `Stopped` transition
+and retains `prior_state=Stopped`. The partial mode keeps its existing
+`prior_state=Registered` latch. `reconciliation_latched=true` identifies the
+live check, including immediate reservation-growth and lifecycle retry refusal.
+Reopening must retain the same identity and reservation. A later observation
+failure cannot undo this latch; it does not establish completed reconciliation,
+cleanup eligibility or verified remote content.

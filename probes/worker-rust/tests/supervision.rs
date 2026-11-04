@@ -100,6 +100,7 @@ fn indexed_store_worker_reopens_as_reconciliation_without_cleanup_authority() {
         "coordinated_admission=true",
         "worker_joined=true",
         "registered_stopped=true",
+        "reconciliation_latched=true",
         "reopened_reconciliation=true",
         "prior_stopped=true",
         "reserved_bytes=131072",
@@ -297,6 +298,7 @@ fn indexed_store_descriptor_handoff_requires_exact_capability_and_arguments() {
         "descriptor_handoff=true",
         "worker_joined=true",
         "registered_stopped=true",
+        "reconciliation_latched=true",
         "reopened_reconciliation=true",
         "cleanup=not_authorized",
     ] {
@@ -350,6 +352,7 @@ fn indexed_worker_payload_uses_descriptor_and_remains_reconciliation_required() 
         "descriptor_handoff=true",
         "payload_validated=true",
         "payload_written=32768",
+        "reconciliation_latched=true",
         "parent_budget_incomplete=true",
         "parent_worker_stopped=true",
         "parent_elapsed_checked=true",

@@ -1,0 +1,7 @@
+# M0: latch stopped indexed attempts before fallible post-stop work
+
+Build on PR99, main eventual integration baseline. Every nonpartial indexed mode currently records Stopped, then runs fallible native inspection/accounting before Registry reopen supplies NeedsReconciliation. Persist require_reconciliation(id, Stopped) immediately after confirmed stop is recorded and before those fallible operations. Validate the returned exact native identities, prior Stopped state and retained reservation, and check immediate growth/lifecycle retry refusal. No synthetic worker operation proves remote verification success, including descriptor-only/stall modes.
+
+Reports explicitly identify reconciliation_latched=true; reopen must retain NeedsReconciliation/priorStopped/reservation. Existing partial Registered-prior latch remains unchanged. Reuse existing registry API, no schema, cleanup, capacity release, retry, adoption or new renderer capability. Validate no later post-stop work is invoked until latch and record validation succeed, and a deterministic post-stop observation refusal still leaves the live registry latched and blocking growth; use private test seams and task-owned disposable fixtures, not timing races or new user-visible execution modes.
+
+This is conservative incomplete-state bookkeeping after exact stop, not completed reconciliation or production/global enforcement. Same-user races, power-loss, continuous accounting, private authentication and milestone acceptance remain open. Version0.0.x/no release/no user-file deletion.
