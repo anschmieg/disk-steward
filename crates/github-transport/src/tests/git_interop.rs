@@ -543,6 +543,19 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
     )
     .unwrap();
     assert_eq!(decoded_pack.objects().len(), 4);
+    let closure = check_pack_graph_closure(
+        &decoded_pack,
+        &[
+            (hex_oid(&commit), GitObjectKind::Commit),
+            (hex_oid(&tag_object), GitObjectKind::Tag),
+        ],
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(closure.root_count(), 2);
+    assert_eq!(closure.reachable_objects(), 4);
+    assert_eq!(closure.checked_edges(), 3);
 
     assert_eq!(checksum.checksum().as_slice(), &pack[pack.len() - 20..]);
     let entry = parse_sha1_pack_entry_header(&pack[12..], 12, 512).unwrap();

@@ -4,6 +4,8 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod graph;
+pub use graph::{check_pack_graph_closure, PackGraphReport};
 mod tag;
 pub use tag::{parse_sha1_tag, GitTagLink};
 mod commit;
@@ -2128,6 +2130,7 @@ mod tests {
     mod failure_tests;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod git_interop;
+    mod graph_tests;
     mod inflate_tests;
     mod object_identity_tests;
     mod pack_tests;
