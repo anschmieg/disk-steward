@@ -245,7 +245,7 @@ is gated to the registry adapter's Linux/macOS targets. No application or
 renderer calls this test sink.
 
 The fixed system-Git fixture supervises repository setup and local receiver
-verification with a ten-second per-command budget, while upload-pack RPC
+verification with a thirty-second per-command budget, while upload-pack RPC
 commands retain a three-second budget. Shared macOS CI exceeded the earlier
 three-second setup budget; the failing child was reaped. These are test-fixture
 limits, not changes to transport or product attempt deadlines.
@@ -377,3 +377,118 @@ or authorize cleanup. These limits and backward-only resolution do not establish
 product Git support. Tests cover real Git object correspondence, independent
 REF/OFS vectors, depth and cumulative limits, unsupported bases, exact object
 counts, corruption, truncation and extra data.
+
+### Structural tree links
+
+`parse_sha1_tree` parses one raw SHA-1 tree body into borrowed raw names,
+canonical mode classes and nonzero object IDs. It checks exact entry framing,
+Git's directory-aware ordering and duplicate basenames, including duplicates
+separated by other names. Mode and name searches are bounded; metadata allocation
+is fallible. Experimental limits are 16 MiB input, 4,096 entries and 1,024 bytes
+per name, with a caller-lowered entry ceiling and cooperative attempt controls.
+
+Names are neither converted into paths nor extracted. Slash, dot, dot-dot and
+ASCII-case-insensitive `.git` are refused, but this is not comprehensive platform
+path validation or full Git fsck. Gitlink mode is reported as external commit
+metadata and never followed; complex-layout product gates remain. Callers must
+bind the body to its tree type and object ID, verify referenced object types and
+presence, and validate relevant graphs before making any product decision.
+Tests cover raw non-UTF-8 names, every canonical mode, malformed/truncated entries,
+ordering/duplicate traps, limits, and Git-generated tree correspondence.
+
+### Structural commit links
+
+`parse_sha1_commit` extracts a tree ID and ordered parent IDs from one supplied
+SHA-1 commit body. It requires canonical link headers, nonempty author/committer
+headers in the supported order, optional-header framing, and a blank separator.
+Optional signature and mergetag continuations remain uninterpreted; the message
+after the separator is opaque. Duplicate/misplaced core headers, malformed IDs,
+NUL/CR header bytes and orphan continuations are refused.
+
+Experimental limits are 16 MiB input, 64 KiB headers, 8,192 bytes per line,
+2,048 physical header lines and 1,024 parents; callers may lower the parent cap.
+Searches and parent allocation are bounded with cooperative attempt controls.
+The parser does not bind object type/hash, validate identity or timestamp syntax,
+verify signatures, perform full fsck, or prove linked-object presence or graph
+completeness. It may reject historical/noncanonical commits. No cleanup authority
+follows from its result. Tests include root and merge objects produced by Git,
+ordered parent correspondence, optional continuations, malformed/core-order
+cases, limits, interruption and opaque binary message boundaries.
+
+The test-only local Git setup/receiver allowance is now thirty seconds after
+macOS CI reaped two cold fixture setup commands at the previous ten-second
+limit. The three-second protocol RPC deadline and production attempt limits
+remain unchanged. This does not turn a timeout into a successful verification;
+commands must still finish successfully within the bounded fixture allowance.
+
+### Structural annotated-tag links
+
+`parse_sha1_tag` extracts a canonical SHA-1 target ID, declared target kind and
+borrowed raw tag name from a supported annotated-tag header. It accepts the
+object/type/tag order, an optional nonempty tagger line and a blank separator.
+Extra headers and continuations are refused. Names use the existing pinned tag
+validator; the message and any signature after the separator remain opaque.
+
+Experimental limits are 16 MiB input, 64 KiB header, 8,192-byte lines and a
+1,024-byte name, with cooperative attempt checks. This parser does not bind the
+tag object's hash/type, verify target presence or type, recursively peel tags,
+validate tagger identity/timestamps, verify signatures, perform full fsck, prove
+graph completeness, or authorize cleanup. Tests compare all four declared target
+kinds with Git mktag and canonical IDs, and cover raw names, tagger-less framing,
+opaque signature bytes, malformed headers, truncation, limits and controls.
+
+### Selected-root pack closure
+
+`check_pack_graph_closure` inspects a decoded pack from explicit typed roots. It
+requires every reachable commit tree/parent, tree entry and annotated-tag target
+to resolve to an object of the expected kind in that pack. Reachable gitlinks
+are unsupported. An iterative traversal visits each object ID once, while every
+repeated edge still consumes the 16,384-edge limit. Roots are limited to 64;
+existing decoder and per-object parser bounds also apply. Index, queue and visit
+storage use fallible bounded allocation. Identical duplicate pack entries share
+one visit; conflicting entries for an ID are refused.
+
+Only selected-root presence and type closure is established. Unreachable entries
+are not syntax-checked. This is not full Git fsck, complete semantic validation,
+platform path validation, signature verification, fresh remote-ref binding or
+local-work preservation evidence. The caller supplies root types; this stage does
+not infer which roots are required. It remains inactive and grants no cleanup
+eligibility. Logical work limits do not establish a total process-memory bound;
+cooperative controls still require an outer supervised worker.
+
+### Advertised-root decode and closure
+
+`decode_advertised_pack` composes a completed pack-transfer report with decoding
+and graph closure of caller-supplied bytes. It requires an exact accepted-byte
+count, resolves every advertised tip, requires commit objects for HEAD and branch
+refs, and uses decoded kinds for other namespaces. Symref targets must appear in
+the same advertisement with the same ID. Peeled tag claims must match the terminal
+non-tag object reached through typed tag links. Repeated peel claims share a
+16,384-step budget. Existing decoder, graph and parser caps remain in force;
+there are at most 1,024 advertised refs and 64 distinct roots.
+
+The caller must provide bytes actually captured from that report's sink. Length
+and matching roots do not prove stream provenance. The operation remains inactive
+and does not establish an atomic remote snapshot, required local-state coverage,
+full fsck, signatures, practical private authentication, production worker/RSS
+limits or cleanup eligibility. Strict supported-subset refusals remain incomplete
+verification. Tests use bounded private TLS fixtures and the isolated real-Git
+fetch/strict receiver fixture; no user repository is accessed.
+
+### Required-object reachability
+
+`AdvertisedPackReport::check_required_objects` checks caller-supplied typed IDs
+against the report's privately retained advertised roots. Each requested object
+must be present with the expected kind and visited by the bounded root traversal;
+an unrelated extra pack entry does not count as coverage. The set must contain
+1–1,024 nonzero IDs. Duplicates consume the request count and every supplied kind
+is checked. The result reports request and graph counts, with no cleanup flag.
+
+This relation does not discover or attest local repository state. Callers still
+need a complete, stable local inventory, local ref-name preservation/disposition,
+receipt freshness and revalidation, and treatment of working files, hooks,
+configuration, stashes and recoverable state. The earlier stream-provenance,
+full-fsck, authentication, worker/RSS and cleanup limits remain. Traversal reuses
+existing fallible allocation and cooperative controls without cloning payloads.
+Tests distinguish an unreachable packed object from a reachable ancestor and
+check all four fixture object kinds through the real-Git private TLS flow.
