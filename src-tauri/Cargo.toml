@@ -21,11 +21,13 @@ disk-steward-review-plan = { path = "../crates/review-plan" }
 disk-steward-demo-execution = { path = "../crates/demo-execution" }
 disk-steward-fixture-purge = { path = "../crates/fixture-purge" }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.8.4"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.6", features = ["process"] }
+rustix = { version = "1.1.6", features = ["process", "fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -33,7 +35,6 @@ objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSValue", "NSString", "NSURL"] }
 
 [dev-dependencies]
-serde_json = "1.0"
 tempfile = "3.27.0"
 
 # Keep native development artifacts bounded; application line tables remain.
