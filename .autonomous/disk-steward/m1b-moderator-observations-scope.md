@@ -1,0 +1,7 @@
+# M1B: separate explicit moderator observations
+
+Build on PR107 with main as eventual integration baseline. The review pilot protocol requires moderator observations of preservation, comprehension, confusion, reversals and assistance, separately from automatic aggregate metrics. Add an optional, finished-report-only structured checklist and separate displayed anonymous JSON artifact. The automatic metrics report remains immutable with humanAssessment=not_recorded.
+
+Use fixed enumerated choices with Not recorded defaults for preservation/comprehension/assistance, and optional integer confusion/reversal counts bounded 0..10000. No free-text notes, paths, native commands, persistence, network, automatic copying, overall pass/fail calculation or execution authority. Embed the exact immutable metrics report in the sidecar so observations remain bound to the displayed session. Preserve base Copy report semantics. Sidecar can be selected/copied manually. Disable inputs while busy; reset checklist on discard/new/different report and hide before finish. Label evidence as manual entries, not app certification.
+
+Root reviews component semantics and validates adversarial numeric inputs, report isolation/reset, no changes to base report, busy-state behavior and no implicit clipboard/native requests. Run frontend/type/build/format/version checks. This scaffolding does not conduct the three-human pilot, native accessibility or performance acceptance, and cannot complete M1B. Keep0.0.x/no release.

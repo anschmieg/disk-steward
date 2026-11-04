@@ -1,0 +1,79 @@
+.folder-inventory {
+  padding: 24px;
+}
+.folder-inventory p {
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.folder-inventory table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 16px;
+  text-align: left;
+}
+.folder-inventory caption {
+  text-align: left;
+  padding: 12px 0;
+}
+.folder-inventory th,
+.folder-inventory td {
+  padding: 10px 12px;
+  border-bottom: 1px solid currentColor;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.folder-inventory td:nth-child(3) {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.folder-inventory select {
+  max-width: 100%;
+  margin: 8px;
+  padding: 8px;
+  font: inherit;
+}
+.folder-inventory nav ol {
+  display: flex;
+  flex-wrap: wrap;
+  list-style: none;
+  gap: 8px;
+  padding: 0;
+}
+.folder-inventory nav li + li::before {
+  content: "/";
+  margin-right: 8px;
+}
+.folder-inventory input {
+  max-width: 100%;
+  margin: 8px;
+  padding: 8px;
+  font: inherit;
+}
+.folder-inventory .inventory-size {
+  position: relative;
+}
+.inventory-size-bar {
+  position: absolute;
+  inset: 4px auto 4px 0;
+  background: currentColor;
+  opacity: 0.09;
+  pointer-events: none;
+}
+.inventory-size-value {
+  position: relative;
+}
+.inventory-evidence {
+  margin-top: 20px;
+  padding-top: 12px;
+  border-top: 1px solid currentColor;
+}
+.inventory-evidence dl {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) minmax(100px, 2fr);
+  gap: 8px;
+}
+.inventory-evidence dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
