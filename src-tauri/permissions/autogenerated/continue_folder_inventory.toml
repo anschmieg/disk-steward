@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-continue-folder-inventory"
+description = "Enables the continue_folder_inventory command without any pre-configured scope."
+commands.allow = ["continue_folder_inventory"]
+
+[[permission]]
+identifier = "deny-continue-folder-inventory"
+description = "Denies the continue_folder_inventory command without any pre-configured scope."
+commands.deny = ["continue_folder_inventory"]
