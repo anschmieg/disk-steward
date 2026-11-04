@@ -623,6 +623,18 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
             .unwrap();
         assert_eq!(decoded.kind(), kind);
         assert_eq!(decoded.content(), raw);
+        if kind == GitObjectKind::Commit {
+            let links = parse_sha1_commit(
+                decoded.content(),
+                1024,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(links.tree(), &hex_oid(&tree));
+            assert!(links.parents().is_empty());
+        }
+
         if kind == GitObjectKind::Tree {
             let links = parse_sha1_tree(
                 decoded.content(),
@@ -1020,4 +1032,58 @@ fn real_git_tree_modes_and_directory_order_match_parser() {
     for index in [0, 2, 4] {
         assert_eq!(links[index].oid(), &hex_oid(&blob));
     }
+}
+
+#[test]
+fn real_git_merge_commit_preserves_ordered_parent_links() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, _, tree, commit, _) = make_repository(&root).unwrap();
+    let child = object_id(
+        &checked_git(
+            &root,
+            &["-C", &repo, "commit-tree", &tree, "-p", &commit],
+            b"child\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let merge = object_id(
+        &checked_git(
+            &root,
+            &[
+                "-C",
+                &repo,
+                "commit-tree",
+                &tree,
+                "-p",
+                &child,
+                "-p",
+                &commit,
+            ],
+            b"merge\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let raw = checked_git(&root, &["-C", &repo, "cat-file", "commit", &merge], b"").unwrap();
+    let links = parse_sha1_commit(
+        &raw,
+        2,
+        &CancellationHandle::new(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(links.tree(), &hex_oid(&tree));
+    assert_eq!(links.parents(), &[hex_oid(&child), hex_oid(&commit)]);
+    assert_eq!(&raw[links.header_bytes()..], b"merge\n");
+    assert_eq!(
+        git_sha1_object_id(
+            GitObjectKind::Commit,
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5)
+        )
+        .unwrap(),
+        hex_oid(&merge)
+    );
 }
