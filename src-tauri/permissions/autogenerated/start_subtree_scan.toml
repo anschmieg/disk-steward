@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-subtree-scan"
+description = "Enables the start_subtree_scan command without any pre-configured scope."
+commands.allow = ["start_subtree_scan"]
+
+[[permission]]
+identifier = "deny-start-subtree-scan"
+description = "Denies the start_subtree_scan command without any pre-configured scope."
+commands.deny = ["start_subtree_scan"]

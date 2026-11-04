@@ -55,6 +55,14 @@ export type FolderTreeSummary = {
   stopReason: string | null;
 };
 
+type SubtreeProgress = FolderTreeSummary & {
+  scanId: string;
+  canContinue: boolean;
+  scanFinished: boolean;
+  entriesThisBatch: number;
+  scanReleased?: boolean;
+};
+
 export default function FolderInventoryPanel({
   native,
   active = true,
@@ -75,6 +83,8 @@ export default function FolderInventoryPanel({
     cancelRequested: boolean;
   } | null>(null);
   const cancelInFlight = useRef(false);
+  const continueScanRef = useRef(false);
+  const [pauseRequested, setPauseRequested] = useState(false);
   const [summaryRunning, setSummaryRunning] = useState(false);
   const [cancelPhase, setCancelPhase] = useState<
     "ready" | "sending" | "requested"
@@ -85,9 +95,7 @@ export default function FolderInventoryPanel({
   const chooseRef = useRef<HTMLButtonElement>(null);
   const treeHeadingRef = useRef<HTMLHeadingElement>(null);
   const focusChooseAfterClear = useRef(false);
-  const [treeSummary, setTreeSummary] = useState<FolderTreeSummary | null>(
-    null,
-  );
+  const [treeSummary, setTreeSummary] = useState<SubtreeProgress | null>(null);
   const [checkpoint, setCheckpoint] = useState<FolderCheckpoint | null>(null);
   const [snapshot, setSnapshot] = useState<FolderInventory | null>(null);
   const [busy, setBusy] = useState(false);
@@ -107,8 +115,9 @@ export default function FolderInventoryPanel({
     if (active && selectedId !== null) evidenceHeadingRef.current?.focus();
   }, [selectedId, active]);
   useEffect(() => {
-    if (active && treeSummary) treeHeadingRef.current?.focus();
-  }, [treeSummary, active]);
+    if (active && treeSummary && !summaryRunning)
+      treeHeadingRef.current?.focus();
+  }, [treeSummary, active, summaryRunning]);
   const inspect = async (
     entryId?: string | null,
     pageAction?: "next" | "refresh",
@@ -324,54 +333,106 @@ export default function FolderInventoryPanel({
       onBusyChange(false);
     }
   };
-  const summarizeTree = async () => {
+  const summarizeTree = async (resume = false) => {
     if (!native || !snapshot || activeRequest.current) return;
-    let attemptId: string;
-    try {
-      attemptId = `disk-steward:summary-attempt:v1:${crypto.randomUUID()}`;
-    } catch {
-      setMessage(
-        "The summary could not be started reliably. The folder page is unchanged.",
-      );
-      return;
-    }
-    const job = {
-      attemptId,
-      observationId: snapshot.observationId,
-      cancelRequested: false,
-    };
+    if (resume && !treeSummary?.canContinue) return;
     activeRequest.current = true;
+    continueScanRef.current = true;
+    setPauseRequested(false);
     setBusy(true);
     onBusyChange(true);
     setMessage("");
-    setTreeSummary(null);
-    summaryJobRef.current = job;
+    if (!resume) setTreeSummary(null);
     setSummaryRunning(true);
-    setCancelPhase("ready");
+    let retained = resume ? treeSummary : null;
     try {
-      const result = await invoke<FolderTreeSummary>(
-        "inspect_folder_tree_summary",
-        {
-          request: {
-            expectedObservationId: snapshot.observationId,
-            attemptId: job.attemptId,
+      while (continueScanRef.current) {
+        const job = {
+          attemptId: `disk-steward:summary-attempt:v1:${crypto.randomUUID()}`,
+          observationId: snapshot.observationId,
+          cancelRequested: false,
+        };
+        summaryJobRef.current = job;
+        setCancelPhase("ready");
+        const result = await invoke<SubtreeProgress>(
+          retained ? "continue_subtree_scan" : "start_subtree_scan",
+          {
+            request: {
+              expectedObservationId: job.observationId,
+              attemptId: job.attemptId,
+              ...(retained ? { scanId: retained.scanId } : {}),
+            },
           },
-        },
-      );
-      if (result.observationId !== snapshot.observationId)
-        throw new Error("Observation mismatch");
-      setTreeSummary(result);
-      if (job.cancelRequested)
-        setMessage("The summary completed before cancellation took effect.");
+        );
+        if (
+          result.observationId !== snapshot.observationId ||
+          (retained && result.scanId !== retained.scanId) ||
+          (result.canContinue && !result.scanId)
+        )
+          throw new Error("Scan identity mismatch");
+        setTreeSummary(result);
+        retained = result;
+        if (job.cancelRequested)
+          setMessage(
+            "The summary batch completed before cancellation took effect. Remaining progress is paused.",
+          );
+        if (!result.canContinue) break;
+      }
+      if (retained?.canContinue && !continueScanRef.current)
+        setMessage(
+          "Subtree scan paused at a batch boundary. Progress is retained in memory; resume or discard it explicitly.",
+        );
     } catch {
+      setTreeSummary((previous) =>
+        previous ? { ...previous, canContinue: false } : previous,
+      );
       setMessage(
-        job.cancelRequested
+        summaryJobRef.current?.cancelRequested
           ? "The summary ended without a reliable result after cancellation was requested. The folder page is unchanged."
-          : "The subtree summary could not be completed reliably. The folder page is unchanged. Review remembered exclusions or choose the folder again to refresh its scope.",
+          : "The subtree summary could not be completed reliably. The folder page is unchanged. Prior scan counts are historical; start again or discard the scan state.",
       );
     } finally {
+      continueScanRef.current = false;
       summaryJobRef.current = null;
       setSummaryRunning(false);
+      activeRequest.current = false;
+      setBusy(false);
+      onBusyChange(false);
+    }
+  };
+  const pauseScan = () => {
+    continueScanRef.current = false;
+    setPauseRequested(true);
+    setMessage(
+      "Pause requested. Waiting for the current metadata batch to finish; an in-flight filesystem call may still finish.",
+    );
+  };
+  const discardScan = async () => {
+    if (!native || !snapshot || !treeSummary?.scanId || activeRequest.current)
+      return;
+    activeRequest.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    try {
+      await invoke("discard_subtree_scan", {
+        request: {
+          expectedObservationId: snapshot.observationId,
+          scanId: treeSummary.scanId,
+        },
+      });
+      setTreeSummary((previous) =>
+        previous
+          ? { ...previous, canContinue: false, scanReleased: true }
+          : previous,
+      );
+      setMessage(
+        "Scan state released. Historical counts remain; no source files or saved review metadata changed.",
+      );
+    } catch {
+      setMessage(
+        "Scan-state release could not be confirmed. The historical view remains; clear the folder scope to release its retained state.",
+      );
+    } finally {
       activeRequest.current = false;
       setBusy(false);
       onBusyChange(false);
@@ -381,6 +442,7 @@ export default function FolderInventoryPanel({
     const job = summaryJobRef.current;
     if (!native || !job || cancelInFlight.current || job.cancelRequested)
       return;
+    continueScanRef.current = false;
     cancelInFlight.current = true;
     setCancelPhase("sending");
     try {
@@ -551,6 +613,15 @@ export default function FolderInventoryPanel({
           {summaryRunning && (
             <button
               className="button secondary"
+              disabled={pauseRequested}
+              onClick={pauseScan}
+            >
+              {pauseRequested ? "Pause requested" : "Pause subtree scan"}
+            </button>
+          )}
+          {summaryRunning && (
+            <button
+              className="button secondary"
               disabled={cancelPhase !== "ready"}
               onClick={() => void cancelSummary()}
             >
@@ -566,12 +637,17 @@ export default function FolderInventoryPanel({
             summary finishes. It cannot interrupt an in-flight filesystem call.
           </p>
           <p>
-            Explicit read-only summary: up to 4,096 entries, 16 levels and
-            cooperative two-second checks. File contents are not read. Links and
-            unsupported boundaries are skipped; coverage gaps remain visible.
-            Remembered exclusions are verified for this summary; uncertain rules
-            or an excluded selected scope refuse the summary. The immediate-page
-            metadata view remains separate from this scan policy.
+            Explicit read-only subtree scan: sequential batches of up to 512
+            entries, at most 65,536 entries and 16 levels, with cooperative
+            two-second checks per batch. Continuation expires after 15 minutes;
+            idle scan state remains until discarded, the folder scope changes,
+            or the app exits. Pause waits for a batch boundary; retained subtree
+            progress does not survive app restart. File contents are not read.
+            Links and unsupported boundaries are skipped; coverage gaps remain
+            visible. Remembered exclusions are verified for this summary;
+            uncertain rules or an excluded selected scope refuse the summary.
+            The immediate-page metadata view remains separate from this scan
+            policy.
           </p>
           {treeSummary && (
             <section
@@ -590,7 +666,39 @@ export default function FolderInventoryPanel({
                     "Some metadata could not be observed reliably.")
                   : ""}
               </p>
+              <p>
+                {treeSummary.canContinue
+                  ? summaryRunning
+                    ? "Scanning; more metadata remains."
+                    : "Paused; more metadata remains."
+                  : treeSummary.scanFinished
+                    ? "Traversal finished within its policy; coverage gaps may remain."
+                    : "Scan stopped or ended without resumable progress."}
+              </p>
+              {treeSummary.canContinue && !summaryRunning && (
+                <button
+                  className="button secondary"
+                  disabled={busy || !native}
+                  onClick={() => void summarizeTree(true)}
+                >
+                  Resume subtree scan
+                </button>
+              )}
+              {treeSummary.scanId &&
+                !treeSummary.scanFinished &&
+                !treeSummary.scanReleased &&
+                !summaryRunning && (
+                  <button
+                    className="button secondary"
+                    disabled={busy || !native}
+                    onClick={() => void discardScan()}
+                  >
+                    Discard subtree scan state
+                  </button>
+                )}
               <dl>
+                <dt>Entries in latest batch</dt>
+                <dd>{treeSummary.entriesThisBatch}</dd>
                 <dt>Observed entry records</dt>
                 <dd>{treeSummary.entriesObserved}</dd>
                 <dt>Regular-file names</dt>
