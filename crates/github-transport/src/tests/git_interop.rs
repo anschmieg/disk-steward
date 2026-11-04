@@ -623,6 +623,18 @@ fn real_git_refs_and_fetch_verify_objects_in_isolated_receiver() {
             .unwrap();
         assert_eq!(decoded.kind(), kind);
         assert_eq!(decoded.content(), raw);
+        if kind == GitObjectKind::Tag {
+            let link = parse_sha1_tag(
+                decoded.content(),
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(link.target(), &hex_oid(&commit));
+            assert_eq!(link.target_kind(), GitObjectKind::Commit);
+            assert_eq!(link.name(), b"fixture");
+        }
+
         if kind == GitObjectKind::Commit {
             let links = parse_sha1_commit(
                 decoded.content(),
@@ -1086,4 +1098,43 @@ fn real_git_merge_commit_preserves_ordered_parent_links() {
         .unwrap(),
         hex_oid(&merge)
     );
+}
+
+#[test]
+fn real_git_mktag_matches_all_declared_target_kinds() {
+    let root = PrivateRoot::create().unwrap();
+    let (repo, blob, tree, commit, tag) = make_repository(&root).unwrap();
+    for (kind, expected, target) in [
+        ("blob", GitObjectKind::Blob, &blob),
+        ("tree", GitObjectKind::Tree, &tree),
+        ("commit", GitObjectKind::Commit, &commit),
+        ("tag", GitObjectKind::Tag, &tag),
+    ] {
+        let name = format!("v-{kind}");
+        let input=format!("object {target}\ntype {kind}\ntag {name}\ntagger P <p@e> 1234567890 +0000\n\nfixture\n");
+        let oid =
+            object_id(&checked_git(&root, &["-C", &repo, "mktag"], input.as_bytes()).unwrap())
+                .unwrap();
+        let raw = checked_git(&root, &["-C", &repo, "cat-file", "tag", &oid], b"").unwrap();
+        let link = parse_sha1_tag(
+            &raw,
+            &CancellationHandle::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(link.target(), &hex_oid(target));
+        assert_eq!(link.target_kind(), expected);
+        assert_eq!(link.name(), name.as_bytes());
+        assert_eq!(&raw[link.header_bytes()..], b"fixture\n");
+        assert_eq!(
+            git_sha1_object_id(
+                GitObjectKind::Tag,
+                &raw,
+                &CancellationHandle::new(),
+                Instant::now() + Duration::from_secs(5)
+            )
+            .unwrap(),
+            hex_oid(&oid)
+        );
+    }
 }

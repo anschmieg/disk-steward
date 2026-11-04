@@ -414,8 +414,25 @@ completeness. It may reject historical/noncanonical commits. No cleanup authorit
 follows from its result. Tests include root and merge objects produced by Git,
 ordered parent correspondence, optional continuations, malformed/core-order
 cases, limits, interruption and opaque binary message boundaries.
+
 The test-only local Git setup/receiver allowance is now thirty seconds after
 macOS CI reaped two cold fixture setup commands at the previous ten-second
 limit. The three-second protocol RPC deadline and production attempt limits
 remain unchanged. This does not turn a timeout into a successful verification;
 commands must still finish successfully within the bounded fixture allowance.
+
+### Structural annotated-tag links
+
+`parse_sha1_tag` extracts a canonical SHA-1 target ID, declared target kind and
+borrowed raw tag name from a supported annotated-tag header. It accepts the
+object/type/tag order, an optional nonempty tagger line and a blank separator.
+Extra headers and continuations are refused. Names use the existing pinned tag
+validator; the message and any signature after the separator remain opaque.
+
+Experimental limits are 16 MiB input, 64 KiB header, 8,192-byte lines and a
+1,024-byte name, with cooperative attempt checks. This parser does not bind the
+tag object's hash/type, verify target presence or type, recursively peel tags,
+validate tagger identity/timestamps, verify signatures, perform full fsck, prove
+graph completeness, or authorize cleanup. Tests compare all four declared target
+kinds with Git mktag and canonical IDs, and cover raw names, tagger-less framing,
+opaque signature bytes, malformed headers, truncation, limits and controls.

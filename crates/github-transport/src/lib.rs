@@ -4,6 +4,8 @@
 //! resolver and cannot be interrupted here; callers need an outer worker
 //! deadline. See the crate README for the current scope and limits.
 
+mod tag;
+pub use tag::{parse_sha1_tag, GitTagLink};
 mod commit;
 pub use commit::{parse_sha1_commit, GitCommitLinks};
 mod tree;
@@ -2129,6 +2131,7 @@ mod tests {
     mod inflate_tests;
     mod object_identity_tests;
     mod pack_tests;
+    mod tag_tests;
     mod tree_tests;
 
     use super::*;
