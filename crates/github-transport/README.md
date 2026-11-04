@@ -245,7 +245,7 @@ is gated to the registry adapter's Linux/macOS targets. No application or
 renderer calls this test sink.
 
 The fixed system-Git fixture supervises repository setup and local receiver
-verification with a ten-second per-command budget, while upload-pack RPC
+verification with a thirty-second per-command budget, while upload-pack RPC
 commands retain a three-second budget. Shared macOS CI exceeded the earlier
 three-second setup budget; the failing child was reaped. These are test-fixture
 limits, not changes to transport or product attempt deadlines.
@@ -414,6 +414,12 @@ completeness. It may reject historical/noncanonical commits. No cleanup authorit
 follows from its result. Tests include root and merge objects produced by Git,
 ordered parent correspondence, optional continuations, malformed/core-order
 cases, limits, interruption and opaque binary message boundaries.
+
+The test-only local Git setup/receiver allowance is now thirty seconds after
+macOS CI reaped two cold fixture setup commands at the previous ten-second
+limit. The three-second protocol RPC deadline and production attempt limits
+remain unchanged. This does not turn a timeout into a successful verification;
+commands must still finish successfully within the bounded fixture allowance.
 
 ### Structural annotated-tag links
 
@@ -621,3 +627,44 @@ allocation. Each of at most 1,024 entries and present links is processed once,
 with binary target lookup and cancellation/deadline checks during traversal
 and completion.
 It cannot establish consistency of refs omitted by the caller or native atomicity.
+
+The closed private pack-file fixture reconciles the completed transfer's
+cumulative raw HTTP ingress into the same `BudgetController` job that charges
+file allocation, before checking cancellation or decoding. Repeating a total
+charges no duplicate bytes. An incomplete transfer still contributes observed
+ingress; a failed/non-running job cannot yield decoded evidence even if late
+accounting itself is accepted. Counter regressions cancel the fixture without
+reducing prior usage. Tests retain the durable reservation and require
+reconciliation on reopen after refusal, including a synthetic over-limit counter.
+Transport-bound fixture constructors also sample that attempt's cumulative raw
+ingress before each payload write and require the same attempt context before
+accounting a final report. Same-byte reports from another attempt are refused
+without charging their counter or cancelling that other attempt. The counter
+mutex is released before controller accounting or filesystem work.
+
+These are write checkpoints and completion-time accounting in a task-owned
+fixture, not a per-read controller callback, durable usage receipt, production
+worker/store integration or multi-gigabyte network enforcement demonstration.
+Unbound constructors remain for file-only tests; this is not a public
+report-adoption API.
+
+`GitHubTransport::ingress_observer()` returns a cloneable, read-only
+`TransportIngressObserver` for that attempt. `observed_bytes()` reads cumulative
+raw socket bytes, including after cancellation or transport consumption;
+`matches_transfer()` compares historical attempt identity with a pack report.
+The observer retains only the shared counter and context, without the full
+transport budget, credentials or mutation controls. The private file fixture
+now uses this interface instead of accessing budget/context internals.
+
+These are observations, not transfer completion, evidence freshness, resource
+admission or cleanup approval. Counter snapshots may wait on the in-flight read
+mutex; they are not nonblocking and provide no OS latency guarantee. Poisoned
+locks return a sanitized error. This backend API adds no renderer command,
+network execution, filesystem access, worker handoff or persisted receipt.
+
+For supervisor sampling, `try_observed_bytes()` uses a single nonblocking mutex
+attempt: `Some(total)` is an observation, `None` means busy, and a poisoned lock
+is an error. Busy is neither zero usage nor completion. The method does not
+retry, change counters, or suppress observations after cancellation. It provides
+no operating-system scheduling guarantee; callers still own attempt deadlines
+and final accounting.
